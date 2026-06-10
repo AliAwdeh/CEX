@@ -82,13 +82,13 @@ def _init_state() -> None:
         "selected_model": "",
         "temperature": 0.1,
         "top_p": 1.0,
-        "max_tokens": 1500,
-        "timeout": 60.0,
+        "max_tokens": 50000,
+        "timeout": 300.0,
         "retries": 2,
         # Always concurrent. Hard upper limit is 64 (api_client.MAX_CONCURRENCY).
-        "concurrency": 8,
+        "concurrency": 50,
         "max_conversations": 50,
-        "max_agent_messages_per_conv": 50,
+        "max_agent_messages_per_conv": 500,
         "truncate_messages": False,
         "max_chars_per_message": 1500,
         "include_unknown_in_history": True,
@@ -96,6 +96,8 @@ def _init_state() -> None:
         "save_raw_responses": True,
         # Which side the message-level judge inspects per turn.
         "message_target_role": "agent",
+        # When set, the run evaluates ONLY these conversation IDs (random sampler).
+        "selected_conversation_ids": None,
         "run_results": None,
         "run_in_progress": False,
         "progress_log": [],
@@ -185,6 +187,11 @@ def _build_run_config() -> tuple[RunConfig, int | None, int | None]:
         stop_on_error=bool(st.session_state.stop_on_error),
         save_raw_responses=bool(st.session_state.save_raw_responses),
         message_target_role=str(st.session_state.message_target_role or "agent"),
+        selected_conversation_ids=(
+            list(st.session_state.selected_conversation_ids)
+            if st.session_state.selected_conversation_ids
+            else None
+        ),
         message_prompt=ml_tpl,
         conversation_prompt=cl_tpl,
     )
@@ -277,7 +284,7 @@ def render_sidebar() -> None:
         st.markdown("### Generation parameters")
         st.slider("Temperature", min_value=0.0, max_value=2.0, step=0.05, key="temperature")
         st.slider("Top P", min_value=0.0, max_value=1.0, step=0.05, key="top_p")
-        st.number_input("Max tokens", min_value=128, max_value=16000, step=64, key="max_tokens")
+        st.number_input("Max tokens", min_value=128, max_value=100000, step=64, key="max_tokens")
         st.number_input("Timeout (seconds)", min_value=5.0, max_value=600.0, step=5.0, key="timeout")
         st.number_input("Retry count", min_value=0, max_value=10, step=1, key="retries")
         st.number_input(
@@ -640,12 +647,69 @@ def tab_run() -> None:
         )
 
     target_role = str(st.session_state.message_target_role or "agent")
-    estimate = estimate_call_counts(
-        df,
-        max_conversations=int(st.session_state.max_conversations),
-        max_agent_messages_per_conv=int(st.session_state.max_agent_messages_per_conv),
-        target_role=target_role,
+
+    # ---- Conversation selection (first-N vs. random sample) -----------------
+    all_ids = (
+        df["CONVERSATION_ID"].astype(str).drop_duplicates().tolist()
+        if "CONVERSATION_ID" in df.columns
+        else []
     )
+    selected_ids = st.session_state.selected_conversation_ids
+    st.markdown("### Conversation selection")
+    pick_cols = st.columns([1, 1, 1, 2])
+    with pick_cols[0]:
+        if st.button(
+            "🎲 Random sample",
+            use_container_width=True,
+            help=(
+                "Pick a random sample of conversation IDs from the uploaded CSV. "
+                "Sample size = 'Max conversations to process' from the sidebar."
+            ),
+            disabled=not all_ids,
+        ):
+            import random
+            n = max(1, int(st.session_state.max_conversations or 1))
+            n = min(n, len(all_ids))
+            st.session_state.selected_conversation_ids = random.sample(all_ids, n)
+            st.rerun()
+    with pick_cols[1]:
+        if st.button(
+            "Clear selection",
+            use_container_width=True,
+            disabled=not selected_ids,
+        ):
+            st.session_state.selected_conversation_ids = None
+            st.rerun()
+    with pick_cols[2]:
+        st.caption(
+            f"**{len(selected_ids):,} pinned**"
+            if selected_ids
+            else "_No selection — runs use the first N from the CSV._"
+        )
+    with pick_cols[3]:
+        if selected_ids:
+            preview = ", ".join(str(x) for x in selected_ids[:6])
+            if len(selected_ids) > 6:
+                preview += f", … (+{len(selected_ids) - 6} more)"
+            st.caption(f"Pinned IDs: `{preview}`")
+
+    # Build the estimate. When a random selection is active, count over the
+    # pinned IDs; otherwise apply the max_conversations slice.
+    if selected_ids:
+        df_for_estimate = df[df["CONVERSATION_ID"].astype(str).isin(set(map(str, selected_ids)))]
+        estimate = estimate_call_counts(
+            df_for_estimate,
+            max_conversations=None,
+            max_agent_messages_per_conv=int(st.session_state.max_agent_messages_per_conv),
+            target_role=target_role,
+        )
+    else:
+        estimate = estimate_call_counts(
+            df,
+            max_conversations=int(st.session_state.max_conversations),
+            max_agent_messages_per_conv=int(st.session_state.max_agent_messages_per_conv),
+            target_role=target_role,
+        )
 
     st.markdown("### Evaluation estimate")
     role_label = "agent" if target_role == "agent" else "customer"

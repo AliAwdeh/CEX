@@ -269,6 +269,9 @@ class RunConfig:
     #   "agent"    — judge the agent's response to a (possibly frustrated) customer message
     #   "customer" — judge the customer's state / frustration before the agent answers
     message_target_role: str = "agent"
+    # Explicit set of conversation IDs to run on. When non-None, takes
+    # precedence over ``max_conversations`` — used by the random sampler.
+    selected_conversation_ids: Optional[list[str]] = None
     # Editable prompts (defaults to the in-memory defaults; the app loads
     # the active prompts from the DB before each run).
     message_prompt: PromptTemplate = field(default_factory=lambda: DEFAULT_MESSAGE_LEVEL_PROMPT)
@@ -414,10 +417,13 @@ def run_evaluation(
 ) -> RunResults:
     """Run the full message-level + conversation-level evaluation pipeline.
 
-    Message-level calls within each conversation run concurrently via a
-    ``ThreadPoolExecutor``. Concurrency is taken from ``config.api.concurrency``
-    and is clamped to ``MAX_CONCURRENCY``. Conversation-level calls remain
-    sequential so each one can incorporate its own message-level metadata.
+    All AI calls — both message-level and conversation-level, across all
+    conversations — share ONE ``ThreadPoolExecutor`` whose worker count equals
+    ``config.api.concurrency`` (clamped to ``MAX_CONCURRENCY``). The instant a
+    worker is free it picks the next pending task from the queue, regardless of
+    which conversation it belongs to. As soon as the *last* message-level call
+    for a given conversation completes, that conversation's conversation-level
+    call is submitted to the same pool — no cross-conversation barrier.
 
     Optional persistence callbacks (``on_message_result``,
     ``on_conversation_result``, ``on_error``) are invoked on the calling thread
@@ -436,7 +442,11 @@ def run_evaluation(
         target_role = "agent"
 
     groups = get_conversation_groups(df)
-    if config.max_conversations is not None:
+    # Selection precedence: explicit IDs (random sampler) > max_conversations slice.
+    if config.selected_conversation_ids is not None:
+        wanted = set(str(x) for x in config.selected_conversation_ids)
+        groups = [g for g in groups if str(g[0]) in wanted]
+    elif config.max_conversations is not None:
         groups = groups[: config.max_conversations]
 
     total_conversations = len(groups)
@@ -449,31 +459,48 @@ def run_evaluation(
             }
         )
 
-    for ci, (conversation_id, group) in enumerate(groups, start=1):
-        if cancel_requested and cancel_requested():
-            break
+    # ---- Pre-build per-conversation state on the main thread ----------------
 
+    def visible_history_of(records: list[dict], up_to_index: Any) -> list[dict]:
+        out = []
+        for r in records:
+            idx = r["message_index"]
+            if idx is None:
+                continue
+            if idx > up_to_index:
+                break
+            role = r.get("sender_role", "unknown")
+            if role == "unknown" and not config.include_unknown_in_history:
+                continue
+            out.append(r)
+        return out
+
+    conv_state: dict[str, dict[str, Any]] = {}
+    conv_order: list[str] = []
+    ml_tasks: list[tuple[str, dict, list[dict]]] = []  # (conversation_id, target_record, history)
+    no_target_convs: list[str] = []
+
+    for ci, (conversation_id, group) in enumerate(groups, start=1):
         records = message_records_from_group(group, conversation_id)
         conversation_metadata = conversation_metadata_from_group(group)
-
-        # History should respect the toggle for unknown messages.
-        def visible_history(up_to_index: int) -> list[dict]:
-            out = []
-            for r in records:
-                idx = r["message_index"]
-                if idx is None:
-                    continue
-                if idx > up_to_index:
-                    break
-                role = r.get("sender_role", "unknown")
-                if role == "unknown" and not config.include_unknown_in_history:
-                    continue
-                out.append(r)
-            return out
-
-        agent_targets = [r for r in records if r.get("sender_role") == target_role]
+        targets = [r for r in records if r.get("sender_role") == target_role]
         if config.max_agent_messages_per_conv is not None:
-            agent_targets = agent_targets[: config.max_agent_messages_per_conv]
+            targets = targets[: config.max_agent_messages_per_conv]
+
+        state = {
+            "conversation_id": conversation_id,
+            "conversation_index": ci,
+            "records": records,
+            "conversation_metadata": conversation_metadata,
+            "targets": targets,
+            "results_by_idx": {},          # message_index -> message-level record
+            "ml_total": len(targets),
+            "ml_done": 0,
+            "cl_submitted": False,
+            "cl_done": False,
+        }
+        conv_state[conversation_id] = state
+        conv_order.append(conversation_id)
 
         if on_progress:
             on_progress(
@@ -481,43 +508,144 @@ def run_evaluation(
                     "phase": "conversation_start",
                     "conversation_index": ci,
                     "conversation_id": conversation_id,
-                    "agent_messages": len(agent_targets),
-                    "target_messages": len(agent_targets),
+                    "agent_messages": len(targets),
+                    "target_messages": len(targets),
                     "target_role": target_role,
                     "total_conversations": total_conversations,
                     "workers": workers,
                 }
             )
 
-        # Pre-compute history slices so worker threads never touch shared state.
-        tasks = [(t, visible_history(t["message_index"])) for t in agent_targets]
-        message_results_by_idx: dict[Any, dict] = {}
-        stop_signal = False
+        if not targets:
+            no_target_convs.append(conversation_id)
+            continue
 
-        if tasks:
-            with cf.ThreadPoolExecutor(max_workers=workers) as ex:
-                future_to_target = {}
-                for target, history in tasks:
-                    fut = ex.submit(
-                        _eval_message_level,
-                        client=client,
-                        api=config.api,
-                        conversation_id=conversation_id,
-                        target_record=target,
-                        history_records=history,
-                        conversation_metadata=conversation_metadata,
-                        save_raw=config.save_raw_responses,
-                        truncate_chars=truncate_chars,
-                        prompt=config.message_prompt,
-                    )
-                    future_to_target[fut] = target
+        for target in targets:
+            history = visible_history_of(records, target["message_index"])
+            ml_tasks.append((conversation_id, target, history))
 
-                completed = 0
-                for fut in cf.as_completed(future_to_target):
-                    target = future_to_target[fut]
+    # ---- One shared pool drives everything ---------------------------------
+
+    stop_signal = {"flag": False, "reason": None}
+
+    def _submit_cl(ex: cf.ThreadPoolExecutor, conversation_id: str) -> cf.Future:
+        """Build the conversation-level payload and submit it to the pool."""
+        state = conv_state[conversation_id]
+        message_results_ordered = [
+            state["results_by_idx"][t["message_index"]]
+            for t in state["targets"]
+            if t["message_index"] in state["results_by_idx"]
+        ]
+        computed_md = compute_metadata(message_results_ordered, state["records"])
+        computed_md["evaluation_target_role"] = target_role
+        computed_md["target_messages_evaluated"] = sum(
+            1 for m in message_results_ordered if m.get("parse_status") == "ok"
+        )
+        full_transcript = (
+            state["records"] if config.include_unknown_in_history
+            else [r for r in state["records"] if r.get("sender_role") != "unknown"]
+        )
+        conv_md_for_judge = dict(state["conversation_metadata"])
+        conv_md_for_judge["evaluation_target_role"] = target_role
+
+        state["message_results_ordered"] = message_results_ordered
+        state["computed_metadata"] = computed_md
+        state["full_transcript"] = full_transcript
+        state["cl_submitted"] = True
+
+        return ex.submit(
+            _eval_conversation_level,
+            client=client,
+            api=config.api,
+            conversation_id=conversation_id,
+            conversation_metadata=conv_md_for_judge,
+            full_transcript=full_transcript,
+            message_level_evaluations=message_results_ordered,
+            computed_metadata=computed_md,
+            save_raw=config.save_raw_responses,
+            truncate_chars=truncate_chars,
+            prompt=config.conversation_prompt,
+        )
+
+    def _finalize_cl_record(conversation_id: str, cr: dict) -> dict:
+        state = conv_state[conversation_id]
+        cr["conversation_metadata"] = state["conversation_metadata"]
+        cr["computed_metadata"] = state["computed_metadata"]
+        cr["transcript"] = state["records"]
+        cr["message_level_results"] = state["message_results_ordered"]
+        cr["evaluation_target_role"] = target_role
+        if cr.get("parse_status") != "ok" and not cr.get("parsed_json"):
+            # Inject a stub so the dashboard still has a row for this conversation.
+            cr["parsed_json"] = {
+                "conversation_id": conversation_id,
+                "customer_objective_type": "Inquiry",
+                "customer_primary_objective": "",
+                "final_classification": "Unhandled with Many Issues",
+                "handled_status": "unhandled",
+                "cx_issue_severity": "many",
+                "final_customer_sentiment": "unknown",
+                "max_frustration_level": state["computed_metadata"].get("max_frustration_level", "none"),
+                "main_issue": {
+                    "issue_exists": True,
+                    "issue_origin": "our_side",
+                    "issue_type": "other",
+                    "issue_summary": "Conversation-level evaluator failed to parse",
+                    "customer_impact": "Unable to assess automatically",
+                },
+                "all_detected_issues": [],
+                "positive_signals": [],
+                "negative_signals": [],
+                "management_summary": "Automatic evaluation could not parse a result for this conversation. Manual review required.",
+                "recommended_actions": ["Review this conversation manually."],
+                "manual_review_required": True,
+                "manual_review_reason": cr.get("error_message") or "Parse failure",
+                "confidence": "low",
+            }
+        return cr
+
+    fut_info: dict[cf.Future, dict] = {}
+    pending: set[cf.Future] = set()
+
+    with cf.ThreadPoolExecutor(max_workers=workers) as ex:
+        # 1. Submit every message-level task across every conversation up front.
+        for conversation_id, target, history in ml_tasks:
+            fut = ex.submit(
+                _eval_message_level,
+                client=client,
+                api=config.api,
+                conversation_id=conversation_id,
+                target_record=target,
+                history_records=history,
+                conversation_metadata=conv_state[conversation_id]["conversation_metadata"],
+                save_raw=config.save_raw_responses,
+                truncate_chars=truncate_chars,
+                prompt=config.message_prompt,
+            )
+            pending.add(fut)
+            fut_info[fut] = {"type": "ml", "conversation_id": conversation_id, "target": target}
+
+        # 2. Conversations with no target messages can run their CL immediately.
+        for conversation_id in no_target_convs:
+            fut = _submit_cl(ex, conversation_id)
+            pending.add(fut)
+            fut_info[fut] = {"type": "cl", "conversation_id": conversation_id}
+
+        # 3. Drain. As each ML finishes, check whether its conversation's CL is
+        #    now ready to fire; if so submit it to the same pool. As each CL
+        #    finishes, record the conversation result.
+        while pending:
+            done, _ = cf.wait(pending, return_when=cf.FIRST_COMPLETED)
+            for fut in done:
+                pending.discard(fut)
+                info = fut_info.pop(fut)
+                conversation_id = info["conversation_id"]
+                state = conv_state[conversation_id]
+
+                if info["type"] == "ml":
+                    target = info["target"]
                     try:
                         mr = fut.result()
-                    except Exception as e:  # noqa: BLE001 — wrap worker crashes
+                    except Exception as e:  # noqa: BLE001
                         mr = {
                             "conversation_id": conversation_id,
                             "target_message_id": target.get("message_id", ""),
@@ -531,14 +659,13 @@ def run_evaluation(
                             "error_message": f"Worker raised: {e}",
                             "debug": None,
                         }
-                    message_results_by_idx[target["message_index"]] = mr
-                    completed += 1
+                    state["results_by_idx"][target["message_index"]] = mr
+                    state["ml_done"] += 1
 
                     if on_message_result:
                         try:
                             on_message_result(mr)
                         except Exception:
-                            # Persistence errors must not abort the run.
                             pass
 
                     if mr.get("parse_status") != "ok":
@@ -559,155 +686,116 @@ def run_evaluation(
                         on_progress(
                             {
                                 "phase": "message_done",
-                                "conversation_index": ci,
+                                "conversation_index": state["conversation_index"],
                                 "conversation_id": conversation_id,
                                 "message_index": target.get("message_index"),
-                                "message_in_conversation": completed,
-                                "total_in_conversation": len(tasks),
+                                "message_in_conversation": state["ml_done"],
+                                "total_in_conversation": state["ml_total"],
                                 "status": mr.get("parse_status"),
                             }
                         )
 
                     if config.stop_on_error and mr.get("parse_status") == "api_error":
-                        stop_signal = True
+                        stop_signal["flag"] = True
+                        stop_signal["reason"] = mr.get("error_message")
                     if cancel_requested and cancel_requested():
-                        stop_signal = True
+                        stop_signal["flag"] = True
+                        stop_signal["reason"] = stop_signal["reason"] or "cancelled"
 
-                    if stop_signal:
-                        # Cancel un-started futures so the executor exits quickly.
-                        for f in future_to_target:
-                            if not f.done():
-                                f.cancel()
-                        break
+                    # Submit this conversation's CL now if its ML batch is complete.
+                    if (
+                        not stop_signal["flag"]
+                        and not state["cl_submitted"]
+                        and state["ml_done"] >= state["ml_total"]
+                    ):
+                        cl_fut = _submit_cl(ex, conversation_id)
+                        pending.add(cl_fut)
+                        fut_info[cl_fut] = {"type": "cl", "conversation_id": conversation_id}
 
-        # Restore original message order for downstream code and append the
-        # whole conversation's results in order so the global list stays sorted
-        # by conversation, then message_index.
-        message_results = [
-            message_results_by_idx[t["message_index"]]
-            for t in agent_targets
-            if t["message_index"] in message_results_by_idx
-        ]
-        results.message_level_results.extend(message_results)
-
-        if stop_signal:
-            if on_progress:
-                on_progress(
-                    {
-                        "phase": "stopped_on_error",
-                        "conversation_id": conversation_id,
-                    }
-                )
-            results.finished_at = time.time()
-            return results
-
-        # Compute metadata + conversation-level call.
-        computed_md = compute_metadata(message_results, records)
-        computed_md["evaluation_target_role"] = target_role
-        computed_md["target_messages_evaluated"] = sum(
-            1 for m in message_results if m.get("parse_status") == "ok"
-        )
-        full_transcript = (
-            records if config.include_unknown_in_history
-            else [r for r in records if r.get("sender_role") != "unknown"]
-        )
-        # Include the target role in metadata sent to the conversation-level judge
-        # so it understands what the inline message_level_evaluation entries judged.
-        conv_md_for_judge = dict(conversation_metadata)
-        conv_md_for_judge["evaluation_target_role"] = target_role
-        cr = _eval_conversation_level(
-            client=client,
-            api=config.api,
-            conversation_id=conversation_id,
-            conversation_metadata=conv_md_for_judge,
-            full_transcript=full_transcript,
-            message_level_evaluations=message_results,
-            computed_metadata=computed_md,
-            save_raw=config.save_raw_responses,
-            truncate_chars=truncate_chars,
-            prompt=config.conversation_prompt,
-        )
-        cr["conversation_metadata"] = conversation_metadata
-        cr["computed_metadata"] = computed_md
-        cr["transcript"] = records
-        cr["message_level_results"] = message_results
-        cr["evaluation_target_role"] = target_role
-
-        if cr.get("parse_status") != "ok":
-            err = {
-                "level": "conversation",
-                "conversation_id": conversation_id,
-                "error": cr.get("error_message"),
-            }
-            results.errors.append(err)
-            if on_error:
-                try:
-                    on_error(err)
-                except Exception:
-                    pass
-            # If parse failed, force manual_review_required = True downstream by
-            # injecting a minimal stub so the dashboard still has a row.
-            if not cr.get("parsed_json"):
-                cr["parsed_json"] = {
-                    "conversation_id": conversation_id,
-                    "customer_objective_type": "Inquiry",
-                    "customer_primary_objective": "",
-                    "final_classification": "Unhandled with Many Issues",
-                    "handled_status": "unhandled",
-                    "cx_issue_severity": "many",
-                    "final_customer_sentiment": "unknown",
-                    "max_frustration_level": computed_md.get("max_frustration_level", "none"),
-                    "main_issue": {
-                        "issue_exists": True,
-                        "issue_origin": "our_side",
-                        "issue_type": "other",
-                        "issue_summary": "Conversation-level evaluator failed to parse",
-                        "customer_impact": "Unable to assess automatically",
-                    },
-                    "all_detected_issues": [],
-                    "positive_signals": [],
-                    "negative_signals": [],
-                    "management_summary": "Automatic evaluation could not parse a result for this conversation. Manual review required.",
-                    "recommended_actions": ["Review this conversation manually."],
-                    "manual_review_required": True,
-                    "manual_review_reason": cr.get("error_message") or "Parse failure",
-                    "confidence": "low",
-                }
-            if config.stop_on_error and cr.get("parse_status") == "api_error":
-                results.conversation_results.append(cr)
-                if on_conversation_result:
+                elif info["type"] == "cl":
                     try:
-                        on_conversation_result(cr)
-                    except Exception:
-                        pass
+                        cr = fut.result()
+                    except Exception as e:  # noqa: BLE001
+                        cr = {
+                            "conversation_id": conversation_id,
+                            "raw_model_response": None,
+                            "parsed_json": None,
+                            "parse_status": "api_error",
+                            "error_message": f"Worker raised: {e}",
+                            "debug": None,
+                        }
+                    cr = _finalize_cl_record(conversation_id, cr)
+                    state["cl_done"] = True
+
+                    if cr.get("parse_status") != "ok":
+                        err = {
+                            "level": "conversation",
+                            "conversation_id": conversation_id,
+                            "error": cr.get("error_message"),
+                        }
+                        results.errors.append(err)
+                        if on_error:
+                            try:
+                                on_error(err)
+                            except Exception:
+                                pass
+                        if config.stop_on_error and cr.get("parse_status") == "api_error":
+                            stop_signal["flag"] = True
+                            stop_signal["reason"] = cr.get("error_message")
+
+                    results.conversation_results.append(cr)
+                    if on_conversation_result:
+                        try:
+                            on_conversation_result(cr)
+                        except Exception:
+                            pass
+
+                    if on_progress:
+                        on_progress(
+                            {
+                                "phase": "conversation_done",
+                                "conversation_index": state["conversation_index"],
+                                "conversation_id": conversation_id,
+                                "total_conversations": total_conversations,
+                                "status": cr.get("parse_status"),
+                            }
+                        )
+
+            if stop_signal["flag"]:
+                # Cancel anything that hasn't started yet and drop the rest.
+                for f in list(pending):
+                    if not f.done():
+                        f.cancel()
+                    pending.discard(f)
                 if on_progress:
                     on_progress(
                         {
                             "phase": "stopped_on_error",
-                            "conversation_id": conversation_id,
-                            "error": cr.get("error_message"),
+                            "error": stop_signal["reason"],
                         }
                     )
-                results.finished_at = time.time()
-                return results
+                break
 
-        results.conversation_results.append(cr)
-        if on_conversation_result:
-            try:
-                on_conversation_result(cr)
-            except Exception:
-                pass
+    # Sort outputs by the original conversation order, then by message_index,
+    # so the dashboard and exports stay deterministic regardless of completion
+    # order in the streaming pool.
+    order_by_cid = {cid: i for i, cid in enumerate(conv_order)}
+    results.conversation_results.sort(
+        key=lambda c: order_by_cid.get(c.get("conversation_id"), 0)
+    )
 
-        if on_progress:
-            on_progress(
-                {
-                    "phase": "conversation_done",
-                    "conversation_index": ci,
-                    "conversation_id": conversation_id,
-                    "total_conversations": total_conversations,
-                    "status": cr.get("parse_status"),
-                }
-            )
+    # Flatten per-conversation ordered message results into the global list.
+    results.message_level_results = []
+    for cid in conv_order:
+        state = conv_state.get(cid, {})
+        ordered = state.get("message_results_ordered")
+        if ordered is None:
+            ordered = [
+                state.get("results_by_idx", {})[t["message_index"]]
+                for t in state.get("targets", [])
+                if t["message_index"] in state.get("results_by_idx", {})
+            ]
+        results.message_level_results.extend(ordered)
 
     results.finished_at = time.time()
     if on_progress:

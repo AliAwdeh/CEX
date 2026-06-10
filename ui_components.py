@@ -201,9 +201,11 @@ def render_conversation_transcript_with_evals(
     """Render a transcript using native chat bubbles, with the message-level
     evaluation card attached directly under each agent message.
 
-    Each bubble's header shows the raw sender role from the CSV (preferring
-    ``raw_sender_role`` when present, otherwise the normalized ``sender_role``).
-    No customer or agent name is rendered.
+    Header label rules:
+    - Customer / unknown rows show the raw sender role from the CSV.
+    - Agent rows: if ``raw_sender_role`` is literally "agent" (a real human
+      agent), show the message's agent full name. For "bot" / "system" / any
+      other raw role, show "agent" as a generic label.
     """
     if not transcript:
         st.info("No messages to display.")
@@ -225,24 +227,32 @@ def render_conversation_transcript_with_evals(
         if (m.get("parsed_json") or {}).get("message_level_effect") == "recovered_issue"
     )
     st.caption(
-        f"{len(transcript)} messages • {n_evals} agent messages evaluated • "
+        f"{len(transcript)} messages • {n_evals} messages evaluated • "
         f"{n_major} major · {n_minor} minor · {n_recovered} recovered"
     )
 
     for msg in transcript:
         role = (msg.get("sender_role") or "unknown").lower()
         raw_role = msg.get("raw_sender_role")
-        display_role = str(raw_role) if raw_role else (msg.get("sender_role") or "unknown")
+        raw_role_norm = str(raw_role).strip().lower() if raw_role else ""
         idx = msg.get("message_index")
         when = msg.get("message_time") or ""
         text = str(msg.get("message_text", "") or "")
 
         if role == "customer":
             chat_role, avatar = "user", "🧑"
+            display_role = str(raw_role) if raw_role else "customer"
         elif role == "agent":
             chat_role, avatar = "assistant", "🤖"
+            if raw_role_norm == "agent":
+                # Real human agent → show their name when available.
+                display_role = str(msg.get("agent_full_name") or "").strip() or "agent"
+            else:
+                # Bot / system / anything else → generic "agent" label.
+                display_role = "agent"
         else:
             chat_role, avatar = "ai", "❔"
+            display_role = str(raw_role) if raw_role else "unknown"
 
         with st.chat_message(chat_role, avatar=avatar):
             header_bits = [f"**{display_role}**"]
@@ -253,16 +263,17 @@ def render_conversation_transcript_with_evals(
             st.markdown(" · ".join(header_bits))
             st.write(text if text else "_(empty message)_")
 
-            if role == "agent":
-                eval_record = eval_by_idx.get(idx)
-                if eval_record:
-                    st.markdown(
-                        "<div style=\"height:1px;background:#e5e7eb;margin:8px 0;\"></div>",
-                        unsafe_allow_html=True,
-                    )
-                    render_inline_evaluation(eval_record)
-                else:
-                    st.caption("_No evaluation was recorded for this message._")
+            # Attach the message-level evaluation card to whichever message
+            # was actually evaluated (agent in agent mode, customer in
+            # customer mode). ``eval_by_idx`` only contains entries for
+            # target messages, so this works for both modes.
+            eval_record = eval_by_idx.get(idx)
+            if eval_record:
+                st.markdown(
+                    "<div style=\"height:1px;background:#e5e7eb;margin:8px 0;\"></div>",
+                    unsafe_allow_html=True,
+                )
+                render_inline_evaluation(eval_record)
 
 
 def render_message_evaluation_panel(message_result: dict) -> None:

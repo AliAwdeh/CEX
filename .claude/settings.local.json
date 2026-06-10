@@ -1,0 +1,7 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python3 -m py_compile prompts.py data_loader.py api_client.py aggregation.py evaluator.py exports.py ui_components.py app.py)"
+    ]
+  }
+}
