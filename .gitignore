@@ -1,0 +1,22 @@
+# Virtual environment
+.venv/
+venv/
+env/
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+
+# Secrets / env
+.env
+*.key
+
+# Local DB backup
+*.mybackup
+
+# OS / editor
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
