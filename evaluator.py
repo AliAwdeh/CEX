@@ -120,6 +120,16 @@ _ML_DEFAULTS = {
     "recommended_fix": "",
 }
 
+_FORBIDDEN_ID_FIELDS = {
+    "conversation_id",
+    "thread_id",
+    "run_id",
+    "customer_id",
+    "customer_phone",
+    "phone_number",
+    "target_message_id",
+}
+
 
 def validate_message_level_result(data: dict) -> dict:
     """Coerce a parsed message-level JSON object into the strict schema shape.
@@ -132,8 +142,6 @@ def validate_message_level_result(data: dict) -> dict:
         raise ValueError("Message-level result is not a JSON object")
 
     out: dict[str, Any] = {}
-    out["conversation_id"] = str(data.get("conversation_id", ""))
-    out["target_message_id"] = str(data.get("target_message_id", ""))
     try:
         out["message_index"] = int(data.get("message_index") or 0)
     except (TypeError, ValueError):
@@ -150,19 +158,34 @@ def validate_message_level_result(data: dict) -> dict:
 
     # Preserve any fields the user's custom schema produced.
     for k, v in data.items():
-        if k not in out:
+        if k not in out and k not in _FORBIDDEN_ID_FIELDS:
             out[k] = v
 
     return out
 
 
 _CL_CLASSIFICATION_RULES = {
+    "Handled with Minimal Issues": ("handled", "zero_minimal", False, False),
+    "Handled with Many Issues": ("handled", "many", False, False),
+    "Handled with Minimal Issues and Frustration": ("handled", "zero_minimal", True, False),
+    "Handled with Many Issues and Frustration": ("handled", "many", True, False),
+    "Handled with Minimal Caused Issues and Frustration": ("handled", "zero_minimal", True, True),
+    "Handled with Many Caused Issues and Frustration": ("handled", "many", True, True),
+    "Not Handled with Minimal Issues": ("unhandled", "zero_minimal", False, False),
+    "Not Handled with Many Issues": ("unhandled", "many", False, False),
+    "Not Handled with Minimal Issues and Frustration": ("unhandled", "zero_minimal", True, False),
+    "Not Handled with Many Issues and Frustration": ("unhandled", "many", True, False),
+    "Not Handled with Minimal Caused Issues and Frustration": ("unhandled", "zero_minimal", True, True),
+    "Not Handled with Many Caused Issues and Frustration": ("unhandled", "many", True, True),
+}
+
+_OLD_CL_CLASSIFICATION_RULES = {
     "Handled with Zero/Minimal Issues": ("handled", "zero_minimal", "not_applicable"),
     "Handled with Many Issues": ("handled", "many", "not_applicable"),
     "Unhandled with Zero/Minimal Issues - Totally Definitive Unresolved": (
         "unhandled",
         "zero_minimal",
-        "totally_definitive_unresolved",
+        "totally_unresolved",
     ),
     "Unhandled with Zero/Minimal Issues - Pending Unresolved": (
         "unhandled",
@@ -172,7 +195,7 @@ _CL_CLASSIFICATION_RULES = {
     "Unhandled with Many Issues - Totally Definitive Unresolved": (
         "unhandled",
         "many",
-        "totally_definitive_unresolved",
+        "totally_unresolved",
     ),
     "Unhandled with Many Issues - Pending Unresolved": (
         "unhandled",
@@ -183,38 +206,106 @@ _CL_CLASSIFICATION_RULES = {
 
 _UNHANDLED_SUBTYPES = {
     "not_applicable",
-    "totally_definitive_unresolved",
+    "totally_unresolved",
     "pending_unresolved",
 }
+
+_MAIN_ISSUE_ORIGINS = {"our_side", "customer_side", "shared", "third_party", "unclear", "none"}
+_TOP_LEVEL_MAIN_ISSUE_ORIGINS = {"our_side", "customer_side", "shared", "unclear", "none"}
+_FRUSTRATION_TIMINGS = {"start", "during", "end", "multiple", "none"}
+
+
+def _normalize_bool_flag(value: Any, default: bool = False) -> bool:
+    if isinstance(value, bool):
+        return value
+    if value is None:
+        return default
+    if isinstance(value, (int, float)):
+        return bool(value)
+    val = str(value).strip().lower()
+    if val in {"true", "1", "yes", "y"}:
+        return True
+    if val in {"false", "0", "no", "n", "", "none", "null"}:
+        return False
+    return default
+
+
+def _normalize_issue_origin(value: Any, *, allow_third_party: bool) -> str:
+    origin = str(value or "").strip().lower().replace(" ", "_")
+    if origin not in _MAIN_ISSUE_ORIGINS:
+        return "none"
+    if origin == "third_party" and not allow_third_party:
+        return "unclear"
+    return origin
 
 
 def _normalize_unhandled_subtype(value: Any) -> str:
     subtype = str(value or "").strip().lower().replace(" ", "_").replace("-", "_")
     if subtype in {"n/a", "na", "none", "not_applicable"}:
         return "not_applicable"
-    if subtype in {"totally_definitive_unresolved", "definitive_unresolved", "definitive"}:
-        return "totally_definitive_unresolved"
+    if subtype in {
+        "totally_unresolved",
+        "totally_definitive_unresolved",
+        "definitive_unresolved",
+        "definitive",
+        "totally",
+    }:
+        return "totally_unresolved"
     if subtype in {"pending_unresolved", "pending"}:
         return "pending_unresolved"
     return ""
 
 
-def _classification_from_parts(handled_status: str, severity: str, subtype: str) -> str:
-    for classification, parts in _CL_CLASSIFICATION_RULES.items():
-        if parts == (handled_status, severity, subtype):
-            return classification
+def _normalize_frustration_timing(value: Any) -> str:
+    timing = str(value or "").strip().lower().replace(" ", "_")
+    return timing if timing in _FRUSTRATION_TIMINGS else ""
+
+
+def _infer_frustration_timing(started: bool, became: bool, ended: bool) -> str:
+    active = [started, became, ended]
+    if not any(active):
+        return "none"
+    if sum(1 for flag in active if flag) > 1:
+        return "multiple"
+    if started:
+        return "start"
+    if became:
+        return "during"
+    return "end"
+
+
+def _classification_from_parts(
+    handled_status: str,
+    severity: str,
+    frustration_detected: bool,
+    main_issue_origin: str,
+) -> str:
     if handled_status == "handled":
-        return "Handled with Many Issues" if severity == "many" else "Handled with Zero/Minimal Issues"
-    if subtype == "pending_unresolved":
+        if not frustration_detected:
+            return "Handled with Many Issues" if severity == "many" else "Handled with Minimal Issues"
+        if main_issue_origin == "our_side":
+            return (
+                "Handled with Many Caused Issues and Frustration"
+                if severity == "many"
+                else "Handled with Minimal Caused Issues and Frustration"
+            )
         return (
-            "Unhandled with Many Issues - Pending Unresolved"
+            "Handled with Many Issues and Frustration"
             if severity == "many"
-            else "Unhandled with Zero/Minimal Issues - Pending Unresolved"
+            else "Handled with Minimal Issues and Frustration"
+        )
+    if not frustration_detected:
+        return "Not Handled with Many Issues" if severity == "many" else "Not Handled with Minimal Issues"
+    if main_issue_origin == "our_side":
+        return (
+            "Not Handled with Many Caused Issues and Frustration"
+            if severity == "many"
+            else "Not Handled with Minimal Caused Issues and Frustration"
         )
     return (
-        "Unhandled with Many Issues - Totally Definitive Unresolved"
+        "Not Handled with Many Issues and Frustration"
         if severity == "many"
-        else "Unhandled with Zero/Minimal Issues - Totally Definitive Unresolved"
+        else "Not Handled with Minimal Issues and Frustration"
     )
 
 
@@ -251,7 +342,6 @@ def validate_conversation_level_result(data: dict) -> dict:
         raise ValueError("Conversation-level result is not a JSON object")
 
     out: dict[str, Any] = {}
-    out["conversation_id"] = str(data.get("conversation_id", ""))
 
     objective_type = str(data.get("customer_objective_type", "") or "").strip()
     if objective_type not in {"Inquiry", "Issue"}:
@@ -264,30 +354,122 @@ def validate_conversation_level_result(data: dict) -> dict:
     severity = str(data.get("cx_issue_severity", "") or "").strip().lower().replace(" ", "_")
     subtype = _normalize_unhandled_subtype(data.get("unhandled_resolution_subtype"))
 
+    main = data.get("main_issue") or {}
+    if not isinstance(main, dict):
+        main = {}
+    main_out = {
+        "issue_exists": _normalize_bool_flag(main.get("issue_exists", False)),
+        "issue_origin": _normalize_issue_origin(main.get("issue_origin", "none"), allow_third_party=True),
+        "issue_type": str(main.get("issue_type", "none") or "none").strip().lower(),
+        "issue_summary": str(main.get("issue_summary", "") or ""),
+        "customer_impact": str(main.get("customer_impact", "") or ""),
+    }
+
+    main_issue_origin = _normalize_issue_origin(
+        data.get("main_issue_origin", main_out["issue_origin"]),
+        allow_third_party=False,
+    )
+    if main_issue_origin not in _TOP_LEVEL_MAIN_ISSUE_ORIGINS:
+        main_issue_origin = "none"
+
+    frustration_detected = _normalize_bool_flag(data.get("frustration_detected"), default=False)
+    customer_started_frustrated = _normalize_bool_flag(data.get("customer_started_frustrated"), default=False)
+    customer_became_frustrated_during_chat = _normalize_bool_flag(
+        data.get("customer_became_frustrated_during_chat"),
+        default=False,
+    )
+    customer_ended_frustrated = _normalize_bool_flag(data.get("customer_ended_frustrated"), default=False)
+    frustration_timing = _normalize_frustration_timing(data.get("frustration_timing"))
+
     if classification in _CL_CLASSIFICATION_RULES:
-        handled_status, severity, subtype = _CL_CLASSIFICATION_RULES[classification]
+        handled_status, severity, frustration_detected, caused_by_us = _CL_CLASSIFICATION_RULES[classification]
+        if caused_by_us:
+            main_issue_origin = "our_side"
+        elif frustration_detected and main_issue_origin == "our_side":
+            main_issue_origin = "shared"
     else:
-        # Backward-compatible recovery for older four-label outputs.
-        if handled_status not in {"handled", "unhandled"}:
-            handled_status = "handled" if classification.startswith("Handled") else "unhandled"
+        if classification in _OLD_CL_CLASSIFICATION_RULES:
+            handled_status, severity, subtype = _OLD_CL_CLASSIFICATION_RULES[classification]
+        else:
+            # Backward-compatible recovery for older or partial outputs.
+            if handled_status not in {"handled", "unhandled"}:
+                handled_status = "handled" if classification.startswith("Handled") else "unhandled"
+            if severity not in {"zero_minimal", "many"}:
+                severity = "many" if "Many" in classification else "zero_minimal"
+            if handled_status == "handled":
+                subtype = "not_applicable"
+            elif subtype not in {"totally_unresolved", "pending_unresolved"}:
+                subtype = "pending_unresolved" if "pending" in classification.lower() else "totally_unresolved"
+            if "Frustration" in classification and not frustration_detected:
+                frustration_detected = True
+            if "Caused Issues and Frustration" in classification:
+                main_issue_origin = "our_side"
+
         if severity not in {"zero_minimal", "many"}:
-            severity = "many" if "Many" in classification else "zero_minimal"
-        if handled_status == "handled":
-            subtype = "not_applicable"
-        elif subtype not in {"totally_definitive_unresolved", "pending_unresolved"}:
-            subtype = "pending_unresolved" if "pending" in classification.lower() else "totally_definitive_unresolved"
-        classification = _classification_from_parts(handled_status, severity, subtype)
+            severity = "zero_minimal"
+        if handled_status not in {"handled", "unhandled"}:
+            handled_status = "handled"
 
     if handled_status == "handled":
         subtype = "not_applicable"
-        classification = _classification_from_parts(handled_status, severity, subtype)
     elif subtype == "not_applicable" or subtype not in _UNHANDLED_SUBTYPES:
-        subtype = "totally_definitive_unresolved"
-        classification = _classification_from_parts(handled_status, severity, subtype)
+        subtype = "totally_unresolved"
+
+    # Promote issue origin from main_issue when the top-level field is missing or unusable.
+    if main_issue_origin == "none" and main_out["issue_origin"] in _TOP_LEVEL_MAIN_ISSUE_ORIGINS:
+        main_issue_origin = main_out["issue_origin"]
+    if main_issue_origin == "unclear" and main_out["issue_origin"] in {"our_side", "customer_side", "shared"}:
+        main_issue_origin = main_out["issue_origin"]
+
+    if not frustration_detected:
+        customer_started_frustrated = False
+        customer_became_frustrated_during_chat = False
+        customer_ended_frustrated = False
+        frustration_timing = "none"
+    else:
+        if frustration_timing:
+            if frustration_timing == "start":
+                customer_started_frustrated = True
+            elif frustration_timing == "during":
+                customer_became_frustrated_during_chat = True
+            elif frustration_timing == "end":
+                customer_ended_frustrated = True
+            elif frustration_timing == "multiple":
+                customer_started_frustrated = True
+                customer_became_frustrated_during_chat = True
+                customer_ended_frustrated = True
+        elif not any(
+            [
+                customer_started_frustrated,
+                customer_became_frustrated_during_chat,
+                customer_ended_frustrated,
+            ]
+        ):
+            customer_became_frustrated_during_chat = True
+        frustration_timing = _infer_frustration_timing(
+            customer_started_frustrated,
+            customer_became_frustrated_during_chat,
+            customer_ended_frustrated,
+        )
+
+    if severity not in {"zero_minimal", "many"}:
+        severity = "zero_minimal"
+    classification = _classification_from_parts(
+        handled_status,
+        severity,
+        frustration_detected,
+        main_issue_origin,
+    )
 
     out["final_classification"] = classification
     out["handled_status"] = handled_status
     out["cx_issue_severity"] = severity
+    out["frustration_detected"] = frustration_detected
+    out["customer_started_frustrated"] = customer_started_frustrated
+    out["customer_became_frustrated_during_chat"] = customer_became_frustrated_during_chat
+    out["customer_ended_frustrated"] = customer_ended_frustrated
+    out["frustration_timing"] = frustration_timing
+    out["main_issue_origin"] = main_issue_origin
     out["unhandled_resolution_subtype"] = subtype
 
     sentiment = str(data.get("final_customer_sentiment", "") or "").strip().lower()
@@ -300,18 +482,11 @@ def validate_conversation_level_result(data: dict) -> dict:
         max_fl = "none"
     out["max_frustration_level"] = max_fl
 
-    main = data.get("main_issue") or {}
-    if not isinstance(main, dict):
-        main = {}
-    main_out = {
-        "issue_exists": bool(main.get("issue_exists", False)),
-        "issue_origin": str(main.get("issue_origin", "none") or "none").strip().lower(),
-        "issue_type": str(main.get("issue_type", "none") or "none").strip().lower(),
-        "issue_summary": str(main.get("issue_summary", "") or ""),
-        "customer_impact": str(main.get("customer_impact", "") or ""),
-    }
-    if main_out["issue_origin"] not in {"our_side", "customer_side", "shared", "none"}:
+    if not main_out["issue_exists"]:
         main_out["issue_origin"] = "none"
+        main_out["issue_type"] = "none"
+        main_out["issue_summary"] = "none"
+        main_out["customer_impact"] = "none"
     out["main_issue"] = main_out
 
     detected = data.get("all_detected_issues") or []
@@ -319,7 +494,7 @@ def validate_conversation_level_result(data: dict) -> dict:
         detected = []
     out["all_detected_issues"] = [
         {
-            "issue_origin": str(d.get("issue_origin", "") or ""),
+            "issue_origin": _normalize_issue_origin(d.get("issue_origin", ""), allow_third_party=True),
             "issue_type": str(d.get("issue_type", "") or ""),
             "issue_summary": str(d.get("issue_summary", "") or ""),
             "evidence": str(d.get("evidence", "") or ""),
@@ -334,8 +509,10 @@ def validate_conversation_level_result(data: dict) -> dict:
     out["quantifiable_metrics"] = _normalize_quantifiable_metrics(data.get("quantifiable_metrics"))
     out["management_summary"] = str(data.get("management_summary", "") or "")
     out["recommended_actions"] = [str(x) for x in (data.get("recommended_actions") or []) if x]
-    out["manual_review_required"] = bool(data.get("manual_review_required", False))
+    out["manual_review_required"] = _normalize_bool_flag(data.get("manual_review_required"), default=False)
     out["manual_review_reason"] = str(data.get("manual_review_reason", "") or "")
+    if not out["manual_review_required"] and not out["manual_review_reason"].strip():
+        out["manual_review_reason"] = "none"
     confidence = str(data.get("confidence", "") or "").strip().lower()
     if confidence not in {"low", "medium", "high"}:
         confidence = "medium"
@@ -343,7 +520,7 @@ def validate_conversation_level_result(data: dict) -> dict:
 
     # Preserve any extra fields a custom schema may have introduced.
     for k, v in data.items():
-        if k not in out:
+        if k not in out and k not in _FORBIDDEN_ID_FIELDS:
             out[k] = v
 
     return out
@@ -407,6 +584,7 @@ def _eval_message_level(
     user_prompt = prompt.build_user(payload)
 
     record: dict[str, Any] = {
+        "thread_id": conversation_id,
         "conversation_id": conversation_id,
         "target_message_id": target_record.get("message_id", ""),
         "message_index": target_record.get("message_index"),
@@ -415,6 +593,7 @@ def _eval_message_level(
         "input_history": history_records if save_raw else None,
         "raw_model_response": None,
         "parsed_json": None,
+        "evaluation_output": None,
         "parse_status": "ok",
         "error_message": None,
         "debug": None,
@@ -428,15 +607,13 @@ def _eval_message_level(
         try:
             obj = extract_json_object(raw)
             validated = validate_message_level_result(obj)
-            # Backfill keys the model may have skipped.
-            validated["conversation_id"] = validated.get("conversation_id") or conversation_id
-            validated["target_message_id"] = validated.get("target_message_id") or record["target_message_id"]
             if not validated.get("message_index") and record["message_index"] is not None:
                 try:
                     validated["message_index"] = int(record["message_index"])
                 except (TypeError, ValueError):
                     pass
             record["parsed_json"] = validated
+            record["evaluation_output"] = validated
         except Exception as je:
             record["parse_status"] = "failed"
             record["error_message"] = f"JSON parse failed: {je}"
@@ -474,9 +651,12 @@ def _eval_conversation_level(
     user_prompt = prompt.build_user(payload)
 
     record: dict[str, Any] = {
+        "thread_id": conversation_id,
         "conversation_id": conversation_id,
+        "run_id": None,
         "raw_model_response": None,
         "parsed_json": None,
+        "evaluation_output": None,
         "parse_status": "ok",
         "error_message": None,
         "debug": None,
@@ -490,8 +670,8 @@ def _eval_conversation_level(
         try:
             obj = extract_json_object(raw)
             validated = validate_conversation_level_result(obj)
-            validated["conversation_id"] = validated.get("conversation_id") or conversation_id
             record["parsed_json"] = validated
+            record["evaluation_output"] = validated
         except Exception as je:
             record["parse_status"] = "failed"
             record["error_message"] = f"JSON parse failed: {je}"
@@ -666,6 +846,7 @@ def run_evaluation(
 
     def _finalize_cl_record(conversation_id: str, cr: dict) -> dict:
         state = conv_state[conversation_id]
+        cr["thread_id"] = conversation_id
         cr["conversation_metadata"] = state["conversation_metadata"]
         cr["computed_metadata"] = state["computed_metadata"]
         cr["transcript"] = state["records"]
@@ -674,13 +855,18 @@ def run_evaluation(
         if cr.get("parse_status") != "ok" and not cr.get("parsed_json"):
             # Inject a stub so the dashboard still has a row for this conversation.
             cr["parsed_json"] = {
-                "conversation_id": conversation_id,
                 "customer_objective_type": "Inquiry",
                 "customer_primary_objective": "",
-                "final_classification": "Unhandled with Many Issues - Totally Definitive Unresolved",
+                "final_classification": "Not Handled with Many Caused Issues and Frustration",
                 "handled_status": "unhandled",
                 "cx_issue_severity": "many",
-                "unhandled_resolution_subtype": "totally_definitive_unresolved",
+                "frustration_detected": True,
+                "customer_started_frustrated": False,
+                "customer_became_frustrated_during_chat": True,
+                "customer_ended_frustrated": False,
+                "frustration_timing": "during",
+                "main_issue_origin": "our_side",
+                "unhandled_resolution_subtype": "totally_unresolved",
                 "final_customer_sentiment": "unknown",
                 "max_frustration_level": state["computed_metadata"].get("max_frustration_level", "none"),
                 "main_issue": {
@@ -700,6 +886,7 @@ def run_evaluation(
                 "manual_review_reason": cr.get("error_message") or "Parse failure",
                 "confidence": "low",
             }
+        cr["evaluation_output"] = cr.get("parsed_json")
         return cr
 
     fut_info: dict[cf.Future, dict] = {}

@@ -126,8 +126,6 @@ Rules:
 
 
 DEFAULT_MESSAGE_LEVEL_OUTPUT_SCHEMA = """{
-  "conversation_id": "string",
-  "target_message_id": "string",
   "message_index": 0,
   "message_level_effect": "helped|neutral|minor_issue|major_issue|recovered_issue",
   "frustration_level_after_message": "none|low|medium|high|cancellation_risk",
@@ -211,20 +209,34 @@ Was there a clear recovery path when the bot could not complete the request?
 Was the tone respectful, clear, practical, and easy to understand?
 
 Classification options (use exactly one):
-- Handled with Zero/Minimal Issues
+- Handled with Minimal Issues
 - Handled with Many Issues
-- Unhandled with Zero/Minimal Issues - Totally Definitive Unresolved
-- Unhandled with Zero/Minimal Issues - Pending Unresolved
-- Unhandled with Many Issues - Totally Definitive Unresolved
-- Unhandled with Many Issues - Pending Unresolved
+- Handled with Minimal Issues and Frustration
+- Handled with Many Issues and Frustration
+- Handled with Minimal Caused Issues and Frustration
+- Handled with Many Caused Issues and Frustration
+- Not Handled with Minimal Caused Issues and Frustration
+- Not Handled with Many Caused Issues and Frustration
+- Not Handled with Minimal Issues and Frustration
+- Not Handled with Many Issues and Frustration
+- Not Handled with Minimal Issues
+- Not Handled with Many Issues
 
 Definitions:
-- Handled with Zero/Minimal Issues: The customer achieved the objective or received a clear acceptable next step, and the interaction was smooth, clear, efficient, and low-effort.
-- Handled with Many Issues: The customer eventually achieved the objective or accepted the outcome, but experienced significant CX issues such as confusion, repetition, delay, frustration, misunderstanding, excessive effort, or poor guidance.
-- Unhandled with Zero/Minimal Issues - Totally Definitive Unresolved: The customer did not achieve the desired outcome, there is no credible pending path, but the limitation was communicated clearly and professionally.
-- Unhandled with Zero/Minimal Issues - Pending Unresolved: The customer did not achieve the desired outcome yet because the case is credibly waiting for a future event, but the next step was clear and low-friction.
-- Unhandled with Many Issues - Totally Definitive Unresolved: The customer's objective was not achieved, no credible pending path remains, and the customer experienced significant CX issues.
-- Unhandled with Many Issues - Pending Unresolved: The customer's objective is still pending a future event, and the journey had significant CX issues such as confusion, repetition, delay, vague next steps, or high effort.
+- Final classification now describes only handled vs not handled, minimal vs many issues, frustration vs no frustration, and whether the main frustration-causing issue came from our side.
+- Pending vs totally unresolved is no longer part of final_classification. Keep it only in unhandled_resolution_subtype.
+- If handled_status=handled and cx_issue_severity=zero_minimal and frustration_detected=false: Handled with Minimal Issues.
+- If handled_status=handled and cx_issue_severity=many and frustration_detected=false: Handled with Many Issues.
+- If handled_status=handled and cx_issue_severity=zero_minimal and frustration_detected=true and main_issue_origin is not our_side: Handled with Minimal Issues and Frustration.
+- If handled_status=handled and cx_issue_severity=many and frustration_detected=true and main_issue_origin is not our_side: Handled with Many Issues and Frustration.
+- If handled_status=handled and cx_issue_severity=zero_minimal and frustration_detected=true and main_issue_origin=our_side: Handled with Minimal Caused Issues and Frustration.
+- If handled_status=handled and cx_issue_severity=many and frustration_detected=true and main_issue_origin=our_side: Handled with Many Caused Issues and Frustration.
+- If handled_status=unhandled and cx_issue_severity=zero_minimal and frustration_detected=false: Not Handled with Minimal Issues.
+- If handled_status=unhandled and cx_issue_severity=many and frustration_detected=false: Not Handled with Many Issues.
+- If handled_status=unhandled and cx_issue_severity=zero_minimal and frustration_detected=true and main_issue_origin is not our_side: Not Handled with Minimal Issues and Frustration.
+- If handled_status=unhandled and cx_issue_severity=many and frustration_detected=true and main_issue_origin is not our_side: Not Handled with Many Issues and Frustration.
+- If handled_status=unhandled and cx_issue_severity=zero_minimal and frustration_detected=true and main_issue_origin=our_side: Not Handled with Minimal Caused Issues and Frustration.
+- If handled_status=unhandled and cx_issue_severity=many and frustration_detected=true and main_issue_origin=our_side: Not Handled with Many Caused Issues and Frustration.
 
 Return strict JSON only. Do not include markdown. Do not include explanations outside the JSON.
 
@@ -235,30 +247,37 @@ Rules:
 - Return JSON only.
 - Do not invent information.
 - Handled vs Unhandled depends mainly on whether the customer objective was achieved or whether a clear acceptable next step was provided.
-- Zero/Minimal vs Many Issues depends on CX friction, effort, confusion, frustration, repetition, and clarity.
+- Minimal vs Many Issues depends on CX friction, effort, confusion, frustration, repetition, and clarity.
+- frustration_detected must reflect visible frustration anywhere in the conversation.
+- main_issue_origin should be our_side, customer_side, shared, unclear, or none.
 - A conversation can be handled even if it had issues.
 - A conversation can be unhandled even if the bot communicated politely.
 - For handled conversations, unhandled_resolution_subtype must be not_applicable.
-- For unhandled conversations, unhandled_resolution_subtype must be totally_definitive_unresolved or pending_unresolved.
-- Always specify whether issues originated from our side, customer side, shared, or none.
+- For unhandled conversations, unhandled_resolution_subtype must be totally_unresolved or pending_unresolved.
+- Always specify whether the main issue originated from our side, customer side, shared, unclear, or none.
 - Explain impact from the customer's perspective.
 - Keep the management summary concise and business-friendly.
 - Set manual_review_required to true if confidence is low, cancellation risk exists, high frustration exists, the final status is unclear, or JSON/message-level errors affected the evaluation."""
 
 
 DEFAULT_CONVERSATION_LEVEL_OUTPUT_SCHEMA = """{
-  "conversation_id": "string",
   "customer_objective_type": "Inquiry|Issue",
   "customer_primary_objective": "short description",
-  "final_classification": "Handled with Zero/Minimal Issues|Handled with Many Issues|Unhandled with Zero/Minimal Issues - Totally Definitive Unresolved|Unhandled with Zero/Minimal Issues - Pending Unresolved|Unhandled with Many Issues - Totally Definitive Unresolved|Unhandled with Many Issues - Pending Unresolved",
+  "final_classification": "Handled with Minimal Issues|Handled with Many Issues|Handled with Minimal Issues and Frustration|Handled with Many Issues and Frustration|Handled with Minimal Caused Issues and Frustration|Handled with Many Caused Issues and Frustration|Not Handled with Minimal Issues|Not Handled with Many Issues|Not Handled with Minimal Issues and Frustration|Not Handled with Many Issues and Frustration|Not Handled with Minimal Caused Issues and Frustration|Not Handled with Many Caused Issues and Frustration",
   "handled_status": "handled|unhandled",
   "cx_issue_severity": "zero_minimal|many",
-  "unhandled_resolution_subtype": "not_applicable|totally_definitive_unresolved|pending_unresolved",
+  "frustration_detected": "true|false",
+  "customer_started_frustrated": "true|false",
+  "customer_became_frustrated_during_chat": "true|false",
+  "customer_ended_frustrated": "true|false",
+  "frustration_timing": "start|during|end|multiple|none",
+  "main_issue_origin": "our_side|customer_side|shared|unclear|none",
+  "unhandled_resolution_subtype": "not_applicable|totally_unresolved|pending_unresolved",
   "final_customer_sentiment": "satisfied|neutral|frustrated|confused|dissatisfied|unknown",
   "max_frustration_level": "none|low|medium|high|cancellation_risk",
   "main_issue": {
-    "issue_exists": true,
-    "issue_origin": "our_side|customer_side|shared|none",
+    "issue_exists": "true|false",
+    "issue_origin": "our_side|customer_side|shared|third_party|unclear|none",
     "issue_type": "none|misunderstanding|repetition|delay|unclear_guidance|wrong_info|ignored_context|dead_end|tool_or_system_failure|poor_tone|missing_next_step|other",
     "issue_summary": "short business-friendly summary",
     "customer_impact": "short explanation of impact on customer journey"
@@ -372,7 +391,7 @@ DEFAULT_CONVERSATION_LEVEL_OUTPUT_SCHEMA = """{
   "negative_signals": ["short bullet"],
   "management_summary": "concise business-friendly explanation of the classification",
   "recommended_actions": ["short actionable recommendation"],
-  "manual_review_required": true,
+  "manual_review_required": "true|false",
   "manual_review_reason": "short reason or none",
   "confidence": "low|medium|high"
 }"""
@@ -402,6 +421,31 @@ CONVERSATION_LEVEL_SYSTEM_PROMPT = DEFAULT_CONVERSATION_LEVEL_PROMPT.build_syste
 # --------- Payload builders (unchanged) ---------
 
 
+_ALLOWED_METADATA_KEYS = {
+    "conversation_start_date",
+    "conversation_end_date",
+    "conversation_status",
+    "initial_skill",
+    "last_skill",
+    "joined_skills",
+    "total_visible_messages",
+    "customer_message_count",
+    "agent_message_count",
+    "unknown_message_count",
+    "evaluation_target_role",
+}
+
+
+def _sanitize_conversation_metadata_for_llm(conversation_metadata: dict | None) -> dict:
+    if not isinstance(conversation_metadata, dict):
+        return {}
+    return {
+        key: value
+        for key, value in conversation_metadata.items()
+        if key in _ALLOWED_METADATA_KEYS and value not in (None, "")
+    }
+
+
 def build_message_level_payload(
     conversation_id: str,
     target_message: dict,
@@ -420,7 +464,6 @@ def build_message_level_payload(
         return text
 
     target = {
-        "message_id": target_message.get("message_id", ""),
         "message_index": target_message.get("message_index", 0),
         "message_time": str(target_message.get("message_time", "")),
         "sender_role": target_message.get("sender_role", "agent"),
@@ -438,10 +481,9 @@ def build_message_level_payload(
         )
 
     return {
-        "conversation_id": conversation_id,
         "target_message": target,
         "conversation_history_until_target": history_clean,
-        "conversation_metadata": conversation_metadata,
+        "conversation_metadata": _sanitize_conversation_metadata_for_llm(conversation_metadata),
     }
 
 
@@ -500,8 +542,7 @@ def build_conversation_level_payload(
         transcript_clean.append(entry)
 
     return {
-        "conversation_id": conversation_id,
-        "conversation_metadata": conversation_metadata,
+        "conversation_metadata": _sanitize_conversation_metadata_for_llm(conversation_metadata),
         "full_transcript": transcript_clean,
         "message_level_evaluations": message_level_evaluations,
         "computed_metadata": computed_metadata,

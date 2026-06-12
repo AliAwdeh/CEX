@@ -9,12 +9,13 @@ import pandas as pd
 
 
 REQUIRED_COLUMNS = [
-    "CONVERSATION_ID",
     "MESSAGE_INDEX",
     "MESSAGE_TIME",
     "SENDER_ROLE",
     "MESSAGE_TEXT",
 ]
+
+ID_COLUMNS = ["THREAD_ID", "CONVERSATION_ID"]
 
 
 METADATA_COLUMNS = [
@@ -50,6 +51,8 @@ def validate_csv(df: pd.DataFrame) -> tuple[bool, list[str], str]:
     Returns (is_valid, missing_columns, message).
     """
     missing = [c for c in REQUIRED_COLUMNS if c not in df.columns]
+    if not any(c in df.columns for c in ID_COLUMNS):
+        missing = ["THREAD_ID or CONVERSATION_ID", *missing]
     if missing:
         msg = (
             "This CSV is missing required columns needed for evaluation:\n- "
@@ -76,9 +79,14 @@ def normalize_dataframe(df: pd.DataFrame) -> pd.DataFrame:
     if "SENDER_ROLE" in df.columns:
         df["SENDER_ROLE"] = df["SENDER_ROLE"].fillna("unknown").astype(str).str.strip().str.lower()
 
-    # Stringify CONVERSATION_ID to handle mixed int/str ids.
-    if "CONVERSATION_ID" in df.columns:
+    # Prefer THREAD_ID as the stable grouping key; keep CONVERSATION_ID as a compatibility alias.
+    if "THREAD_ID" in df.columns:
+        df["THREAD_ID"] = df["THREAD_ID"].astype(str)
+        if "CONVERSATION_ID" not in df.columns:
+            df["CONVERSATION_ID"] = df["THREAD_ID"]
+    elif "CONVERSATION_ID" in df.columns:
         df["CONVERSATION_ID"] = df["CONVERSATION_ID"].astype(str)
+        df["THREAD_ID"] = df["CONVERSATION_ID"]
 
     return df
 
@@ -103,8 +111,9 @@ def summarize_dataframe(df: pd.DataFrame) -> dict:
         "date_min": None,
         "date_max": None,
     }
-    if "CONVERSATION_ID" in df.columns:
-        summary["conversations"] = int(df["CONVERSATION_ID"].nunique())
+    id_col = "THREAD_ID" if "THREAD_ID" in df.columns else "CONVERSATION_ID"
+    if id_col in df.columns:
+        summary["conversations"] = int(df[id_col].nunique())
     if "SENDER_ROLE" in df.columns:
         role_series = df["SENDER_ROLE"].astype(str).str.lower()
         summary["customer_messages"] = int((role_series == "customer").sum())
@@ -130,11 +139,16 @@ def summarize_dataframe(df: pd.DataFrame) -> dict:
 
 def get_conversation_groups(df: pd.DataFrame) -> list[tuple[str, pd.DataFrame]]:
     """Return list of (conversation_id, sorted_dataframe) tuples."""
-    if "CONVERSATION_ID" not in df.columns:
+    id_col = "THREAD_ID" if "THREAD_ID" in df.columns else "CONVERSATION_ID"
+    if id_col not in df.columns:
         return []
     out = []
-    for conv_id, group in df.groupby("CONVERSATION_ID", sort=False):
-        sorted_group = group.sort_values("MESSAGE_INDEX", kind="stable").reset_index(drop=True)
+    sort_cols = [col for col in ("MESSAGE_INDEX", "MESSAGE_TIME") if col in df.columns]
+    for conv_id, group in df.groupby(id_col, sort=False):
+        if sort_cols:
+            sorted_group = group.sort_values(sort_cols, kind="stable").reset_index(drop=True)
+        else:
+            sorted_group = group.reset_index(drop=True)
         out.append((str(conv_id), sorted_group))
     return out
 

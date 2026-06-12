@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import json
+import html as html_lib
+import importlib
 import os
 import time
 from dataclasses import asdict
@@ -10,6 +12,8 @@ from pathlib import Path
 
 import pandas as pd
 import streamlit as st
+import streamlit.components.v1 as components
+import ui_components as ui_components_module
 
 from api_client import APIConfig, DEFAULT_BASE_URL, build_client, fetch_models
 from data_loader import (
@@ -34,6 +38,8 @@ from aggregation import (
     dashboard_aggregates,
     flatten_conversation_row,
     flatten_message_row,
+    get_metric_definition,
+    humanize_label,
     metric_category_display_name,
     metric_display_name,
     quantifiable_metric_columns,
@@ -108,6 +114,7 @@ def _init_state() -> None:
         # DB integration
         "current_run_id": None,        # id of the run we're writing to (or loaded from)
         "loaded_run_label": None,
+        "theme_mode": "Dark",
     }
     for k, v in defaults.items():
         if k not in st.session_state:
@@ -231,21 +238,552 @@ def _msg_dataframe_from_results() -> pd.DataFrame:
     return build_message_table(rows)
 
 
+def _conversation_filters_with_keys(conv_df: pd.DataFrame, key_prefix: str) -> dict:
+    try:
+        return conversation_filters(conv_df, key_prefix=key_prefix)
+    except TypeError:
+        reloaded = importlib.reload(ui_components_module)
+        return reloaded.conversation_filters(conv_df, key_prefix=key_prefix)
+
+
+def _humanize_columns(df: pd.DataFrame, columns: list[str]) -> pd.DataFrame:
+    out = df.copy()
+    for col in columns:
+        if col in out.columns:
+            out[col] = out[col].apply(humanize_label)
+    return out
+
+
+def _display_column_name(column: str) -> str:
+    if column.startswith("metric__"):
+        return f"{metric_category_display_name(column)} / {metric_display_name(column)}"
+    special = {
+        "conversation_id": "Conversation ID",
+        "customer_name": "Customer name",
+        "customer_phone": "Customer phone",
+        "conversation_start_date": "Started",
+        "conversation_end_date": "Ended",
+        "conversation_status": "Conversation status",
+        "customer_objective_type": "Customer goal type",
+        "customer_primary_objective": "Customer goal",
+        "final_classification": "Overall result",
+        "handled_status": "Outcome",
+        "cx_issue_severity": "Journey quality",
+        "frustration_detected": "Customer frustration",
+        "customer_started_frustrated": "Started frustrated",
+        "customer_became_frustrated_during_chat": "Became frustrated during chat",
+        "customer_ended_frustrated": "Ended frustrated",
+        "frustration_timing": "When frustration appeared",
+        "unhandled_resolution_subtype": "Unresolved status",
+        "final_customer_sentiment": "Customer feeling at end",
+        "max_frustration_level": "Highest frustration level",
+        "main_issue_type": "Main problem type",
+        "main_issue_origin": "Where the main problem came from",
+        "main_issue_summary": "Main problem summary",
+        "customer_impact": "Customer impact",
+        "manual_review_required": "Needs human review",
+        "manual_review_reason": "Reason for human review",
+        "metric_value": "Metric value",
+        "target_message_id": "Target message ID",
+        "message_index": "Message index",
+        "message_time": "Message time",
+        "target_message_text": "Assistant message",
+    }
+    return special.get(column, humanize_label(column))
+
+
+def _prepare_display_table(df: pd.DataFrame, enum_columns: list[str] | None = None) -> pd.DataFrame:
+    out = _humanize_columns(df, enum_columns or [])
+    return out.rename(columns={col: _display_column_name(col) for col in out.columns})
+
+
+def _theme_colors() -> dict[str, str]:
+    dark = str(st.session_state.get("theme_mode") or "Light") == "Dark"
+    return {
+        "bg": "#0a0e27" if dark else "#ffffff",
+        "panel": "#111827" if dark else "#f8fafc",
+        "panel_2": "#1a202c" if dark else "#ffffff",
+        "text": "#f0f4f8" if dark else "#0f172a",
+        "muted": "#a0aec0" if dark else "#64748b",
+        "border": "#2d3748" if dark else "#e5e7eb",
+        "accent": "#3b82f6" if dark else "#2563eb",
+        "accent_2": "#f59e0b" if dark else "#ef4444",
+        "track": "#2d3748" if dark else "#e5e7eb",
+        "grid": "#2d3748" if dark else "#e5e7eb",
+    }
+
+
+def _render_display_table(
+    df: pd.DataFrame,
+    *,
+    enum_columns: list[str] | None = None,
+    max_rows: int | None = None,
+    height: int | None = None,
+    empty_message: str = "No data.",
+) -> None:
+    """Render a theme-aware HTML table instead of Streamlit's iframe table."""
+    if df is None or df.empty:
+        if empty_message:
+            st.caption(empty_message)
+        return
+
+    display_df = _prepare_display_table(df, enum_columns) if enum_columns is not None else df.copy()
+    if max_rows is not None:
+        display_df = display_df.head(max_rows)
+
+    height_style = f' style="max-height: {height}px;"' if height else ""
+    table_html = display_df.to_html(
+        index=False,
+        escape=True,
+        border=0,
+        classes="cx-data-table",
+    )
+    st.markdown(
+        f'<div class="cx-table-wrap"{height_style}>{table_html}</div>',
+        unsafe_allow_html=True,
+    )
+
+
+def _format_chart_value(value: float, suffix: str = "") -> str:
+    if pd.isna(value):
+        return "0"
+    value = float(value)
+    if abs(value - round(value)) < 0.001:
+        return f"{int(round(value))}{suffix}"
+    return f"{value:.1f}{suffix}"
+
+
+def _render_simple_bar_chart(
+    df: pd.DataFrame,
+    label_col: str,
+    value_col: str,
+    *,
+    height: int = 360,
+    max_value: float | None = None,
+    value_suffix: str = "",
+    empty_message: str = "No data.",
+) -> None:
+    if df is None or df.empty or label_col not in df.columns or value_col not in df.columns:
+        st.caption(empty_message)
+        return
+
+    chart_df = df[[label_col, value_col]].copy()
+    chart_df[value_col] = pd.to_numeric(chart_df[value_col], errors="coerce").fillna(0)
+    chart_df = chart_df[chart_df[value_col] >= 0]
+    if chart_df.empty:
+        st.caption(empty_message)
+        return
+
+    colors = _theme_colors()
+    max_seen = float(chart_df[value_col].max()) if not chart_df.empty else 0.0
+    denominator = float(max_value) if max_value is not None else max_seen
+    denominator = denominator if denominator > 0 else 1.0
+
+    rows = []
+    for _, row in chart_df.iterrows():
+        label = html_lib.escape(str(row[label_col]))
+        value = float(row[value_col])
+        width = max(1.5, min(100.0, (value / denominator) * 100.0))
+        value_text = html_lib.escape(_format_chart_value(value, value_suffix))
+        rows.append(
+            f"""
+            <div class="cx-chart-row">
+              <div class="cx-chart-label" title="{label}">{label}</div>
+              <div class="cx-chart-track">
+                <div class="cx-chart-bar" style="width: {width:.2f}%"></div>
+              </div>
+              <div class="cx-chart-value">{value_text}</div>
+            </div>
+            """
+        )
+
+    html_content = f"""
+    <div class="cx-chart-wrap" style="max-height: {height}px;">
+      {''.join(rows)}
+    </div>
+    <style>
+    .cx-chart-wrap {{
+      overflow: auto;
+      background: {colors["panel_2"]};
+      border: 1px solid {colors["border"]};
+      border-radius: 8px;
+      padding: 0.75rem;
+      margin: 0.35rem 0 1rem;
+    }}
+    .cx-chart-row {{
+      display: grid;
+      grid-template-columns: minmax(160px, 32%) 1fr minmax(54px, auto);
+      gap: 0.75rem;
+      align-items: center;
+      min-height: 34px;
+    }}
+    .cx-chart-row + .cx-chart-row {{
+      margin-top: 0.55rem;
+    }}
+    .cx-chart-label {{
+      color: {colors["text"]};
+      font-weight: 600;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }}
+    .cx-chart-track {{
+      height: 14px;
+      border-radius: 999px;
+      background: {colors["track"]};
+      overflow: hidden;
+    }}
+    .cx-chart-bar {{
+      height: 100%;
+      border-radius: 999px;
+      background: linear-gradient(90deg, #3b82f6, #f59e0b);
+      box-shadow: 0 0 8px rgba(59, 130, 246, 0.5);
+    }}
+    .cx-chart-value {{
+      color: {colors["text"]};
+      font-weight: 700;
+      text-align: right;
+      font-variant-numeric: tabular-nums;
+    }}
+    @media (max-width: 720px) {{
+      .cx-chart-row {{
+        grid-template-columns: 1fr minmax(48px, auto);
+      }}
+      .cx-chart-track {{
+        grid-column: 1 / -1;
+        grid-row: 2;
+      }}
+    }}
+    </style>
+    """
+    components.html(html_content, height=height + 24, scrolling=False)
+
+
+def _render_simple_line_chart(
+    df: pd.DataFrame,
+    x_col: str,
+    y_col: str,
+    *,
+    height: int = 300,
+    empty_message: str = "No data.",
+) -> None:
+    if df is None or df.empty or x_col not in df.columns or y_col not in df.columns:
+        st.caption(empty_message)
+        return
+
+    chart_df = df[[x_col, y_col]].copy()
+    chart_df[y_col] = pd.to_numeric(chart_df[y_col], errors="coerce").fillna(0)
+    chart_df = chart_df.reset_index(drop=True)
+    if chart_df.empty:
+        st.caption(empty_message)
+        return
+
+    colors = _theme_colors()
+    width = 900
+    chart_h = max(180, height - 70)
+    pad_x = 46
+    pad_y = 28
+    max_y = float(chart_df[y_col].max())
+    min_y = float(chart_df[y_col].min())
+    if max_y == min_y:
+        max_y += 1.0
+        min_y = 0.0
+    span_x = max(len(chart_df) - 1, 1)
+
+    points = []
+    dots = []
+    for i, row in chart_df.iterrows():
+        x = pad_x + (i / span_x) * (width - pad_x * 2)
+        y = pad_y + ((max_y - float(row[y_col])) / (max_y - min_y)) * (chart_h - pad_y * 2)
+        points.append(f"{x:.2f},{y:.2f}")
+        dots.append(f'<circle cx="{x:.2f}" cy="{y:.2f}" r="4" fill="{colors["accent_2"]}" />')
+
+    first_label = html_lib.escape(str(chart_df.iloc[0][x_col]))
+    last_label = html_lib.escape(str(chart_df.iloc[-1][x_col]))
+    max_label = html_lib.escape(_format_chart_value(max_y))
+    min_label = html_lib.escape(_format_chart_value(min_y))
+    path_points = " ".join(points)
+
+    html_content = f"""
+    <div class="cx-line-wrap" style="height: {height}px;">
+      <svg class="cx-line-svg" viewBox="0 0 {width} {chart_h}" preserveAspectRatio="none">
+        <line x1="{pad_x}" y1="{pad_y}" x2="{pad_x}" y2="{chart_h - pad_y}" stroke="{colors["grid"]}" />
+        <line x1="{pad_x}" y1="{chart_h - pad_y}" x2="{width - pad_x}" y2="{chart_h - pad_y}" stroke="{colors["grid"]}" />
+        <polyline points="{path_points}" fill="none" stroke="{colors["accent"]}" stroke-width="4" stroke-linecap="round" stroke-linejoin="round" />
+        {''.join(dots)}
+      </svg>
+      <div class="cx-line-axis cx-line-axis-y-top">{max_label}</div>
+      <div class="cx-line-axis cx-line-axis-y-bottom">{min_label}</div>
+      <div class="cx-line-axis cx-line-axis-x-left">{first_label}</div>
+      <div class="cx-line-axis cx-line-axis-x-right">{last_label}</div>
+    </div>
+    <style>
+    .cx-line-wrap {{
+      position: relative;
+      background: {colors["panel_2"]};
+      border: 1px solid {colors["border"]};
+      border-radius: 8px;
+      padding: 0.5rem;
+      margin: 0.35rem 0 1rem;
+    }}
+    .cx-line-svg {{
+      width: 100%;
+      height: calc(100% - 1.8rem);
+      display: block;
+    }}
+    .cx-line-axis {{
+      position: absolute;
+      color: {colors["muted"]};
+      font-size: 0.82rem;
+      font-weight: 600;
+    }}
+    .cx-line-axis-y-top {{
+      top: 0.45rem;
+      left: 0.65rem;
+    }}
+    .cx-line-axis-y-bottom {{
+      bottom: 1.75rem;
+      left: 0.65rem;
+    }}
+    .cx-line-axis-x-left {{
+      left: 3rem;
+      bottom: 0.45rem;
+    }}
+    .cx-line-axis-x-right {{
+      right: 1rem;
+      bottom: 0.45rem;
+    }}
+    </style>
+    """
+    components.html(html_content, height=height + 24, scrolling=False)
+
+
+def _apply_theme() -> None:
+    """Apply the selected app theme with CSS and Plotly template defaults."""
+    mode = str(st.session_state.get("theme_mode") or "Light")
+    dark = mode == "Dark"
+    if HAS_PLOTLY:
+        px.defaults.template = "plotly_dark" if dark else "plotly_white"
+        px.defaults.color_continuous_scale = "Blues" if not dark else "Viridis"
+
+    colors = {
+        "bg": "#0a0e27" if dark else "#ffffff",
+        "panel": "#111827" if dark else "#f8fafc",
+        "panel_2": "#1a202c" if dark else "#ffffff",
+        "text": "#f0f4f8" if dark else "#0f172a",
+        "muted": "#a0aec0" if dark else "#64748b",
+        "border": "#2d3748" if dark else "#e5e7eb",
+        "input": "#0a0e27" if dark else "#ffffff",
+        "input_text": "#f0f4f8" if dark else "#111827",
+        "accent": "#3b82f6" if dark else "#ef4444",
+        "button": "#2563eb" if dark else "#2563eb",
+        "button_text": "#ffffff",
+        "disabled": "#2d3748" if dark else "#e5e7eb",
+        "disabled_text": "#a0aec0" if dark else "#94a3b8",
+        "plot_bg": "#1a202c" if dark else "#ffffff",
+        "grid": "#2d3748" if dark else "#e5e7eb",
+    }
+    color_scheme = "dark" if dark else "light"
+    st.markdown(
+        f"""
+        <style>
+        :root {{
+          color-scheme: {color_scheme};
+        }}
+        .stApp {{
+          background: {colors["bg"]};
+          color: {colors["text"]};
+        }}
+        [data-testid="stSidebar"], [data-testid="stSidebarContent"] {{
+          background: {colors["panel"]} !important;
+          color: {colors["text"]} !important;
+        }}
+        [data-testid="stHeader"], [data-testid="stDecoration"] {{
+          background: {colors["bg"]} !important;
+        }}
+        .stApp h1, .stApp h2, .stApp h3, .stApp h4, .stApp h5, .stApp h6,
+        .stApp p, .stApp label, .stApp span, .stApp div {{
+          color: {colors["text"]};
+        }}
+        [data-testid="stCaptionContainer"], [data-testid="stCaptionContainer"] *,
+        small {{
+          color: {colors["muted"]} !important;
+        }}
+        div[data-testid="stMetric"], div[data-testid="stExpander"],
+        div[data-testid="stDataFrame"], div[data-testid="stTable"] {{
+          background-color: {colors["panel_2"]} !important;
+          border-color: {colors["border"]} !important;
+        }}
+        .cx-table-wrap {{
+          width: 100%;
+          overflow: auto;
+          border: 1px solid {colors["border"]};
+          border-radius: 8px;
+          background: {colors["panel_2"]};
+          margin: 0.35rem 0 1rem;
+        }}
+        table.cx-data-table {{
+          width: 100%;
+          border-collapse: collapse;
+          background: {colors["panel_2"]};
+          color: {colors["text"]};
+          font-size: 0.92rem;
+          line-height: 1.35;
+        }}
+        table.cx-data-table thead th {{
+          position: sticky;
+          top: 0;
+          z-index: 1;
+          background: {colors["panel"]};
+          color: {colors["muted"]};
+          font-weight: 700;
+          text-align: left;
+          border-bottom: 1px solid {colors["border"]};
+          padding: 0.65rem 0.75rem;
+          white-space: nowrap;
+        }}
+        table.cx-data-table tbody td {{
+          background: {colors["panel_2"]};
+          color: {colors["text"]};
+          border-bottom: 1px solid {colors["border"]};
+          padding: 0.58rem 0.75rem;
+          vertical-align: top;
+        }}
+        table.cx-data-table tbody tr:last-child td {{
+          border-bottom: 0;
+        }}
+        table.cx-data-table tbody tr:hover td {{
+          background: {colors["panel"]};
+        }}
+        table.cx-data-table td:nth-child(n+2):not(:last-child),
+        table.cx-data-table th:nth-child(n+2):not(:last-child) {{
+          text-align: right;
+        }}
+        input, textarea, select,
+        div[data-baseweb="input"], div[data-baseweb="input"] > div,
+        div[data-baseweb="base-input"], div[data-baseweb="textarea"],
+        div[data-baseweb="select"], div[data-baseweb="select"] > div {{
+          color-scheme: {color_scheme};
+          background-color: {colors["input"]} !important;
+          color: {colors["input_text"]} !important;
+          border-color: {colors["border"]} !important;
+        }}
+        input, textarea {{
+          -webkit-text-fill-color: {colors["input_text"]} !important;
+        }}
+        input::placeholder, textarea::placeholder {{
+          color: {colors["muted"]} !important;
+          -webkit-text-fill-color: {colors["muted"]} !important;
+        }}
+        [data-testid="stWidgetLabel"], [data-testid="stWidgetLabel"] *,
+        [data-testid="stRadio"] label, [data-testid="stRadio"] label *,
+        div[role="radiogroup"] label, div[role="radiogroup"] label * {{
+          color: {colors["text"]} !important;
+          opacity: 1 !important;
+        }}
+        div[role="radiogroup"] [data-baseweb="radio"] {{
+          color: {colors["text"]} !important;
+        }}
+        div[role="radiogroup"] [aria-checked="true"] div {{
+          border-color: {colors["accent"]} !important;
+        }}
+        .stButton > button, button[kind="primary"], button[kind="secondary"] {{
+          background-color: {colors["button"]} !important;
+          color: {colors["button_text"]} !important;
+          border-color: {colors["button"]} !important;
+        }}
+        .stButton > button:disabled, button:disabled {{
+          background-color: {colors["disabled"]} !important;
+          color: {colors["disabled_text"]} !important;
+          border-color: {colors["border"]} !important;
+          opacity: 1 !important;
+        }}
+        section[data-testid="stFileUploaderDropzone"] {{
+          background-color: {colors["panel_2"]} !important;
+          border: 1px solid {colors["border"]} !important;
+        }}
+        section[data-testid="stFileUploaderDropzone"] * {{
+          color: {colors["text"]} !important;
+        }}
+        section[data-testid="stFileUploaderDropzone"] button {{
+          background-color: {colors["input"]} !important;
+          color: {colors["input_text"]} !important;
+          border-color: {colors["border"]} !important;
+        }}
+        button[data-baseweb="tab"] p {{
+          color: {colors["muted"]} !important;
+        }}
+        button[data-baseweb="tab"][aria-selected="true"] p {{
+          color: {colors["accent"]} !important;
+        }}
+        button[data-baseweb="tab"][aria-selected="true"] {{
+          border-bottom-color: {colors["accent"]} !important;
+        }}
+        [data-testid="stAlert"] {{
+          color: {colors["text"]} !important;
+        }}
+        [data-testid="stAlert"] * {{
+          color: inherit !important;
+        }}
+        [data-testid="stSidebar"] hr {{
+          border-color: {colors["border"]} !important;
+        }}
+        </style>
+        """,
+        unsafe_allow_html=True,
+    )
+
+
+def _plotly_layout(fig, height: int | None = None, **layout):
+    """Apply app theme colors to Plotly figures."""
+    dark = str(st.session_state.get("theme_mode") or "Light") == "Dark"
+    bg = "#0a0e27" if dark else "#ffffff"
+    panel = "#1a202c" if dark else "#ffffff"
+    text = "#f0f4f8" if dark else "#0f172a"
+    grid = "#2d3748" if dark else "#e5e7eb"
+    base = {
+        "template": "plotly_dark" if dark else "plotly_white",
+        "paper_bgcolor": bg,
+        "plot_bgcolor": panel,
+        "font": {"color": text},
+        "legend": {"bgcolor": "rgba(0,0,0,0)", "font": {"color": text}},
+        "margin": dict(t=10, b=10),
+    }
+    if height is not None:
+        base["height"] = height
+    base.update(layout)
+    fig.update_layout(**base)
+    fig.update_xaxes(gridcolor=grid, zerolinecolor=grid, linecolor=grid, tickfont={"color": text}, title_font={"color": text})
+    fig.update_yaxes(gridcolor=grid, zerolinecolor=grid, linecolor=grid, tickfont={"color": text}, title_font={"color": text})
+    try:
+        fig.update_traces(textfont_color=text, insidetextfont_color=text, outsidetextfont_color=text)
+    except Exception:
+        pass
+    return fig
+
+
+def _render_plotly(fig) -> None:
+    st.plotly_chart(fig, use_container_width=True, config={"displayModeBar": True, "responsive": True})
+
+
 # --------- Sidebar ---------
 
 
 def render_sidebar() -> None:
     with st.sidebar:
+        st.markdown("## Display")
+        # Dark mode only
+        st.session_state.theme_mode = "Dark"
+        st.markdown("---")
+
         st.markdown("## API Settings")
         st.text_input(
             "Base URL",
-            value=st.session_state.api_base_url,
             key="api_base_url",
             help="OpenAI-compatible base URL.",
         )
         st.text_input(
             "API Key",
-            value=st.session_state.api_key,
             key="api_key",
             type="password",
         )
@@ -278,7 +816,6 @@ def render_sidebar() -> None:
         else:
             st.text_input(
                 "Model",
-                value=st.session_state.selected_model,
                 key="selected_model",
                 help="Click 'Load available models' to populate this dropdown.",
             )
@@ -313,7 +850,7 @@ def render_sidebar() -> None:
             key="max_conversations",
         )
         st.number_input(
-            "Max agent messages per conversation",
+            "Max target messages per conversation",
             min_value=1,
             max_value=2000,
             step=1,
@@ -325,14 +862,14 @@ def render_sidebar() -> None:
             key="message_target_role",
             horizontal=True,
             format_func=lambda v: {
-                "agent": "Agent messages",
+                "agent": "Assistant messages",
                 "customer": "Customer messages",
             }.get(v, v),
             help=(
-                "Agent: judge each agent reply — how it responded to a "
+                "Assistant: judge each assistant reply — how it responded to a "
                 "possibly-frustrated customer message.\n\n"
                 "Customer: judge each customer message — capture the customer's "
-                "state / frustration BEFORE the agent answers."
+                "state / frustration BEFORE the assistant answers."
             ),
         )
         st.toggle("Truncate message text", key="truncate_messages")
@@ -398,7 +935,7 @@ def tab_upload() -> None:
             ("Rows", f"{summary.get('rows', 0):,}", None),
             ("Conversations", f"{summary.get('conversations', 0):,}", None),
             ("Customer messages", f"{summary.get('customer_messages', 0):,}", None),
-            ("Agent messages", f"{summary.get('agent_messages', 0):,}", None),
+            ("Assistant messages", f"{summary.get('agent_messages', 0):,}", None),
             ("Unknown messages", f"{summary.get('unknown_messages', 0):,}", None),
         ]
     )
@@ -715,12 +1252,12 @@ def tab_run() -> None:
         )
 
     st.markdown("### Evaluation estimate")
-    role_label = "agent" if target_role == "agent" else "customer"
+    role_label = "assistant" if target_role == "agent" else "customer"
     st.caption(
         f"Message-level layer will evaluate **{role_label} messages** "
-        + ("(judging the agent's response to a possibly-frustrated customer message)."
-           if role_label == "agent"
-           else "(capturing the customer's state / frustration before the agent answers).")
+        + ("(judging the assistant's response to a possibly-frustrated customer message)."
+           if target_role == "agent"
+           else "(capturing the customer's state / frustration before the assistant answers).")
     )
     metric_row(
         [
@@ -735,7 +1272,7 @@ def tab_run() -> None:
     if large_job:
         st.warning(
             f"This run will make ~{estimate['total_calls']:,} AI calls. "
-            "Consider lowering Max conversations or Max agent messages per conversation in the sidebar."
+            "Consider lowering Max conversations or Max target messages per conversation in the sidebar."
         )
 
     run_col, cancel_col, _ = st.columns([1, 1, 4])
@@ -778,7 +1315,7 @@ def tab_run() -> None:
             "retries": config.api.retries,
             "concurrency": config.api.concurrency,
             "max_conversations": config.max_conversations,
-            "max_agent_messages_per_conv": config.max_agent_messages_per_conv,
+            "max_target_messages_per_conversation": config.max_agent_messages_per_conv,
             "truncate_messages": config.truncate_messages,
             "max_chars_per_message": config.max_chars_per_message,
             "include_unknown_in_history": config.include_unknown_in_history,
@@ -805,7 +1342,7 @@ def tab_run() -> None:
                 current_box.info(
                     f"Conversation {evt.get('conversation_index')}/{evt.get('total_conversations')} — "
                     f"ID `{evt.get('conversation_id')}` — "
-                    f"{evt.get('agent_messages', 0)} agent messages"
+                    f"{evt.get('agent_messages', 0)} target messages"
                 )
             elif phase == "message_done":
                 progress_state["calls_done"] += 1
@@ -839,12 +1376,14 @@ def tab_run() -> None:
 
         def save_message(mr: dict) -> None:
             try:
+                mr["run_id"] = run_id
                 db.save_message_result(run_id, mr)
             except Exception:
                 pass
 
         def save_conversation(cr: dict) -> None:
             try:
+                cr["run_id"] = run_id
                 db.save_conversation_result(run_id, cr)
             except Exception:
                 pass
@@ -922,7 +1461,7 @@ def tab_dashboard() -> None:
     conv_df = _conv_dataframe_from_results()
     msg_df = _msg_dataframe_from_results()
 
-    filters = conversation_filters(conv_df)
+    filters = _conversation_filters_with_keys(conv_df, "dashboard_filters")
     filtered = apply_conversation_filters(conv_df, filters)
     agg = dashboard_aggregates(filtered)
 
@@ -944,74 +1483,128 @@ def tab_dashboard() -> None:
     )
 
     st.markdown("---")
-    left, right = st.columns(2)
-    with left:
-        st.markdown("#### Classification distribution")
-        if agg["classification_counts"]:
-            cls_df = pd.DataFrame(
-                [{"Classification": k, "Count": v} for k, v in agg["classification_counts"].items()]
-            )
-            if HAS_PLOTLY:
-                fig = px.bar(cls_df, x="Classification", y="Count", text="Count", color="Classification")
-                fig.update_layout(showlegend=False, xaxis_tickangle=-15, height=380, margin=dict(t=20, b=10))
-                st.plotly_chart(fig, use_container_width=True)
-            else:
-                st.bar_chart(cls_df.set_index("Classification"))
-        else:
-            st.write("No data.")
+    classification_order = [
+        "Handled with Minimal Issues",
+        "Handled with Many Issues",
+        "Handled with Minimal Issues and Frustration",
+        "Handled with Many Issues and Frustration",
+        "Handled with Minimal Caused Issues and Frustration",
+        "Handled with Many Caused Issues and Frustration",
+        "Not Handled with Minimal Issues",
+        "Not Handled with Many Issues",
+        "Not Handled with Minimal Issues and Frustration",
+        "Not Handled with Many Issues and Frustration",
+        "Not Handled with Minimal Caused Issues and Frustration",
+        "Not Handled with Many Caused Issues and Frustration",
+    ]
+    total_filtered = int(len(filtered))
+    if "final_classification" in filtered.columns and total_filtered:
+        class_counts = filtered["final_classification"].fillna("Unknown").value_counts()
+    else:
+        class_counts = pd.Series(dtype=int)
 
-        st.markdown("#### Handled vs Unhandled")
-        if "handled_status" in filtered.columns and not filtered.empty:
-            hs_df = filtered["handled_status"].fillna("unknown").value_counts().reset_index()
-            hs_df.columns = ["handled_status", "count"]
-            if HAS_PLOTLY:
-                fig = px.pie(hs_df, names="handled_status", values="count", hole=0.45)
-                fig.update_layout(height=340, margin=dict(t=10, b=10))
-                st.plotly_chart(fig, use_container_width=True)
-            else:
-                st.bar_chart(hs_df.set_index("handled_status"))
-        else:
-            st.write("No data.")
+    classification_rows = []
+    seen_classes = set()
+    for classification in classification_order:
+        count = int(class_counts.get(classification, 0))
+        pct = (count / total_filtered * 100.0) if total_filtered else 0.0
+        classification_rows.append(
+            {
+                "Classification": classification,
+                "Count": count,
+                "Percentage": pct,
+                "Share": f"{pct:.1f}%",
+                "Outcome": "Handled" if classification.startswith("Handled") else "Unhandled",
+            }
+        )
+        seen_classes.add(classification)
+    for classification, count in class_counts.items():
+        if classification in seen_classes:
+            continue
+        pct = (int(count) / total_filtered * 100.0) if total_filtered else 0.0
+        classification_rows.append(
+            {
+                "Classification": classification,
+                "Count": int(count),
+                "Percentage": pct,
+                "Share": f"{pct:.1f}%",
+                "Outcome": "Other",
+            }
+        )
+    cls_df = pd.DataFrame(classification_rows)
 
-    with right:
-        st.markdown("#### Zero/Minimal vs Many Issues")
-        if "cx_issue_severity" in filtered.columns and not filtered.empty:
-            sev_df = filtered["cx_issue_severity"].fillna("unknown").value_counts().reset_index()
-            sev_df.columns = ["cx_issue_severity", "count"]
-            if HAS_PLOTLY:
-                fig = px.pie(sev_df, names="cx_issue_severity", values="count", hole=0.45)
-                fig.update_layout(height=340, margin=dict(t=10, b=10))
-                st.plotly_chart(fig, use_container_width=True)
-            else:
-                st.bar_chart(sev_df.set_index("cx_issue_severity"))
-        else:
-            st.write("No data.")
+    st.markdown("#### Final classification percentages")
+    _render_display_table(
+        cls_df[["Classification", "Count", "Share"]],
+    )
+    if HAS_PLOTLY and not cls_df.empty:
+        fig = px.bar(
+            cls_df,
+            x="Percentage",
+            y="Classification",
+            color="Outcome",
+            orientation="h",
+            text="Share",
+            hover_data=["Count"],
+        )
+        _plotly_layout(
+            fig,
+            height=430,
+            xaxis_title="Percent of filtered conversations",
+            yaxis_title="",
+            xaxis=dict(range=[0, 100]),
+            yaxis=dict(autorange="reversed"),
+        )
+        _render_plotly(fig)
+    elif not cls_df.empty:
+        _render_simple_bar_chart(
+            cls_df,
+            "Classification",
+            "Percentage",
+            height=360,
+            max_value=100,
+            value_suffix="%",
+        )
 
-        st.markdown("#### Unhandled subtype")
-        if agg["unhandled_subtype_counts"]:
-            subtype_df = pd.DataFrame(
-                [{"Subtype": k, "Count": v} for k, v in agg["unhandled_subtype_counts"].items()]
-            )
-            if HAS_PLOTLY:
-                fig = px.bar(subtype_df, x="Subtype", y="Count", text="Count", color="Subtype")
-                fig.update_layout(showlegend=False, height=340, margin=dict(t=10, b=10), xaxis_tickangle=-15)
-                st.plotly_chart(fig, use_container_width=True)
-            else:
-                st.bar_chart(subtype_df.set_index("Subtype"))
-        else:
-            st.write("No data.")
-
+    st.markdown("---")
+    c_breakdown_1, c_breakdown_2 = st.columns(2)
+    with c_breakdown_1:
         st.markdown("#### Issue origin distribution")
         if agg["issue_origin_counts"]:
             io_df = pd.DataFrame(
-                [{"Origin": k, "Count": v} for k, v in agg["issue_origin_counts"].items()]
+                [{"Origin": humanize_label(k), "Count": v} for k, v in agg["issue_origin_counts"].items() if k.lower() != "none"]
             )
             if HAS_PLOTLY:
-                fig = px.bar(io_df, x="Origin", y="Count", text="Count", color="Origin")
-                fig.update_layout(showlegend=False, height=340, margin=dict(t=10, b=10))
-                st.plotly_chart(fig, use_container_width=True)
+                fig = px.treemap(
+                    io_df,
+                    path=["Origin"],
+                    values="Count",
+                    color="Count",
+                    color_continuous_scale=["#0f4c5c", "#2c7da0", "#468faf", "#89c2d9"],
+                )
+                _plotly_layout(fig, height=340)
+                _render_plotly(fig)
             else:
-                st.bar_chart(io_df.set_index("Origin"))
+                _render_simple_bar_chart(io_df, "Origin", "Count", height=300)
+        else:
+            st.write("No data.")
+
+    with c_breakdown_2:
+        st.markdown("#### Unhandled subtype")
+        if agg["unhandled_subtype_counts"]:
+            subtype_df = pd.DataFrame(
+                [{"Subtype": humanize_label(k), "Count": v} for k, v in agg["unhandled_subtype_counts"].items() if k.lower() != "not applicable"]
+            )
+            subtype_df = subtype_df[subtype_df["Count"] > 0]
+            subtype_total = max(int(subtype_df["Count"].sum()), 1)
+            subtype_df["Share"] = subtype_df["Count"].apply(lambda c: f"{(c / subtype_total * 100):.1f}%")
+            if HAS_PLOTLY:
+                fig = px.pie(subtype_df, names="Subtype", values="Count", hole=0.55)
+                fig.update_traces(textposition="inside", textinfo="percent+label")
+                _plotly_layout(fig, height=340)
+                _render_plotly(fig)
+            else:
+                _render_simple_bar_chart(subtype_df, "Subtype", "Count", height=300)
         else:
             st.write("No data.")
 
@@ -1022,15 +1615,25 @@ def tab_dashboard() -> None:
         if agg["issue_type_counts"]:
             it_df = (
                 pd.DataFrame([{"Issue type": k, "Count": v} for k, v in agg["issue_type_counts"].items()])
+                .assign(**{"Issue type": lambda d: d["Issue type"].apply(humanize_label)})
+                .query("Count > 0")
                 .sort_values("Count", ascending=False)
                 .head(12)
             )
             if HAS_PLOTLY:
-                fig = px.bar(it_df, x="Count", y="Issue type", orientation="h", text="Count")
-                fig.update_layout(height=400, margin=dict(t=10, b=10), yaxis=dict(autorange="reversed"))
-                st.plotly_chart(fig, use_container_width=True)
+                fig = px.scatter(
+                    it_df,
+                    x="Count",
+                    y="Issue type",
+                    size="Count",
+                    color="Count",
+                    text="Count",
+                )
+                fig.update_traces(textposition="middle right")
+                _plotly_layout(fig, height=400, yaxis=dict(autorange="reversed"))
+                _render_plotly(fig)
             else:
-                st.bar_chart(it_df.set_index("Issue type"))
+                _render_simple_bar_chart(it_df, "Issue type", "Count", height=360)
         else:
             st.write("No data.")
 
@@ -1038,12 +1641,14 @@ def tab_dashboard() -> None:
         st.markdown("#### Top frustration causes")
         causes = top_frustration_causes(msg_df, top_n=15)
         if not causes.empty:
+            causes = causes.copy()
+            causes["frustration_cause"] = causes["frustration_cause"].apply(humanize_label)
             if HAS_PLOTLY:
                 fig = px.bar(causes, x="count", y="frustration_cause", orientation="h", text="count")
-                fig.update_layout(height=400, margin=dict(t=10, b=10), yaxis=dict(autorange="reversed"))
-                st.plotly_chart(fig, use_container_width=True)
+                _plotly_layout(fig, height=400, yaxis=dict(autorange="reversed"))
+                _render_plotly(fig)
             else:
-                st.bar_chart(causes.set_index("frustration_cause"))
+                _render_simple_bar_chart(causes, "frustration_cause", "count", height=360)
         else:
             st.write("No frustration causes identified.")
 
@@ -1053,7 +1658,10 @@ def tab_dashboard() -> None:
     if not metric_totals.empty:
         metric_view = metric_totals.copy()
         metric_view["Total"] = pd.to_numeric(metric_view["Total"], errors="coerce").fillna(0)
-        metric_view["Average"] = pd.to_numeric(metric_view["Average"], errors="coerce").fillna(0)
+        metric_view["Average when flagged"] = pd.to_numeric(
+            metric_view["Average"], errors="coerce"
+        ).fillna(0)
+        metric_view = metric_view.drop(columns=["Average"])
         metric_view["Conversations > 0"] = pd.to_numeric(
             metric_view["Conversations > 0"], errors="coerce"
         ).fillna(0).astype(int)
@@ -1080,7 +1688,7 @@ def tab_dashboard() -> None:
                 "Total descending",
                 "Contributing conversations descending",
                 "Category then metric",
-                "Average descending",
+                "Average when flagged descending",
             ],
             index=0,
         )
@@ -1105,7 +1713,10 @@ def tab_dashboard() -> None:
                 [False, False, True, True],
             ),
             "Category then metric": (["Category", "Metric"], [True, True]),
-            "Average descending": (["Average", "Total", "Category", "Metric"], [False, False, True, True]),
+            "Average when flagged descending": (
+                ["Average when flagged", "Total", "Category", "Metric"],
+                [False, False, True, True],
+            ),
         }
         sort_cols, sort_asc = sort_map[sort_mode]
         metric_view = metric_view.sort_values(sort_cols, ascending=sort_asc)
@@ -1113,7 +1724,7 @@ def tab_dashboard() -> None:
         if metric_view.empty:
             st.caption("No metrics match the selected filters.")
         else:
-            top_metrics = metric_view.head(15)
+            top_metrics = metric_view[metric_view["Total"] > 0].head(15)
             if HAS_PLOTLY:
                 fig = px.bar(
                     top_metrics,
@@ -1122,12 +1733,12 @@ def tab_dashboard() -> None:
                     color="Category",
                     orientation="h",
                     text="Total",
-                    hover_data=["Average", "Conversations > 0"],
+                    hover_data=["Average when flagged", "Conversations > 0"],
                 )
-                fig.update_layout(height=520, margin=dict(t=10, b=10), yaxis=dict(autorange="reversed"))
-                st.plotly_chart(fig, use_container_width=True)
+                _plotly_layout(fig, height=520, yaxis=dict(autorange="reversed"))
+                _render_plotly(fig)
             else:
-                st.bar_chart(top_metrics.set_index("Metric")["Total"])
+                _render_simple_bar_chart(top_metrics, "Metric", "Total", height=460)
 
             contributor_base_cols = [
                 "conversation_id",
@@ -1178,9 +1789,9 @@ def tab_dashboard() -> None:
                     expanded=len(metric_view["Category"].unique()) == 1,
                 ):
                     category_table = category_metrics[
-                        ["Metric", "Total", "Average", "Conversations > 0"]
+                        ["Metric", "Total", "Average when flagged", "Conversations > 0"]
                     ].copy()
-                    st.dataframe(category_table, use_container_width=True, hide_index=True)
+                    _render_display_table(category_table, height=260)
                     st.caption(f"Category total across displayed metrics: {category_total:g}")
 
                     metric_options = category_metrics["Metric"].tolist()
@@ -1193,6 +1804,12 @@ def tab_dashboard() -> None:
                     metric_col = selected_row.get("Column") or metric_column_lookup.get(
                         (category, selected_metric)
                     )
+                    
+                    # Show metric definition
+                    if metric_col:
+                        definition = get_metric_definition(metric_col)
+                        if definition:
+                            st.info(definition)
                     if metric_col in filtered.columns:
                         values = pd.to_numeric(filtered[metric_col], errors="coerce").fillna(0)
                         contributors = filtered.loc[values > 0].copy()
@@ -1203,31 +1820,24 @@ def tab_dashboard() -> None:
                             ["metric_value", "conversation_id"],
                             ascending=[False, True],
                         )
+                        contributor_table = _prepare_display_table(
+                            contributor_table,
+                            [
+                                "handled_status",
+                                "cx_issue_severity",
+                                "unhandled_resolution_subtype",
+                                "main_issue_type",
+                            ],
+                        )
                         st.caption(
                             f"{len(contributor_table):,} conversations contributed to "
                             f"{selected_metric}."
                         )
-                        st.dataframe(contributor_table, use_container_width=True, hide_index=True)
+                        _render_display_table(contributor_table, height=360)
                     else:
                         st.caption("This metric column is not available in the filtered conversation table.")
     else:
         st.caption("No quantifiable metrics returned by the conversation-level evaluator yet.")
-
-    st.markdown("---")
-    c3, c4 = st.columns(2)
-    with c3:
-        st.markdown("#### Agent-level summary")
-        if not agg["agent_breakdown"].empty:
-            st.dataframe(agg["agent_breakdown"], use_container_width=True, hide_index=True)
-        else:
-            st.caption("Agent names not available in the CSV.")
-
-    with c4:
-        st.markdown("#### Skill-level summary")
-        if not agg["skill_breakdown"].empty:
-            st.dataframe(agg["skill_breakdown"], use_container_width=True, hide_index=True)
-        else:
-            st.caption("Skill columns not available in the CSV.")
 
     st.markdown("#### Date / time summary")
     if "conversation_start_date" in filtered.columns and not filtered.empty:
@@ -1238,10 +1848,10 @@ def tab_dashboard() -> None:
             if not daily.empty:
                 if HAS_PLOTLY:
                     fig = px.line(daily, x="_d", y="count", markers=True)
-                    fig.update_layout(height=300, margin=dict(t=10, b=10), xaxis_title="Date", yaxis_title="Conversations")
-                    st.plotly_chart(fig, use_container_width=True)
+                    _plotly_layout(fig, height=300, xaxis_title="Date", yaxis_title="Conversations")
+                    _render_plotly(fig)
                 else:
-                    st.line_chart(daily.set_index("_d"))
+                    _render_simple_line_chart(daily, "_d", "count", height=300)
             else:
                 st.caption("No parseable dates.")
         except Exception:
@@ -1256,11 +1866,14 @@ def tab_dashboard() -> None:
         "customer_name",
         "customer_phone",
         "conversation_start_date",
-        "initial_skill",
-        "last_skill",
         "final_classification",
         "handled_status",
         "cx_issue_severity",
+        "frustration_detected",
+        "customer_started_frustrated",
+        "customer_became_frustrated_during_chat",
+        "customer_ended_frustrated",
+        "frustration_timing",
         "unhandled_resolution_subtype",
         "final_customer_sentiment",
         "max_frustration_level",
@@ -1279,7 +1892,22 @@ def tab_dashboard() -> None:
     ]
     display_cols.extend(quantifiable_metric_columns(filtered))
     existing_cols = [c for c in display_cols if c in filtered.columns]
-    st.dataframe(filtered[existing_cols], use_container_width=True, hide_index=True)
+    conversation_table = _prepare_display_table(
+        filtered[existing_cols],
+        [
+            "handled_status",
+            "cx_issue_severity",
+            "frustration_detected",
+            "frustration_timing",
+            "unhandled_resolution_subtype",
+            "final_customer_sentiment",
+            "max_frustration_level",
+            "main_issue_type",
+            "main_issue_origin",
+            "confidence",
+        ],
+    )
+    _render_display_table(conversation_table, height=520)
 
     st.markdown("### Message-level results")
     message_display_cols = [
@@ -1305,7 +1933,21 @@ def tab_dashboard() -> None:
     ]
     message_existing_cols = [c for c in message_display_cols if c in msg_df.columns]
     if message_existing_cols:
-        st.dataframe(msg_df[message_existing_cols], use_container_width=True, hide_index=True)
+        message_table = _prepare_display_table(
+            msg_df[message_existing_cols],
+            [
+                "message_level_effect",
+                "frustration_level_after_message",
+                "frustration_change",
+                "customer_effort_level",
+                "clarity_level",
+                "context_handling",
+                "issue_origin",
+                "issue_type",
+                "parse_status",
+            ],
+        )
+        _render_display_table(message_table, height=520)
     else:
         st.caption("No message-level results available.")
 
@@ -1320,26 +1962,72 @@ def tab_review() -> None:
         return
 
     rr = st.session_state.run_results
+    conv_df = _conv_dataframe_from_results()
+    if conv_df.empty:
+        st.info("No conversation results are available yet.")
+        return
+
+    st.caption(
+        "Browse conversations by result, customer frustration, review priority, or the main customer problem."
+    )
+
+    review_filters = _conversation_filters_with_keys(conv_df, "review_filters")
+    filtered_df = apply_conversation_filters(conv_df, review_filters)
+
+    search = st.text_input(
+        "Search by conversation ID, customer name, result, or problem summary",
+        value="",
+    ).strip()
+    if search:
+        search_text = search.lower()
+        search_cols = [
+            "conversation_id",
+            "customer_name",
+            "final_classification",
+            "main_issue_summary",
+        ]
+        mask = pd.Series(False, index=filtered_df.index)
+        for col in search_cols:
+            if col in filtered_df.columns:
+                mask = mask | filtered_df[col].fillna("").astype(str).str.lower().str.contains(search_text, regex=False)
+        filtered_df = filtered_df[mask]
+
+    if filtered_df.empty:
+        st.warning("No conversations match the current filters.")
+        return
+
+    metric_row(
+        [
+            ("Conversations shown", f"{len(filtered_df):,}", None),
+            (
+                "Handled",
+                f"{int((filtered_df.get('handled_status') == 'handled').sum()):,}",
+                None,
+            ),
+            (
+                "Need human review",
+                f"{int(filtered_df.get('manual_review_required', pd.Series(dtype=bool)).fillna(False).astype(bool).sum()):,}",
+                None,
+            ),
+            (
+                "High frustration",
+                f"{int(filtered_df.get('max_frustration_level', pd.Series(dtype=str)).isin(['high', 'cancellation_risk']).sum()):,}",
+                None,
+            ),
+        ]
+    )
+
     options = []
     label_to_id = {}
-    for cr in rr.conversation_results:
-        cid = cr.get("conversation_id", "")
-        md = cr.get("conversation_metadata", {}) or {}
-        pj = cr.get("parsed_json", {}) or {}
-        cust = md.get("customer_name") or "—"
-        label = f"{cid} • {cust} • {pj.get('final_classification', 'Unknown')}"
+    for row in filtered_df.to_dict(orient="records"):
+        cid = row.get("conversation_id", "")
+        cust = row.get("customer_name") or "—"
+        result = row.get("final_classification") or "Unknown"
+        label = f"{cid} • {cust} • {result}"
         options.append(label)
         label_to_id[label] = cid
 
-    search = st.text_input("Search by conversation id, customer name, or classification", value="")
-    filtered_options = (
-        [o for o in options if search.lower() in o.lower()] if search else options
-    )
-    if not filtered_options:
-        st.warning("No conversations match your search.")
-        return
-
-    selection = st.selectbox("Select a conversation", filtered_options, index=0)
+    selection = st.selectbox("Open a conversation", options, index=0)
     target_id = label_to_id[selection]
     target_cr = next((c for c in rr.conversation_results if c.get("conversation_id") == target_id), None)
     if not target_cr:
@@ -1348,10 +2036,9 @@ def tab_review() -> None:
 
     render_conversation_summary_card(target_cr)
 
-    st.markdown("### Transcript with inline evaluations")
+    st.markdown("### Full Conversation")
     st.caption(
-        "Each agent message includes its message-level evaluation directly below it. "
-        "Customer and unknown messages are shown for context."
+        "The full conversation is shown below. Where available, assistant replies also include a short quality check underneath."
     )
     transcript = target_cr.get("transcript") or []
     msgs = target_cr.get("message_level_results") or []
@@ -1380,7 +2067,7 @@ def tab_exports() -> None:
         "timeout": st.session_state.timeout,
         "retries": st.session_state.retries,
         "max_conversations": st.session_state.max_conversations,
-        "max_agent_messages_per_conv": st.session_state.max_agent_messages_per_conv,
+        "max_target_messages_per_conversation": st.session_state.max_agent_messages_per_conv,
         "truncate_messages": st.session_state.truncate_messages,
         "max_chars_per_message": st.session_state.max_chars_per_message,
         "include_unknown_in_history": st.session_state.include_unknown_in_history,
@@ -1413,7 +2100,7 @@ def tab_exports() -> None:
         )
     with c2:
         st.markdown("#### Message-Level CSV")
-        st.caption("One row per evaluated agent message.")
+        st.caption("One row per evaluated assistant message.")
         st.download_button(
             "Download message_results.csv",
             data=msg_bytes,
@@ -1502,7 +2189,11 @@ def tab_debug() -> None:
             with st.expander("Conversation-level raw model response"):
                 st.code(target.get("raw_model_response") or "—")
             with st.expander("Computed metadata"):
-                st.json(target.get("computed_metadata") or {}, expanded=False)
+                visible_cm = {
+                    k: v for k, v in (target.get("computed_metadata") or {}).items()
+                    if k not in {"agent_messages", "agent_messages_evaluated"}
+                }
+                st.json(visible_cm, expanded=False)
             with st.expander("Message-level records (parsed)"):
                 st.json(
                     [
@@ -1532,7 +2223,7 @@ def tab_debug() -> None:
         "timeout": st.session_state.timeout,
         "retries": st.session_state.retries,
         "max_conversations": st.session_state.max_conversations,
-        "max_agent_messages_per_conv": st.session_state.max_agent_messages_per_conv,
+        "max_target_messages_per_conversation": st.session_state.max_agent_messages_per_conv,
         "truncate_messages": st.session_state.truncate_messages,
         "max_chars_per_message": st.session_state.max_chars_per_message,
         "include_unknown_in_history": st.session_state.include_unknown_in_history,
@@ -1547,17 +2238,18 @@ def tab_debug() -> None:
 
 
 def main() -> None:
+    _apply_theme()
+    render_sidebar()
+
     st.title("CX Conversation Evaluator")
     st.caption(
-        "AI-as-a-Judge evaluation of customer/agent conversations. "
+        "AI-as-a-Judge evaluation of customer/assistant conversations. "
         "Built for management review — focused on outcomes, frustration, and root cause."
     )
 
     # Force DB initialization at app start so the seeded defaults exist before
     # any tab tries to read them.
     get_db()
-
-    render_sidebar()
 
     tabs = st.tabs(
         [
