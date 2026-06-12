@@ -156,12 +156,93 @@ def validate_message_level_result(data: dict) -> dict:
     return out
 
 
-_CL_CLASSIFICATIONS = {
-    "Handled with Zero/Minimal Issues",
-    "Handled with Many Issues",
-    "Unhandled with Zero/Minimal Issues",
-    "Unhandled with Many Issues",
+_CL_CLASSIFICATION_RULES = {
+    "Handled with Zero/Minimal Issues": ("handled", "zero_minimal", "not_applicable"),
+    "Handled with Many Issues": ("handled", "many", "not_applicable"),
+    "Unhandled with Zero/Minimal Issues - Totally Definitive Unresolved": (
+        "unhandled",
+        "zero_minimal",
+        "totally_definitive_unresolved",
+    ),
+    "Unhandled with Zero/Minimal Issues - Pending Unresolved": (
+        "unhandled",
+        "zero_minimal",
+        "pending_unresolved",
+    ),
+    "Unhandled with Many Issues - Totally Definitive Unresolved": (
+        "unhandled",
+        "many",
+        "totally_definitive_unresolved",
+    ),
+    "Unhandled with Many Issues - Pending Unresolved": (
+        "unhandled",
+        "many",
+        "pending_unresolved",
+    ),
 }
+
+_UNHANDLED_SUBTYPES = {
+    "not_applicable",
+    "totally_definitive_unresolved",
+    "pending_unresolved",
+}
+
+
+def _normalize_unhandled_subtype(value: Any) -> str:
+    subtype = str(value or "").strip().lower().replace(" ", "_").replace("-", "_")
+    if subtype in {"n/a", "na", "none", "not_applicable"}:
+        return "not_applicable"
+    if subtype in {"totally_definitive_unresolved", "definitive_unresolved", "definitive"}:
+        return "totally_definitive_unresolved"
+    if subtype in {"pending_unresolved", "pending"}:
+        return "pending_unresolved"
+    return ""
+
+
+def _classification_from_parts(handled_status: str, severity: str, subtype: str) -> str:
+    for classification, parts in _CL_CLASSIFICATION_RULES.items():
+        if parts == (handled_status, severity, subtype):
+            return classification
+    if handled_status == "handled":
+        return "Handled with Many Issues" if severity == "many" else "Handled with Zero/Minimal Issues"
+    if subtype == "pending_unresolved":
+        return (
+            "Unhandled with Many Issues - Pending Unresolved"
+            if severity == "many"
+            else "Unhandled with Zero/Minimal Issues - Pending Unresolved"
+        )
+    return (
+        "Unhandled with Many Issues - Totally Definitive Unresolved"
+        if severity == "many"
+        else "Unhandled with Zero/Minimal Issues - Totally Definitive Unresolved"
+    )
+
+
+def _normalize_quantifiable_metrics(value: Any) -> list[dict]:
+    if not isinstance(value, list):
+        return []
+
+    out: list[dict[str, Any]] = []
+    for item in value:
+        if not isinstance(item, dict):
+            continue
+        category = str(item.get("category") or "").strip()
+        metrics = item.get("metrics") or {}
+        if not category or not isinstance(metrics, dict):
+            continue
+
+        clean_metrics: dict[str, float | int] = {}
+        for key, raw in metrics.items():
+            metric_name = str(key or "").strip()
+            if not metric_name:
+                continue
+            try:
+                num = float(raw)
+            except (TypeError, ValueError):
+                num = 0.0
+            clean_metrics[metric_name] = int(num) if num.is_integer() else num
+        out.append({"category": category, "metrics": clean_metrics})
+    return out
 
 
 def validate_conversation_level_result(data: dict) -> dict:
@@ -179,20 +260,35 @@ def validate_conversation_level_result(data: dict) -> dict:
     out["customer_primary_objective"] = str(data.get("customer_primary_objective", "") or "")
 
     classification = str(data.get("final_classification", "") or "").strip()
-    if classification not in _CL_CLASSIFICATIONS:
-        classification = "Unhandled with Many Issues" if "many" in classification.lower() else "Handled with Zero/Minimal Issues"
-        classification = classification if classification in _CL_CLASSIFICATIONS else "Handled with Zero/Minimal Issues"
-    out["final_classification"] = classification
-
     handled_status = str(data.get("handled_status", "") or "").strip().lower()
-    if handled_status not in {"handled", "unhandled"}:
-        handled_status = "handled" if classification.startswith("Handled") else "unhandled"
-    out["handled_status"] = handled_status
-
     severity = str(data.get("cx_issue_severity", "") or "").strip().lower().replace(" ", "_")
-    if severity not in {"zero_minimal", "many"}:
-        severity = "many" if "Many" in classification else "zero_minimal"
+    subtype = _normalize_unhandled_subtype(data.get("unhandled_resolution_subtype"))
+
+    if classification in _CL_CLASSIFICATION_RULES:
+        handled_status, severity, subtype = _CL_CLASSIFICATION_RULES[classification]
+    else:
+        # Backward-compatible recovery for older four-label outputs.
+        if handled_status not in {"handled", "unhandled"}:
+            handled_status = "handled" if classification.startswith("Handled") else "unhandled"
+        if severity not in {"zero_minimal", "many"}:
+            severity = "many" if "Many" in classification else "zero_minimal"
+        if handled_status == "handled":
+            subtype = "not_applicable"
+        elif subtype not in {"totally_definitive_unresolved", "pending_unresolved"}:
+            subtype = "pending_unresolved" if "pending" in classification.lower() else "totally_definitive_unresolved"
+        classification = _classification_from_parts(handled_status, severity, subtype)
+
+    if handled_status == "handled":
+        subtype = "not_applicable"
+        classification = _classification_from_parts(handled_status, severity, subtype)
+    elif subtype == "not_applicable" or subtype not in _UNHANDLED_SUBTYPES:
+        subtype = "totally_definitive_unresolved"
+        classification = _classification_from_parts(handled_status, severity, subtype)
+
+    out["final_classification"] = classification
+    out["handled_status"] = handled_status
     out["cx_issue_severity"] = severity
+    out["unhandled_resolution_subtype"] = subtype
 
     sentiment = str(data.get("final_customer_sentiment", "") or "").strip().lower()
     if sentiment not in {"satisfied", "neutral", "frustrated", "confused", "dissatisfied", "unknown"}:
@@ -235,6 +331,7 @@ def validate_conversation_level_result(data: dict) -> dict:
 
     out["positive_signals"] = [str(x) for x in (data.get("positive_signals") or []) if x]
     out["negative_signals"] = [str(x) for x in (data.get("negative_signals") or []) if x]
+    out["quantifiable_metrics"] = _normalize_quantifiable_metrics(data.get("quantifiable_metrics"))
     out["management_summary"] = str(data.get("management_summary", "") or "")
     out["recommended_actions"] = [str(x) for x in (data.get("recommended_actions") or []) if x]
     out["manual_review_required"] = bool(data.get("manual_review_required", False))
@@ -580,9 +677,10 @@ def run_evaluation(
                 "conversation_id": conversation_id,
                 "customer_objective_type": "Inquiry",
                 "customer_primary_objective": "",
-                "final_classification": "Unhandled with Many Issues",
+                "final_classification": "Unhandled with Many Issues - Totally Definitive Unresolved",
                 "handled_status": "unhandled",
                 "cx_issue_severity": "many",
+                "unhandled_resolution_subtype": "totally_definitive_unresolved",
                 "final_customer_sentiment": "unknown",
                 "max_frustration_level": state["computed_metadata"].get("max_frustration_level", "none"),
                 "main_issue": {
@@ -595,6 +693,7 @@ def run_evaluation(
                 "all_detected_issues": [],
                 "positive_signals": [],
                 "negative_signals": [],
+                "quantifiable_metrics": [],
                 "management_summary": "Automatic evaluation could not parse a result for this conversation. Manual review required.",
                 "recommended_actions": ["Review this conversation manually."],
                 "manual_review_required": True,

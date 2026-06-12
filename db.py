@@ -225,6 +225,18 @@ class Database:
                 (kind,),
             )
             if existing:
+                now = _now_iso()
+                self._exec(
+                    "UPDATE prompt_templates SET system_prompt=?, output_schema=?, "
+                    "user_prompt_template=?, updated_at=? WHERE id=?",
+                    (
+                        tpl.system_prompt,
+                        tpl.output_schema,
+                        tpl.user_prompt_template,
+                        now,
+                        int(existing["id"]),
+                    ),
+                )
                 continue
             now = _now_iso()
             with self._tx() as c:

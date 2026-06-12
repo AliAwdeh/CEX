@@ -334,6 +334,7 @@ def render_conversation_summary_card(conv_result: dict) -> None:
     classification = pj.get("final_classification", "Unknown")
     handled = pj.get("handled_status", "unknown")
     severity = pj.get("cx_issue_severity", "")
+    subtype = pj.get("unhandled_resolution_subtype", "")
     sentiment = pj.get("final_customer_sentiment", "unknown")
     max_fl = pj.get("max_frustration_level", "none")
     main = pj.get("main_issue") or {}
@@ -341,8 +342,10 @@ def render_conversation_summary_card(conv_result: dict) -> None:
     head_colors = {
         "Handled with Zero/Minimal Issues": "#16a34a",
         "Handled with Many Issues": "#d97706",
-        "Unhandled with Zero/Minimal Issues": "#0ea5e9",
-        "Unhandled with Many Issues": "#dc2626",
+        "Unhandled with Zero/Minimal Issues - Totally Definitive Unresolved": "#0ea5e9",
+        "Unhandled with Zero/Minimal Issues - Pending Unresolved": "#0284c7",
+        "Unhandled with Many Issues - Totally Definitive Unresolved": "#dc2626",
+        "Unhandled with Many Issues - Pending Unresolved": "#b91c1c",
     }
     color = head_colors.get(classification, "#6b7280")
 
@@ -359,6 +362,7 @@ def render_conversation_summary_card(conv_result: dict) -> None:
     badges = []
     badges.append(_badge("Handled", handled, "#16a34a" if handled == "handled" else "#dc2626"))
     badges.append(_badge("CX Severity", severity.replace("_", " ") or "—", "#d97706" if severity == "many" else "#16a34a"))
+    badges.append(_badge("Unhandled subtype", subtype.replace("_", " ") or "n/a", "#475569"))
     badges.append(_badge("Sentiment", sentiment, _SENTIMENT_COLORS.get(sentiment, "#6b7280")))
     badges.append(_badge("Frustration", max_fl.replace("_", " "), _FRUSTRATION_COLORS.get(max_fl, "#6b7280")))
     if pj.get("manual_review_required"):
@@ -407,6 +411,52 @@ def render_conversation_summary_card(conv_result: dict) -> None:
     st.markdown("### Management Summary")
     st.write(pj.get("management_summary") or "—")
 
+    positives = pj.get("positive_signals") or []
+    negatives = pj.get("negative_signals") or []
+    if positives or negatives:
+        sig_cols = st.columns(2)
+        with sig_cols[0]:
+            st.markdown("### Positive Signals")
+            if positives:
+                for item in positives:
+                    st.write(f"- {item}")
+            else:
+                st.write("n/a")
+        with sig_cols[1]:
+            st.markdown("### Negative Signals")
+            if negatives:
+                for item in negatives:
+                    st.write(f"- {item}")
+            else:
+                st.write("n/a")
+
+    issues = pj.get("all_detected_issues") or []
+    if issues:
+        with st.expander("All detected issues", expanded=False):
+            st.dataframe(pd.DataFrame(issues), use_container_width=True, hide_index=True)
+
+    quantifiable_metrics = pj.get("quantifiable_metrics") or []
+    if quantifiable_metrics:
+        metric_rows = []
+        for category_obj in quantifiable_metrics:
+            if not isinstance(category_obj, dict):
+                continue
+            category = category_obj.get("category") or "Metrics"
+            metrics = category_obj.get("metrics") or {}
+            if not isinstance(metrics, dict):
+                continue
+            for name, value in metrics.items():
+                metric_rows.append(
+                    {
+                        "Category": category,
+                        "Metric": str(name).replace("_", " ").title(),
+                        "Value": value,
+                    }
+                )
+        if metric_rows:
+            with st.expander("Quantifiable metrics", expanded=True):
+                st.dataframe(pd.DataFrame(metric_rows), use_container_width=True, hide_index=True)
+
     rec = pj.get("recommended_actions") or []
     if rec:
         st.markdown("### Recommended Actions")
@@ -438,6 +488,10 @@ def conversation_filters(conv_df: pd.DataFrame) -> dict:
             severity = sorted([s for s in conv_df.get("cx_issue_severity", pd.Series(dtype=str)).dropna().unique()])
             sel_severity = st.multiselect("CX issue severity", severity, default=[])
         with c2:
+            subtypes = sorted(
+                [s for s in conv_df.get("unhandled_resolution_subtype", pd.Series(dtype=str)).dropna().unique()]
+            )
+            sel_subtype = st.multiselect("Unhandled subtype", subtypes, default=[])
             frustration_levels = sorted(
                 [f for f in conv_df.get("max_frustration_level", pd.Series(dtype=str)).dropna().unique()]
             )
@@ -479,6 +533,7 @@ def conversation_filters(conv_df: pd.DataFrame) -> dict:
         "classification": sel_class,
         "handled_status": sel_handled,
         "cx_issue_severity": sel_severity,
+        "unhandled_resolution_subtype": sel_subtype,
         "max_frustration_level": sel_frustration,
         "main_issue_origin": sel_origin,
         "main_issue_type": sel_issue_type,
@@ -505,6 +560,7 @@ def apply_conversation_filters(conv_df: pd.DataFrame, filters: dict) -> pd.DataF
     in_filter("final_classification", "classification")
     in_filter("handled_status", "handled_status")
     in_filter("cx_issue_severity", "cx_issue_severity")
+    in_filter("unhandled_resolution_subtype", "unhandled_resolution_subtype")
     in_filter("max_frustration_level", "max_frustration_level")
     in_filter("main_issue_origin", "main_issue_origin")
     in_filter("main_issue_type", "main_issue_type")
