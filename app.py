@@ -246,6 +246,16 @@ def _conversation_filters_with_keys(conv_df: pd.DataFrame, key_prefix: str) -> d
         return reloaded.conversation_filters(conv_df, key_prefix=key_prefix)
 
 
+def _apply_conversation_filters_fresh(conv_df: pd.DataFrame, filters: dict) -> pd.DataFrame:
+    reloaded = importlib.reload(ui_components_module)
+    return reloaded.apply_conversation_filters(conv_df, filters)
+
+
+def _render_conversation_summary_card_fresh(conv_result: dict) -> None:
+    reloaded = importlib.reload(ui_components_module)
+    reloaded.render_conversation_summary_card(conv_result)
+
+
 def _humanize_columns(df: pd.DataFrame, columns: list[str]) -> pd.DataFrame:
     out = df.copy()
     for col in columns:
@@ -258,7 +268,7 @@ def _display_column_name(column: str) -> str:
     if column.startswith("metric__"):
         return f"{metric_category_display_name(column)} / {metric_display_name(column)}"
     special = {
-        "conversation_id": "Conversation ID",
+        "conversation_id": "ID",
         "customer_name": "Customer name",
         "customer_phone": "Customer phone",
         "conversation_start_date": "Started",
@@ -342,6 +352,37 @@ def _render_display_table(
         f'<div class="cx-table-wrap"{height_style}>{table_html}</div>',
         unsafe_allow_html=True,
     )
+
+
+def _render_metric_definition_table(metric_df: pd.DataFrame) -> None:
+    """Render metrics with a clickable info control for each definition."""
+    if metric_df is None or metric_df.empty:
+        st.caption("No metrics.")
+        return
+
+    header_cols = st.columns([3.8, 0.7, 1.0, 1.4, 1.5])
+    headers = ["Metric", "Info", "Total", "Average when flagged", "Conversations > 0"]
+    for col, label in zip(header_cols, headers):
+        with col:
+            st.markdown(f"**{label}**")
+
+    for _, row in metric_df.iterrows():
+        metric_name = str(row.get("Metric", "") or "")
+        metric_col = row.get("Column")
+        definition = get_metric_definition(metric_col) if metric_col else ""
+        row_cols = st.columns([3.8, 0.7, 1.0, 1.4, 1.5])
+        with row_cols[0]:
+            st.write(metric_name or "—")
+        with row_cols[1]:
+            if definition:
+                with st.popover("i", use_container_width=True):
+                    st.write(definition)
+        with row_cols[2]:
+            st.write(_format_chart_value(row.get("Total", 0)))
+        with row_cols[3]:
+            st.write(_format_chart_value(row.get("Average when flagged", 0)))
+        with row_cols[4]:
+            st.write(_format_chart_value(row.get("Conversations > 0", 0)))
 
 
 def _format_chart_value(value: float, suffix: str = "") -> str:
@@ -1462,7 +1503,7 @@ def tab_dashboard() -> None:
     msg_df = _msg_dataframe_from_results()
 
     filters = _conversation_filters_with_keys(conv_df, "dashboard_filters")
-    filtered = apply_conversation_filters(conv_df, filters)
+    filtered = _apply_conversation_filters_fresh(conv_df, filters)
     agg = dashboard_aggregates(filtered)
 
     metric_row(
@@ -1654,6 +1695,9 @@ def tab_dashboard() -> None:
 
     st.markdown("---")
     st.markdown("### Quantifiable conversation metrics")
+    st.caption(
+        "Scroll down to the detailed category sections below if you want to see the definition of any metric."
+    )
     metric_totals = agg.get("metric_totals", pd.DataFrame())
     if not metric_totals.empty:
         metric_view = metric_totals.copy()
@@ -1789,9 +1833,9 @@ def tab_dashboard() -> None:
                     expanded=len(metric_view["Category"].unique()) == 1,
                 ):
                     category_table = category_metrics[
-                        ["Metric", "Total", "Average when flagged", "Conversations > 0"]
+                        ["Metric", "Column", "Total", "Average when flagged", "Conversations > 0"]
                     ].copy()
-                    _render_display_table(category_table, height=260)
+                    _render_metric_definition_table(category_table)
                     st.caption(f"Category total across displayed metrics: {category_total:g}")
 
                     metric_options = category_metrics["Metric"].tolist()
@@ -1972,7 +2016,7 @@ def tab_review() -> None:
     )
 
     review_filters = _conversation_filters_with_keys(conv_df, "review_filters")
-    filtered_df = apply_conversation_filters(conv_df, review_filters)
+    filtered_df = _apply_conversation_filters_fresh(conv_df, review_filters)
 
     search = st.text_input(
         "Search by conversation ID, customer name, result, or problem summary",
@@ -2034,7 +2078,7 @@ def tab_review() -> None:
         st.error("Conversation not found.")
         return
 
-    render_conversation_summary_card(target_cr)
+    _render_conversation_summary_card_fresh(target_cr)
 
     st.markdown("### Full Conversation")
     st.caption(
@@ -2181,7 +2225,7 @@ def tab_debug() -> None:
     st.caption("Pick any conversation to view raw payloads, parsed JSON, and debug info.")
     ids = [c.get("conversation_id", "") for c in rr.conversation_results]
     if ids:
-        sel = st.selectbox("Conversation ID", ids)
+        sel = st.selectbox("ID", ids)
         target = next((c for c in rr.conversation_results if c.get("conversation_id") == sel), None)
         if target:
             with st.expander("Conversation-level parsed JSON"):

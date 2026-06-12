@@ -358,22 +358,30 @@ def render_conversation_summary_card(conv_result: dict) -> None:
     color = head_colors.get(classification, "#6b7280")
     subtype_display = humanize_label(subtype) or "n/a"
     show_unresolved_header_badge = handled == "unhandled"
+    subtype_color = "#0f766e" if subtype == "pending_unresolved" else "#b45309"
+    unresolved_html = ""
+    if show_unresolved_header_badge:
+        unresolved_html = f"""
+          <div style="margin-top:12px; padding:14px 16px; border-radius:8px; background:#fff7ed; border:1px solid #fed7aa;">
+            <div style="font-size:0.8rem; font-weight:800; color:#7c2d12; text-transform:uppercase; letter-spacing:0.04em; margin-bottom:4px;">
+              Unresolved status
+            </div>
+            <div style="font-size:1.18rem; font-weight:900; color:{subtype_color};">
+              {html.escape(subtype_display)}
+            </div>
+          </div>
+        """
 
     st.markdown(
         f"""
-        <div style="border-left:6px solid {color}; padding:10px 14px; background:#f9fafb; border-radius:6px; margin-bottom:8px;">
+        <div style="border-left:6px solid {color}; padding:14px 18px; background:#f9fafb; border-radius:6px; margin-bottom:12px;">
           <div style="font-size:0.95rem; color:#374151;">Overall result</div>
           <div style="font-size:1.25rem; font-weight:700; color:{color};">{html.escape(classification)}</div>
+          {unresolved_html}
         </div>
         """,
         unsafe_allow_html=True,
     )
-    if show_unresolved_header_badge:
-        subtype_color = "#0f766e" if subtype == "pending_unresolved" else "#b45309"
-        st.markdown(
-            f'<div style="margin: 8px 0 12px 0;">{_badge("Unresolved status", subtype_display, subtype_color)}</div>',
-            unsafe_allow_html=True,
-        )
 
     badges = []
     badges.append(_badge("Outcome", humanize_label(handled), "#16a34a" if handled == "handled" else "#dc2626"))
@@ -394,7 +402,7 @@ def render_conversation_summary_card(conv_result: dict) -> None:
 
     cols = st.columns([1, 1])
     with cols[0]:
-        st.markdown("**Conversation ID**")
+        st.markdown("**ID**")
         st.write(conv_result.get("conversation_id", ""))
         st.markdown("**Customer**")
         st.write(md.get("customer_name") or "—")
@@ -599,16 +607,16 @@ def conversation_filters(conv_df: pd.DataFrame, key_prefix: str = "conv_filters"
 
 
 def apply_conversation_filters(conv_df: pd.DataFrame, filters: dict) -> pd.DataFrame:
-    """Apply the active filters returned from ``conversation_filters``."""
+    """Apply active filters using AND semantics across all filter groups."""
     if conv_df.empty or not filters:
         return conv_df
-    df = conv_df.copy()
+    mask = pd.Series(True, index=conv_df.index)
 
-    def in_filter(col: str, key: str):
-        nonlocal df
+    def in_filter(col: str, key: str) -> None:
+        nonlocal mask
         sel = filters.get(key) or []
-        if sel and col in df.columns:
-            df = df[df[col].isin(sel)]
+        if sel and col in conv_df.columns:
+            mask &= conv_df[col].isin(sel)
 
     in_filter("final_classification", "classification")
     in_filter("handled_status", "handled_status")
@@ -618,18 +626,18 @@ def apply_conversation_filters(conv_df: pd.DataFrame, filters: dict) -> pd.DataF
     in_filter("main_issue_origin", "main_issue_origin")
     in_filter("main_issue_type", "main_issue_type")
     mr = filters.get("manual_review")
-    if mr == "Only manual review" and "manual_review_required" in df.columns:
-        df = df[df["manual_review_required"].fillna(False).astype(bool)]
-    elif mr == "Only no manual review" and "manual_review_required" in df.columns:
-        df = df[~df["manual_review_required"].fillna(False).astype(bool)]
+    if mr == "Only manual review" and "manual_review_required" in conv_df.columns:
+        mask &= conv_df["manual_review_required"].fillna(False).astype(bool)
+    elif mr == "Only no manual review" and "manual_review_required" in conv_df.columns:
+        mask &= ~conv_df["manual_review_required"].fillna(False).astype(bool)
 
     dr = filters.get("date_range")
-    if dr and "conversation_start_date" in df.columns:
+    if dr and "conversation_start_date" in conv_df.columns:
         try:
             start, end = dr
-            parsed = pd.to_datetime(df["conversation_start_date"], errors="coerce")
-            df = df[(parsed.dt.date >= start) & (parsed.dt.date <= end)]
+            parsed = pd.to_datetime(conv_df["conversation_start_date"], errors="coerce")
+            mask &= (parsed.dt.date >= start) & (parsed.dt.date <= end)
         except Exception:
             pass
 
-    return df
+    return conv_df[mask].copy()
