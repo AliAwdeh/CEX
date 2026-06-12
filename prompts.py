@@ -213,14 +213,18 @@ Was the tone respectful, clear, practical, and easy to understand?
 Classification options (use exactly one):
 - Handled with Zero/Minimal Issues
 - Handled with Many Issues
-- Unhandled with Zero/Minimal Issues
-- Unhandled with Many Issues
+- Unhandled with Zero/Minimal Issues - Totally Definitive Unresolved
+- Unhandled with Zero/Minimal Issues - Pending Unresolved
+- Unhandled with Many Issues - Totally Definitive Unresolved
+- Unhandled with Many Issues - Pending Unresolved
 
 Definitions:
 - Handled with Zero/Minimal Issues: The customer achieved the objective or received a clear acceptable next step, and the interaction was smooth, clear, efficient, and low-effort.
 - Handled with Many Issues: The customer eventually achieved the objective or accepted the outcome, but experienced significant CX issues such as confusion, repetition, delay, frustration, misunderstanding, excessive effort, or poor guidance.
-- Unhandled with Zero/Minimal Issues: The customer did not achieve the desired outcome, but the communication was clear, professional, reasonable, and the limitation was explained properly.
-- Unhandled with Many Issues: The customer's objective was not achieved and the customer experienced significant CX issues such as confusion, repetition, frustration, excessive effort, poor guidance, lack of clarity, unresolved loops, or no clear next step.
+- Unhandled with Zero/Minimal Issues - Totally Definitive Unresolved: The customer did not achieve the desired outcome, there is no credible pending path, but the limitation was communicated clearly and professionally.
+- Unhandled with Zero/Minimal Issues - Pending Unresolved: The customer did not achieve the desired outcome yet because the case is credibly waiting for a future event, but the next step was clear and low-friction.
+- Unhandled with Many Issues - Totally Definitive Unresolved: The customer's objective was not achieved, no credible pending path remains, and the customer experienced significant CX issues.
+- Unhandled with Many Issues - Pending Unresolved: The customer's objective is still pending a future event, and the journey had significant CX issues such as confusion, repetition, delay, vague next steps, or high effort.
 
 Return strict JSON only. Do not include markdown. Do not include explanations outside the JSON.
 
@@ -234,6 +238,8 @@ Rules:
 - Zero/Minimal vs Many Issues depends on CX friction, effort, confusion, frustration, repetition, and clarity.
 - A conversation can be handled even if it had issues.
 - A conversation can be unhandled even if the bot communicated politely.
+- For handled conversations, unhandled_resolution_subtype must be not_applicable.
+- For unhandled conversations, unhandled_resolution_subtype must be totally_definitive_unresolved or pending_unresolved.
 - Always specify whether issues originated from our side, customer side, shared, or none.
 - Explain impact from the customer's perspective.
 - Keep the management summary concise and business-friendly.
@@ -244,9 +250,10 @@ DEFAULT_CONVERSATION_LEVEL_OUTPUT_SCHEMA = """{
   "conversation_id": "string",
   "customer_objective_type": "Inquiry|Issue",
   "customer_primary_objective": "short description",
-  "final_classification": "Handled with Zero/Minimal Issues|Handled with Many Issues|Unhandled with Zero/Minimal Issues|Unhandled with Many Issues",
+  "final_classification": "Handled with Zero/Minimal Issues|Handled with Many Issues|Unhandled with Zero/Minimal Issues - Totally Definitive Unresolved|Unhandled with Zero/Minimal Issues - Pending Unresolved|Unhandled with Many Issues - Totally Definitive Unresolved|Unhandled with Many Issues - Pending Unresolved",
   "handled_status": "handled|unhandled",
   "cx_issue_severity": "zero_minimal|many",
+  "unhandled_resolution_subtype": "not_applicable|totally_definitive_unresolved|pending_unresolved",
   "final_customer_sentiment": "satisfied|neutral|frustrated|confused|dissatisfied|unknown",
   "max_frustration_level": "none|low|medium|high|cancellation_risk",
   "main_issue": {
@@ -258,11 +265,107 @@ DEFAULT_CONVERSATION_LEVEL_OUTPUT_SCHEMA = """{
   },
   "all_detected_issues": [
     {
-      "issue_origin": "our_side|customer_side|shared",
+      "issue_origin": "our_side|customer_side|shared|third_party",
       "issue_type": "string",
       "issue_summary": "string",
       "evidence": "string",
       "impact": "string"
+    }
+  ],
+  "quantifiable_metrics": [
+    {
+      "category": "Customer Understanding & Context Management",
+      "metrics": {
+        "intent_understanding_errors": "number",
+        "information_retention_failures": "number",
+        "misleading_information_count": "number",
+        "date_timeline_errors": "number",
+        "repeated_response_count": "number"
+      }
+    },
+    {
+      "category": "Conversation Efficiency & Customer Effort",
+      "metrics": {
+        "document_request_fragmentation": "number",
+        "customer_effort_score": "number",
+        "wasted_customer_trip_count": "number",
+        "estimated_customer_time_wasted_minutes": "number",
+        "avoidable_agent_message_count": "number"
+      }
+    },
+    {
+      "category": "Delays, Escalation & Service Delivery",
+      "metrics": {
+        "missed_transfer_count": "number",
+        "manual_escalation_count": "number",
+        "late_information_delivery_count": "number",
+        "process_delay_minutes": "number",
+        "sla_breach_count": "number",
+        "critical_delay_count": "number"
+      }
+    },
+    {
+      "category": "Technical & System Performance",
+      "metrics": {
+        "attachment_information_processing_failures": "number"
+      }
+    },
+    {
+      "category": "Issue Attribution & Root Cause Analysis",
+      "metrics": {
+        "customer_side_issue_count": "number",
+        "chatbot_company_side_issue_count": "number",
+        "third_party_issue_count": "number",
+        "total_issue_count": "number"
+      }
+    },
+    {
+      "category": "Financial Impact & Revenue Risk",
+      "metrics": {
+        "customer_financial_burden_event_count": "number",
+        "company_cost_exposure_event_count": "number",
+        "estimated_monetary_loss_amount": "number",
+        "potential_revenue_at_risk_amount": "number"
+      }
+    },
+    {
+      "category": "Refunds, Cancellations & Compensation",
+      "metrics": {
+        "refund_request_count": "number",
+        "cancellation_request_count": "number",
+        "compensation_request_count": "number"
+      }
+    },
+    {
+      "category": "Domain & Policy Accuracy",
+      "metrics": {
+        "insurance_coverage_error_count": "number",
+        "visa_immigration_error_count": "number",
+        "contractual_miscommunication_count": "number"
+      }
+    },
+    {
+      "category": "Customer Satisfaction, Trust & Complaints",
+      "metrics": {
+        "complaint_threat_count": "number",
+        "lost_trust_statement_count": "number"
+      }
+    },
+    {
+      "category": "Appointments, Contact Information & Payments",
+      "metrics": {
+        "appointment_failure_count": "number",
+        "wrong_location_count": "number",
+        "wrong_contact_count": "number",
+        "payment_confusion_count": "number",
+        "duplicate_payment_risk_count": "number"
+      }
+    },
+    {
+      "category": "Compliance & Risk Management",
+      "metrics": {
+        "legal_compliance_risk_count": "number"
+      }
     }
   ],
   "positive_signals": ["short bullet"],

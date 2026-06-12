@@ -12,6 +12,60 @@ FRUSTRATION_ORDER = ["none", "low", "medium", "high", "cancellation_risk"]
 FRUSTRATION_RANK = {v: i for i, v in enumerate(FRUSTRATION_ORDER)}
 
 
+def _flatten_quantifiable_metrics(metrics: Any) -> dict[str, Any]:
+    """Flatten categorized quantifiable metrics into table-friendly columns."""
+    if not isinstance(metrics, list):
+        return {}
+
+    out: dict[str, Any] = {}
+    for category_obj in metrics:
+        if not isinstance(category_obj, dict):
+            continue
+        category = str(category_obj.get("category") or "").strip()
+        values = category_obj.get("metrics") or {}
+        if not category or not isinstance(values, dict):
+            continue
+
+        category_key = (
+            category.lower()
+            .replace("&", "and")
+            .replace("/", " ")
+            .replace("-", " ")
+        )
+        category_key = "_".join(part for part in category_key.split() if part)
+        for metric_name, raw in values.items():
+            metric_key = str(metric_name or "").strip()
+            if not metric_key:
+                continue
+            col = f"metric__{category_key}__{metric_key}"
+            try:
+                num = float(raw)
+            except (TypeError, ValueError):
+                num = 0.0
+            out[col] = int(num) if num.is_integer() else num
+    return out
+
+
+def quantifiable_metric_columns(df: pd.DataFrame) -> list[str]:
+    """Return flattened quantifiable metric columns in a stable order."""
+    return sorted([c for c in df.columns if c.startswith("metric__")])
+
+
+def metric_display_name(column: str) -> str:
+    """Convert a flattened metric column name into a readable label."""
+    parts = column.split("__")
+    if len(parts) < 3:
+        return column
+    return parts[-1].replace("_", " ").title()
+
+
+def metric_category_display_name(column: str) -> str:
+    parts = column.split("__")
+    if len(parts) < 3:
+        return "Metrics"
+    return parts[1].replace("_", " ").replace(" And ", " & ").title()
+
+
 def _max_frustration(levels: list[str]) -> str:
     rank = -1
     out = "none"
@@ -124,6 +178,7 @@ def flatten_conversation_row(
         "final_classification": cl.get("final_classification"),
         "handled_status": cl.get("handled_status"),
         "cx_issue_severity": cl.get("cx_issue_severity"),
+        "unhandled_resolution_subtype": cl.get("unhandled_resolution_subtype"),
         "final_customer_sentiment": cl.get("final_customer_sentiment"),
         "max_frustration_level": cl.get("max_frustration_level"),
         "main_issue_exists": main_issue.get("issue_exists"),
@@ -131,6 +186,15 @@ def flatten_conversation_row(
         "main_issue_type": main_issue.get("issue_type"),
         "main_issue_summary": main_issue.get("issue_summary"),
         "customer_impact": main_issue.get("customer_impact"),
+        "all_detected_issues": " | ".join(
+            [
+                f"{i.get('issue_type', '')}: {i.get('issue_summary', '')}".strip(": ")
+                for i in (cl.get("all_detected_issues") or [])
+                if isinstance(i, dict)
+            ]
+        ),
+        "positive_signals": " | ".join(cl.get("positive_signals", []) or []),
+        "negative_signals": " | ".join(cl.get("negative_signals", []) or []),
         "management_summary": cl.get("management_summary"),
         "recommended_actions": " | ".join(cl.get("recommended_actions", []) or []),
         "manual_review_required": cl.get("manual_review_required"),
@@ -163,6 +227,7 @@ def flatten_conversation_row(
     ]
     for f in cm_fields:
         row[f] = computed_metadata.get(f)
+    row.update(_flatten_quantifiable_metrics(cl.get("quantifiable_metrics")))
     return row
 
 
@@ -218,8 +283,10 @@ def dashboard_aggregates(conv_df: pd.DataFrame) -> dict:
             "cancellation_risk_count": 0,
             "manual_review_count": 0,
             "classification_counts": {},
+            "unhandled_subtype_counts": {},
             "issue_origin_counts": {},
             "issue_type_counts": {},
+            "metric_totals": pd.DataFrame(),
             "agent_breakdown": pd.DataFrame(),
             "skill_breakdown": pd.DataFrame(),
         }
@@ -257,6 +324,12 @@ def dashboard_aggregates(conv_df: pd.DataFrame) -> dict:
             conv_df["final_classification"].fillna("Unknown").value_counts().to_dict()
         )
 
+    unhandled_subtype_counts = {}
+    if "unhandled_resolution_subtype" in conv_df.columns:
+        unhandled_subtype_counts = (
+            conv_df["unhandled_resolution_subtype"].fillna("unknown").value_counts().to_dict()
+        )
+
     issue_origin_counts = {}
     if "main_issue_origin" in conv_df.columns:
         issue_origin_counts = (
@@ -267,6 +340,27 @@ def dashboard_aggregates(conv_df: pd.DataFrame) -> dict:
     if "main_issue_type" in conv_df.columns:
         issue_type_counts = (
             conv_df["main_issue_type"].fillna("none").value_counts().to_dict()
+        )
+
+    metric_totals = pd.DataFrame()
+    metric_cols = quantifiable_metric_columns(conv_df)
+    if metric_cols:
+        rows = []
+        for col in metric_cols:
+            series = pd.to_numeric(conv_df[col], errors="coerce").fillna(0)
+            rows.append(
+                {
+                    "Column": col,
+                    "Category": metric_category_display_name(col),
+                    "Metric": metric_display_name(col),
+                    "Total": float(series.sum()),
+                    "Average": float(series.mean()) if len(series) else 0.0,
+                    "Conversations > 0": int((series > 0).sum()),
+                }
+            )
+        metric_totals = pd.DataFrame(rows).sort_values(
+            ["Total", "Conversations > 0", "Category", "Metric"],
+            ascending=[False, False, True, True],
         )
 
     agent_breakdown = pd.DataFrame()
@@ -318,8 +412,10 @@ def dashboard_aggregates(conv_df: pd.DataFrame) -> dict:
         "cancellation_risk_count": cancellation_risk_count,
         "manual_review_count": manual_review_count,
         "classification_counts": classification_counts,
+        "unhandled_subtype_counts": unhandled_subtype_counts,
         "issue_origin_counts": issue_origin_counts,
         "issue_type_counts": issue_type_counts,
+        "metric_totals": metric_totals,
         "agent_breakdown": agent_breakdown,
         "skill_breakdown": skill_breakdown,
     }

@@ -34,6 +34,9 @@ from aggregation import (
     dashboard_aggregates,
     flatten_conversation_row,
     flatten_message_row,
+    metric_category_display_name,
+    metric_display_name,
+    quantifiable_metric_columns,
     top_frustration_causes,
 )
 from exports import (
@@ -984,6 +987,20 @@ def tab_dashboard() -> None:
         else:
             st.write("No data.")
 
+        st.markdown("#### Unhandled subtype")
+        if agg["unhandled_subtype_counts"]:
+            subtype_df = pd.DataFrame(
+                [{"Subtype": k, "Count": v} for k, v in agg["unhandled_subtype_counts"].items()]
+            )
+            if HAS_PLOTLY:
+                fig = px.bar(subtype_df, x="Subtype", y="Count", text="Count", color="Subtype")
+                fig.update_layout(showlegend=False, height=340, margin=dict(t=10, b=10), xaxis_tickangle=-15)
+                st.plotly_chart(fig, use_container_width=True)
+            else:
+                st.bar_chart(subtype_df.set_index("Subtype"))
+        else:
+            st.write("No data.")
+
         st.markdown("#### Issue origin distribution")
         if agg["issue_origin_counts"]:
             io_df = pd.DataFrame(
@@ -1029,6 +1046,172 @@ def tab_dashboard() -> None:
                 st.bar_chart(causes.set_index("frustration_cause"))
         else:
             st.write("No frustration causes identified.")
+
+    st.markdown("---")
+    st.markdown("### Quantifiable conversation metrics")
+    metric_totals = agg.get("metric_totals", pd.DataFrame())
+    if not metric_totals.empty:
+        metric_view = metric_totals.copy()
+        metric_view["Total"] = pd.to_numeric(metric_view["Total"], errors="coerce").fillna(0)
+        metric_view["Average"] = pd.to_numeric(metric_view["Average"], errors="coerce").fillna(0)
+        metric_view["Conversations > 0"] = pd.to_numeric(
+            metric_view["Conversations > 0"], errors="coerce"
+        ).fillna(0).astype(int)
+
+        f1, f2, f3, f4 = st.columns([1.3, 1.3, 1, 1])
+        with f1:
+            category_options = sorted(metric_view["Category"].dropna().unique().tolist())
+            selected_categories = st.multiselect(
+                "Metric categories",
+                category_options,
+                default=[],
+                help="Leave empty to include all categories.",
+            )
+        with f2:
+            metric_search = st.text_input("Search metrics", value="")
+        with f3:
+            only_nonzero = st.toggle("Only nonzero", value=True)
+        with f4:
+            min_total = st.number_input("Minimum total", min_value=0.0, value=0.0, step=1.0)
+
+        sort_mode = st.selectbox(
+            "Sort metrics by",
+            [
+                "Total descending",
+                "Contributing conversations descending",
+                "Category then metric",
+                "Average descending",
+            ],
+            index=0,
+        )
+
+        if selected_categories:
+            metric_view = metric_view[metric_view["Category"].isin(selected_categories)]
+        if metric_search.strip():
+            needle = metric_search.strip().lower()
+            metric_view = metric_view[
+                metric_view["Metric"].astype(str).str.lower().str.contains(needle, na=False)
+                | metric_view["Category"].astype(str).str.lower().str.contains(needle, na=False)
+            ]
+        if only_nonzero:
+            metric_view = metric_view[metric_view["Conversations > 0"] > 0]
+        if min_total > 0:
+            metric_view = metric_view[metric_view["Total"] >= float(min_total)]
+
+        sort_map = {
+            "Total descending": (["Total", "Conversations > 0", "Category", "Metric"], [False, False, True, True]),
+            "Contributing conversations descending": (
+                ["Conversations > 0", "Total", "Category", "Metric"],
+                [False, False, True, True],
+            ),
+            "Category then metric": (["Category", "Metric"], [True, True]),
+            "Average descending": (["Average", "Total", "Category", "Metric"], [False, False, True, True]),
+        }
+        sort_cols, sort_asc = sort_map[sort_mode]
+        metric_view = metric_view.sort_values(sort_cols, ascending=sort_asc)
+
+        if metric_view.empty:
+            st.caption("No metrics match the selected filters.")
+        else:
+            top_metrics = metric_view.head(15)
+            if HAS_PLOTLY:
+                fig = px.bar(
+                    top_metrics,
+                    x="Total",
+                    y="Metric",
+                    color="Category",
+                    orientation="h",
+                    text="Total",
+                    hover_data=["Average", "Conversations > 0"],
+                )
+                fig.update_layout(height=520, margin=dict(t=10, b=10), yaxis=dict(autorange="reversed"))
+                st.plotly_chart(fig, use_container_width=True)
+            else:
+                st.bar_chart(top_metrics.set_index("Metric")["Total"])
+
+            contributor_base_cols = [
+                "conversation_id",
+                "customer_name",
+                "conversation_start_date",
+                "final_classification",
+                "handled_status",
+                "cx_issue_severity",
+                "unhandled_resolution_subtype",
+                "main_issue_type",
+                "main_issue_summary",
+                "management_summary",
+            ]
+            metric_column_lookup = {
+                (metric_category_display_name(c), metric_display_name(c)): c
+                for c in quantifiable_metric_columns(filtered)
+            }
+            if "Column" not in metric_view.columns:
+                metric_view["Column"] = metric_view.apply(
+                    lambda r: metric_column_lookup.get((r.get("Category"), r.get("Metric"))),
+                    axis=1,
+                )
+            else:
+                metric_view["Column"] = metric_view.apply(
+                    lambda r: (
+                        r.get("Column")
+                        if r.get("Column") in filtered.columns
+                        else metric_column_lookup.get((r.get("Category"), r.get("Metric")))
+                    ),
+                    axis=1,
+                )
+
+            for category, category_metrics in metric_view.groupby("Category", sort=False):
+                category_total = category_metrics["Total"].sum()
+                category_cols = [
+                    c for c in category_metrics.get("Column", pd.Series(dtype=str)).tolist()
+                    if c in filtered.columns
+                ]
+                if category_cols:
+                    category_values = filtered[category_cols].apply(
+                        lambda s: pd.to_numeric(s, errors="coerce")
+                    ).fillna(0)
+                    category_conversations = int((category_values.sum(axis=1) > 0).sum())
+                else:
+                    category_conversations = 0
+                with st.expander(
+                    f"{category} - {len(category_metrics)} metrics, {category_conversations} contributing conversations",
+                    expanded=len(metric_view["Category"].unique()) == 1,
+                ):
+                    category_table = category_metrics[
+                        ["Metric", "Total", "Average", "Conversations > 0"]
+                    ].copy()
+                    st.dataframe(category_table, use_container_width=True, hide_index=True)
+                    st.caption(f"Category total across displayed metrics: {category_total:g}")
+
+                    metric_options = category_metrics["Metric"].tolist()
+                    selected_metric = st.selectbox(
+                        "Metric contributors",
+                        metric_options,
+                        key=f"metric_contributors_{category}",
+                    )
+                    selected_row = category_metrics[category_metrics["Metric"] == selected_metric].iloc[0]
+                    metric_col = selected_row.get("Column") or metric_column_lookup.get(
+                        (category, selected_metric)
+                    )
+                    if metric_col in filtered.columns:
+                        values = pd.to_numeric(filtered[metric_col], errors="coerce").fillna(0)
+                        contributors = filtered.loc[values > 0].copy()
+                        contributor_cols = [c for c in contributor_base_cols if c in contributors.columns]
+                        contributor_table = contributors[contributor_cols].copy()
+                        contributor_table.insert(1, "metric_value", values.loc[contributors.index].values)
+                        contributor_table = contributor_table.sort_values(
+                            ["metric_value", "conversation_id"],
+                            ascending=[False, True],
+                        )
+                        st.caption(
+                            f"{len(contributor_table):,} conversations contributed to "
+                            f"{selected_metric}."
+                        )
+                        st.dataframe(contributor_table, use_container_width=True, hide_index=True)
+                    else:
+                        st.caption("This metric column is not available in the filtered conversation table.")
+    else:
+        st.caption("No quantifiable metrics returned by the conversation-level evaluator yet.")
 
     st.markdown("---")
     c3, c4 = st.columns(2)
@@ -1078,17 +1261,53 @@ def tab_dashboard() -> None:
         "final_classification",
         "handled_status",
         "cx_issue_severity",
+        "unhandled_resolution_subtype",
         "final_customer_sentiment",
         "max_frustration_level",
         "main_issue_type",
         "main_issue_origin",
         "main_issue_summary",
+        "customer_impact",
+        "all_detected_issues",
+        "positive_signals",
+        "negative_signals",
         "management_summary",
+        "recommended_actions",
         "manual_review_required",
+        "manual_review_reason",
         "confidence",
     ]
+    display_cols.extend(quantifiable_metric_columns(filtered))
     existing_cols = [c for c in display_cols if c in filtered.columns]
     st.dataframe(filtered[existing_cols], use_container_width=True, hide_index=True)
+
+    st.markdown("### Message-level results")
+    message_display_cols = [
+        "conversation_id",
+        "target_message_id",
+        "message_index",
+        "message_time",
+        "target_message_text",
+        "message_level_effect",
+        "frustration_level_after_message",
+        "frustration_change",
+        "customer_effort_level",
+        "clarity_level",
+        "context_handling",
+        "issue_origin",
+        "issue_type",
+        "frustration_cause",
+        "evidence",
+        "business_impact",
+        "recommended_fix",
+        "parse_status",
+        "error_message",
+    ]
+    message_existing_cols = [c for c in message_display_cols if c in msg_df.columns]
+    if message_existing_cols:
+        st.dataframe(msg_df[message_existing_cols], use_container_width=True, hide_index=True)
+    else:
+        st.caption("No message-level results available.")
 
 
 # --------- Tab: Conversation Review ---------
