@@ -543,7 +543,7 @@ class RunConfig:
     #   "agent"    — judge the agent's response to a (possibly frustrated) customer message
     #   "customer" — judge the customer's state / frustration before the agent answers
     message_target_role: str = "agent"
-    # Explicit set of conversation IDs to run on. When non-None, takes
+    # Explicit set of IDs to run on. When non-None, takes
     # precedence over ``max_conversations`` — used by the random sampler.
     selected_conversation_ids: Optional[list[str]] = None
     # Editable prompts (defaults to the in-memory defaults; the app loads

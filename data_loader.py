@@ -92,7 +92,7 @@ def normalize_dataframe(df: pd.DataFrame) -> pd.DataFrame:
 
 
 def generate_message_id(conversation_id: str, message_index: Any) -> str:
-    """Generate a stable message id from conversation id and message index."""
+    """Generate a stable message id from ID and message index."""
     try:
         idx = int(message_index)
     except (TypeError, ValueError):

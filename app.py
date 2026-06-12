@@ -105,7 +105,7 @@ def _init_state() -> None:
         "save_raw_responses": True,
         # Which side the message-level judge inspects per turn.
         "message_target_role": "agent",
-        # When set, the run evaluates ONLY these conversation IDs (random sampler).
+        # When set, the run evaluates ONLY these IDs (random sampler).
         "selected_conversation_ids": None,
         "run_results": None,
         "run_in_progress": False,
@@ -1243,7 +1243,7 @@ def tab_run() -> None:
             "🎲 Random sample",
             use_container_width=True,
             help=(
-                "Pick a random sample of conversation IDs from the uploaded CSV. "
+                "Pick a random sample of IDs from the uploaded CSV. "
                 "Sample size = 'Max conversations to process' from the sidebar."
             ),
             disabled=not all_ids,
@@ -2043,7 +2043,7 @@ def tab_review() -> None:
     filtered_df = _apply_conversation_filters_fresh(conv_df, review_filters)
 
     search = st.text_input(
-        "Search by conversation ID, customer name, result, or problem summary",
+        "Search by ID, customer name, result, or problem summary",
         value="",
     ).strip()
     if search:
