@@ -1614,16 +1614,40 @@ def tab_dashboard() -> None:
         if agg["issue_origin_counts"]:
             io_df = pd.DataFrame(
                 [{"Origin": humanize_label(k), "Count": v} for k, v in agg["issue_origin_counts"].items() if k.lower() != "none"]
-            )
-            if HAS_PLOTLY:
-                fig = px.treemap(
+            ).sort_values("Count", ascending=True)
+            io_df = io_df[io_df["Count"] > 0]
+            if io_df.empty:
+                st.write("No issue origins identified.")
+            elif HAS_PLOTLY:
+                total_origins = max(int(io_df["Count"].sum()), 1)
+                io_df["Share"] = io_df["Count"].apply(lambda c: f"{(c / total_origins * 100):.1f}%")
+                io_df["Label"] = io_df.apply(lambda r: f"{int(r['Count'])} ({r['Share']})", axis=1)
+                origin_colors = {
+                    "Our side": "#ef4444",
+                    "Shared": "#f59e0b",
+                    "Customer side": "#2563eb",
+                    "Third party": "#14b8a6",
+                    "Unclear": "#64748b",
+                }
+                fig = px.bar(
                     io_df,
-                    path=["Origin"],
-                    values="Count",
-                    color="Count",
-                    color_continuous_scale=["#0f4c5c", "#2c7da0", "#468faf", "#89c2d9"],
+                    x="Count",
+                    y="Origin",
+                    orientation="h",
+                    color="Origin",
+                    color_discrete_map=origin_colors,
+                    text="Label",
+                    hover_data={"Share": True, "Count": True, "Origin": False, "Label": False},
                 )
-                _plotly_layout(fig, height=340)
+                fig.update_traces(textposition="outside", cliponaxis=False)
+                fig.update_layout(showlegend=False)
+                _plotly_layout(
+                    fig,
+                    height=320,
+                    xaxis_title="Conversations",
+                    yaxis_title="",
+                    margin=dict(l=10, r=40, t=10, b=30),
+                )
                 _render_plotly(fig)
             else:
                 _render_simple_bar_chart(io_df, "Origin", "Count", height=300)
