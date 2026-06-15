@@ -30,7 +30,7 @@ def build_conversation_csv_bytes(conversation_results: list[dict]) -> bytes:
 
 
 def build_message_csv_bytes(message_results: list[dict]) -> bytes:
-    """Build the message-level CSV (one row per evaluated agent message) as bytes."""
+    """Build the message-level CSV (one row per evaluated assistant message) as bytes."""
     rows = [flatten_message_row(m) for m in message_results]
     df = pd.DataFrame(rows) if rows else pd.DataFrame()
     buf = io.StringIO()

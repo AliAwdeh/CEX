@@ -457,7 +457,7 @@ class Database:
             " VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (
                 int(run_id),
-                str(mr.get("conversation_id", "")),
+                str(mr.get("thread_id") or mr.get("conversation_id", "")),
                 mr.get("target_message_id"),
                 int(mr["message_index"]) if mr.get("message_index") is not None else None,
                 mr.get("message_time"),
@@ -465,7 +465,8 @@ class Database:
                 mr.get("parse_status", "ok"),
                 mr.get("error_message"),
                 mr.get("raw_model_response"),
-                _json_dump(mr.get("parsed_json")) if mr.get("parsed_json") is not None else None,
+                _json_dump(mr.get("evaluation_output", mr.get("parsed_json")))
+                if mr.get("evaluation_output", mr.get("parsed_json")) is not None else None,
                 _json_dump(mr.get("debug")) if mr.get("debug") is not None else None,
                 _json_dump(mr.get("input_history")) if mr.get("input_history") is not None else None,
                 now,
@@ -482,11 +483,12 @@ class Database:
             " VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (
                 int(run_id),
-                str(cr.get("conversation_id", "")),
+                str(cr.get("thread_id") or cr.get("conversation_id", "")),
                 cr.get("parse_status", "ok"),
                 cr.get("error_message"),
                 cr.get("raw_model_response"),
-                _json_dump(cr.get("parsed_json")) if cr.get("parsed_json") is not None else None,
+                _json_dump(cr.get("evaluation_output", cr.get("parsed_json")))
+                if cr.get("evaluation_output", cr.get("parsed_json")) is not None else None,
                 _json_dump(cr.get("conversation_metadata")) if cr.get("conversation_metadata") is not None else None,
                 _json_dump(cr.get("computed_metadata")) if cr.get("computed_metadata") is not None else None,
                 _json_dump(cr.get("transcript")) if cr.get("transcript") is not None else None,
@@ -530,11 +532,14 @@ class Database:
             d = dict(r)
             conversation_results.append(
                 {
+                    "thread_id": d["conversation_id"],
                     "conversation_id": d["conversation_id"],
+                    "run_id": int(run_id),
                     "parse_status": d["parse_status"],
                     "error_message": d.get("error_message"),
                     "raw_model_response": d.get("raw_response"),
                     "parsed_json": _json_load(d.get("parsed_json")),
+                    "evaluation_output": _json_load(d.get("parsed_json")),
                     "conversation_metadata": _json_load(d.get("conversation_metadata")) or {},
                     "computed_metadata": _json_load(d.get("computed_metadata")) or {},
                     "transcript": _json_load(d.get("transcript_json")) or [],
@@ -552,7 +557,9 @@ class Database:
         for r in msg_rows:
             d = dict(r)
             mr = {
+                "thread_id": d["conversation_id"],
                 "conversation_id": d["conversation_id"],
+                "run_id": int(run_id),
                 "target_message_id": d.get("target_message_id"),
                 "message_index": d.get("message_index"),
                 "message_time": d.get("message_time"),
@@ -561,6 +568,7 @@ class Database:
                 "error_message": d.get("error_message"),
                 "raw_model_response": d.get("raw_response"),
                 "parsed_json": _json_load(d.get("parsed_json")),
+                "evaluation_output": _json_load(d.get("parsed_json")),
                 "debug": _json_load(d.get("debug_json")),
                 "input_history": _json_load(d.get("input_history_json")),
             }

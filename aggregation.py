@@ -12,6 +12,25 @@ FRUSTRATION_ORDER = ["none", "low", "medium", "high", "cancellation_risk"]
 FRUSTRATION_RANK = {v: i for i, v in enumerate(FRUSTRATION_ORDER)}
 
 
+def humanize_label(value: Any) -> str:
+    """Render enum/metric identifiers as readable labels."""
+    text = str(value or "").strip()
+    if not text:
+        return ""
+    special = {
+        "many": "Many Issues",
+        "zero_minimal": "Zero/Minimal issues",
+    }
+    normalized = text.lower().replace(" ", "_").replace("-", "_")
+    if normalized in special:
+        return special[normalized]
+    text = text.replace("_", " ")
+    text = " ".join(text.split())
+    if not text:
+        return ""
+    return text[:1].upper() + text[1:].lower()
+
+
 def _flatten_quantifiable_metrics(metrics: Any) -> dict[str, Any]:
     """Flatten categorized quantifiable metrics into table-friendly columns."""
     if not isinstance(metrics, list):
@@ -55,15 +74,64 @@ def metric_display_name(column: str) -> str:
     """Convert a flattened metric column name into a readable label."""
     parts = column.split("__")
     if len(parts) < 3:
-        return column
-    return parts[-1].replace("_", " ").title()
+        return humanize_label(column)
+    return humanize_label(parts[-1])
 
 
 def metric_category_display_name(column: str) -> str:
     parts = column.split("__")
     if len(parts) < 3:
         return "Metrics"
-    return parts[1].replace("_", " ").replace(" And ", " & ").title()
+    return humanize_label(parts[1])
+
+
+def get_metric_definition(column: str) -> str:
+    """Return the definition/help text for a metric column."""
+    metric_name = metric_display_name(column).lower()
+    
+    definitions = {
+        "intent understanding errors": "Count of times the agent misunderstood the customer's intent or primary request.",
+        "information retention failures": "Count of times the agent forgot or failed to use information the customer had already provided.",
+        "misleading information count": "Count of instances where the agent provided incorrect or misleading information.",
+        "date timeline errors": "Count of times the agent got dates, timelines, or temporal references wrong.",
+        "repeated response count": "Count of times the agent gave the same response or asked the same question multiple times.",
+        "document request fragmentation": "Count of times the agent asked for documents in separate requests instead of all at once.",
+        "customer effort score": "Measure of how much effort the customer had to expend (low/medium/high). Higher = more frustration.",
+        "wasted customer trip count": "Count of times the customer had to take action or visit a location that turned out to be unnecessary.",
+        "estimated customer time wasted minutes": "Estimated total minutes of the customer's time wasted due to inefficient responses or delays.",
+        "avoidable agent message count": "Count of agent messages that could have been avoided with better context handling.",
+        "missed transfer count": "Count of times the agent should have transferred the customer but didn't.",
+        "manual escalation count": "Count of times the customer had to be escalated to a human agent.",
+        "late information delivery count": "Count of times information was provided too late in the conversation.",
+        "process delay minutes": "Total estimated minutes of delay caused by the agent or system.",
+        "sla breach count": "Count of times service level agreements were violated.",
+        "critical delay count": "Count of instances where delays had critical business impact.",
+        "attachment information processing failures": "Count of failures to process or correctly handle customer-submitted documents/attachments.",
+        "customer side issue count": "Count of issues that originated from the customer's side.",
+        "chatbot company side issue count": "Count of issues that originated from the chatbot or company side.",
+        "third party issue count": "Count of issues caused by a third party.",
+        "total issue count": "Total count of all issues detected in the conversation.",
+        "customer financial burden event count": "Count of events where the customer incurred unexpected financial burden.",
+        "company cost exposure event count": "Count of events where the company incurred potential cost exposure.",
+        "estimated monetary loss amount": "Estimated total financial loss to the customer or company.",
+        "potential revenue at risk amount": "Estimated potential revenue at risk from this conversation.",
+        "refund request count": "Count of times the customer requested a refund.",
+        "cancellation request count": "Count of times the customer requested to cancel.",
+        "compensation request count": "Count of times the customer requested compensation.",
+        "insurance coverage error count": "Count of errors related to insurance coverage information.",
+        "visa immigration error count": "Count of errors related to visa or immigration information.",
+        "contractual miscommunication count": "Count of miscommunications about contract terms or obligations.",
+        "complaint threat count": "Count of times the customer threatened to complain or escalate.",
+        "lost trust statement count": "Count of times the customer expressed loss of trust in the company.",
+        "appointment failure count": "Count of failed or missed appointments.",
+        "wrong location count": "Count of times the agent provided incorrect location information.",
+        "wrong contact count": "Count of times the agent provided incorrect contact information.",
+        "payment confusion count": "Count of instances where the customer was confused about payment.",
+        "duplicate payment risk count": "Count of instances where duplicate payment could occur.",
+        "legal compliance risk count": "Count of potential legal compliance risks identified.",
+    }
+    
+    return definitions.get(metric_name, "")
 
 
 def _max_frustration(levels: list[str]) -> str:
@@ -168,21 +236,21 @@ def flatten_conversation_row(
         "conversation_start_date": get_md("conversation_start_date"),
         "conversation_end_date": get_md("conversation_end_date"),
         "conversation_status": get_md("conversation_status"),
-        "initial_skill": get_md("initial_skill"),
-        "last_skill": get_md("last_skill"),
-        "joined_skills": get_md("joined_skills"),
-        "conversation_agent_full_name": get_md("conversation_agent_full_name"),
-        "conversation_agent_login_name": get_md("conversation_agent_login_name"),
         "customer_objective_type": cl.get("customer_objective_type"),
         "customer_primary_objective": cl.get("customer_primary_objective"),
         "final_classification": cl.get("final_classification"),
         "handled_status": cl.get("handled_status"),
         "cx_issue_severity": cl.get("cx_issue_severity"),
+        "frustration_detected": cl.get("frustration_detected"),
+        "customer_started_frustrated": cl.get("customer_started_frustrated"),
+        "customer_became_frustrated_during_chat": cl.get("customer_became_frustrated_during_chat"),
+        "customer_ended_frustrated": cl.get("customer_ended_frustrated"),
+        "frustration_timing": cl.get("frustration_timing"),
         "unhandled_resolution_subtype": cl.get("unhandled_resolution_subtype"),
         "final_customer_sentiment": cl.get("final_customer_sentiment"),
         "max_frustration_level": cl.get("max_frustration_level"),
         "main_issue_exists": main_issue.get("issue_exists"),
-        "main_issue_origin": main_issue.get("issue_origin"),
+        "main_issue_origin": cl.get("main_issue_origin", main_issue.get("issue_origin")),
         "main_issue_type": main_issue.get("issue_type"),
         "main_issue_summary": main_issue.get("issue_summary"),
         "customer_impact": main_issue.get("customer_impact"),
@@ -207,9 +275,7 @@ def flatten_conversation_row(
     cm_fields = [
         "total_messages",
         "customer_messages",
-        "agent_messages",
         "unknown_messages",
-        "agent_messages_evaluated",
         "issue_count",
         "major_issue_count",
         "minor_issue_count",
@@ -287,8 +353,6 @@ def dashboard_aggregates(conv_df: pd.DataFrame) -> dict:
             "issue_origin_counts": {},
             "issue_type_counts": {},
             "metric_totals": pd.DataFrame(),
-            "agent_breakdown": pd.DataFrame(),
-            "skill_breakdown": pd.DataFrame(),
         }
 
     total = int(len(conv_df))
@@ -326,9 +390,11 @@ def dashboard_aggregates(conv_df: pd.DataFrame) -> dict:
 
     unhandled_subtype_counts = {}
     if "unhandled_resolution_subtype" in conv_df.columns:
-        unhandled_subtype_counts = (
-            conv_df["unhandled_resolution_subtype"].fillna("unknown").value_counts().to_dict()
-        )
+        subtype_series = conv_df["unhandled_resolution_subtype"].fillna("unknown")
+        subtype_series = subtype_series[
+            subtype_series.astype(str).str.strip().str.lower() != "not_applicable"
+        ]
+        unhandled_subtype_counts = subtype_series.value_counts().to_dict()
 
     issue_origin_counts = {}
     if "main_issue_origin" in conv_df.columns:
@@ -348,60 +414,21 @@ def dashboard_aggregates(conv_df: pd.DataFrame) -> dict:
         rows = []
         for col in metric_cols:
             series = pd.to_numeric(conv_df[col], errors="coerce").fillna(0)
+            contributing = int((series > 0).sum())
             rows.append(
                 {
                     "Column": col,
                     "Category": metric_category_display_name(col),
                     "Metric": metric_display_name(col),
                     "Total": float(series.sum()),
-                    "Average": float(series.mean()) if len(series) else 0.0,
-                    "Conversations > 0": int((series > 0).sum()),
+                    "Average": (float(series[series > 0].mean()) if contributing else 0.0),
+                    "Conversations > 0": contributing,
                 }
             )
         metric_totals = pd.DataFrame(rows).sort_values(
             ["Total", "Conversations > 0", "Category", "Metric"],
             ascending=[False, False, True, True],
         )
-
-    agent_breakdown = pd.DataFrame()
-    if "conversation_agent_full_name" in conv_df.columns:
-        try:
-            agent_breakdown = (
-                conv_df.groupby("conversation_agent_full_name", dropna=False)
-                .agg(
-                    conversations=("conversation_id", "count"),
-                    handled=("handled_status", lambda s: int((s == "handled").sum())),
-                    unhandled=("handled_status", lambda s: int((s == "unhandled").sum())),
-                    many_issues=("cx_issue_severity", lambda s: int((s == "many").sum())),
-                    manual_review=("manual_review_required", lambda s: int(s.fillna(False).astype(bool).sum())),
-                )
-                .reset_index()
-                .rename(columns={"conversation_agent_full_name": "Agent"})
-            )
-        except Exception:
-            agent_breakdown = pd.DataFrame()
-
-    skill_breakdown = pd.DataFrame()
-    skill_col = None
-    for c in ("last_skill", "initial_skill"):
-        if c in conv_df.columns:
-            skill_col = c
-            break
-    if skill_col:
-        try:
-            skill_breakdown = (
-                conv_df.groupby(skill_col, dropna=False)
-                .agg(
-                    conversations=("conversation_id", "count"),
-                    handled=("handled_status", lambda s: int((s == "handled").sum())),
-                    unhandled=("handled_status", lambda s: int((s == "unhandled").sum())),
-                    many_issues=("cx_issue_severity", lambda s: int((s == "many").sum())),
-                )
-                .reset_index()
-                .rename(columns={skill_col: "Skill"})
-            )
-        except Exception:
-            skill_breakdown = pd.DataFrame()
 
     return {
         "total": total,
@@ -416,8 +443,6 @@ def dashboard_aggregates(conv_df: pd.DataFrame) -> dict:
         "issue_origin_counts": issue_origin_counts,
         "issue_type_counts": issue_type_counts,
         "metric_totals": metric_totals,
-        "agent_breakdown": agent_breakdown,
-        "skill_breakdown": skill_breakdown,
     }
 
 
