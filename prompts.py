@@ -422,6 +422,12 @@ CONVERSATION_LEVEL_SYSTEM_PROMPT = DEFAULT_CONVERSATION_LEVEL_PROMPT.build_syste
 
 
 _ALLOWED_METADATA_KEYS = {
+    "customer_name",
+    "customer_phone",
+    "customer_journey_id",
+    "journey_id",
+    "source_conversation_ids",
+    "source_conversation_count",
     "conversation_start_date",
     "conversation_end_date",
     "conversation_status",
@@ -465,6 +471,11 @@ def build_message_level_payload(
 
     target = {
         "message_index": target_message.get("message_index", 0),
+        "appended_message_index": target_message.get(
+            "appended_message_index",
+            target_message.get("message_index", 0),
+        ),
+        "source_conversation_id": target_message.get("source_conversation_id"),
         "message_time": str(target_message.get("message_time", "")),
         "sender_role": target_message.get("sender_role", "agent"),
         "message_text": trim(target_message.get("message_text", "")),
@@ -474,6 +485,11 @@ def build_message_level_payload(
         history_clean.append(
             {
                 "message_index": m.get("message_index", 0),
+                "appended_message_index": m.get(
+                    "appended_message_index",
+                    m.get("message_index", 0),
+                ),
+                "source_conversation_id": m.get("source_conversation_id"),
                 "message_time": str(m.get("message_time", "")),
                 "sender_role": m.get("sender_role", ""),
                 "message_text": trim(m.get("message_text", "")),
@@ -533,6 +549,8 @@ def build_conversation_level_payload(
             msg_idx = m.get("message_index", 0)
         entry: dict[str, Any] = {
             "message_index": msg_idx,
+            "appended_message_index": m.get("appended_message_index", msg_idx),
+            "source_conversation_id": m.get("source_conversation_id"),
             "message_time": str(m.get("message_time", "")),
             "sender_role": m.get("sender_role", ""),
             "message_text": trim(m.get("message_text", "")),

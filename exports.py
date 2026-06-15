@@ -1,4 +1,4 @@
-"""Export helpers: conversation-level CSV, message-level CSV, and full JSON."""
+"""Export helpers: journey-level CSV, message-level CSV, and full JSON."""
 
 from __future__ import annotations
 
@@ -13,7 +13,7 @@ from aggregation import flatten_conversation_row, flatten_message_row
 
 
 def build_conversation_csv_bytes(conversation_results: list[dict]) -> bytes:
-    """Build the conversation-level CSV (one row per conversation) as bytes."""
+    """Build the journey-level CSV (one row per customer journey) as bytes."""
     rows = []
     for cr in conversation_results:
         rows.append(

@@ -37,9 +37,20 @@ Open the URL Streamlit prints in your browser.
 
 ## 3. Expected CSV structure
 
-The CSV must contain one row per visible message and these columns:
+The CSV must contain one row per visible message in the appended customer journey.
+`CUSTOMER_PHONE` is the parent key for the full journey. `APPENDED_MESSAGE_INDEX`
+is the message order within that journey. `CONVERSATION_ID` remains the original
+source conversation ID for traceability.
 
 ```
+CUSTOMER_PHONE
+CUSTOMER_NAME
+TOTAL_VISIBLE_MESSAGES
+CUSTOMER_MESSAGE_COUNT
+AGENT_MESSAGE_COUNT
+SOURCE_CONVERSATION_COUNT
+CONVERSATION_IDS
+APPENDED_MESSAGE_INDEX
 CONVERSATION_ID
 CONVERSATION_START_DATE
 CONVERSATION_END_DATE
@@ -49,9 +60,6 @@ LAST_SKILL
 JOINED_SKILLS
 CONVERSATION_AGENT_FULL_NAME
 CONVERSATION_AGENT_LOGIN_NAME
-CUSTOMER_NAME
-CUSTOMER_PHONE
-MESSAGE_INDEX
 MESSAGE_TIME
 SENDER_ROLE              -- customer / agent / unknown
 RAW_SENDER_ROLE
@@ -72,8 +80,8 @@ The CSV is expected to be **clean**:
 The app will refuse to run if any of these are missing:
 
 ```
-CONVERSATION_ID
-MESSAGE_INDEX
+CUSTOMER_PHONE
+APPENDED_MESSAGE_INDEX
 MESSAGE_TIME
 SENDER_ROLE
 MESSAGE_TEXT
@@ -91,31 +99,32 @@ Settings live in the sidebar:
 - **API Key**: password-style input.
 - **Load available models**: calls `GET /models` through the OpenAI SDK and populates the dropdown.
 - **Model**: chosen from the dropdown — never hardcoded.
-- Generation parameters: temperature, top_p, max tokens, timeout, retries, concurrency (sequential today).
-- Safeguards: max conversations, max agent messages per conversation, optional text truncation, include-unknown toggle, stop-on-error, save-raw-responses.
+- Generation parameters: temperature, top_p, max tokens, timeout, retries, concurrency.
+- Safeguards: max customer journeys, max target messages per journey, optional text truncation, include-unknown toggle, stop-on-error, save-raw-responses.
 
 ---
 
 ## 5. Evaluation logic
 
-For each conversation, in `MESSAGE_INDEX` order:
+For each customer journey, in `APPENDED_MESSAGE_INDEX` order:
 
 ```python
-for conversation_id, group in df.groupby("CONVERSATION_ID"):
-    messages = group.sort_values("MESSAGE_INDEX")
+for journey_id, group in df.groupby("CUSTOMER_PHONE"):
+    messages = group.sort_values("APPENDED_MESSAGE_INDEX")
 
     for each row where SENDER_ROLE == "agent":
-        history = all messages where MESSAGE_INDEX <= current MESSAGE_INDEX
+        history = all messages where APPENDED_MESSAGE_INDEX <= current APPENDED_MESSAGE_INDEX
         run message-level AI evaluation
 
     after all agent messages are evaluated:
         compute metadata
-        run conversation-level AI evaluation
+        run journey-level AI evaluation
 ```
 
 - Customer messages are never evaluated as target messages but are always included in history.
 - Unknown messages can be optionally included in history (default: included).
-- The app generates a stable message ID per row as `{CONVERSATION_ID}-{MESSAGE_INDEX}`.
+- The app generates a stable message ID per row as `{CUSTOMER_PHONE}-{APPENDED_MESSAGE_INDEX}`.
+- Each message retains `source_conversation_id` from `CONVERSATION_ID`; the journey summary also shows `CONVERSATION_IDS`.
 
 ### Message-level output
 
@@ -143,7 +152,7 @@ The **Exports** tab produces three files:
 
 | File | Granularity | Use |
 | --- | --- | --- |
-| `cx_conversation_results.csv` | One row per conversation | Drop into a BI tool / spreadsheet |
+| `cx_journey_results.csv` | One row per customer journey | Drop into a BI tool / spreadsheet |
 | `cx_message_results.csv` | One row per evaluated agent message | Drill into the agent's turn-by-turn behavior |
 | `cx_full_results.json` | Full structured export | Includes raw model responses, debug info, errors, and run config |
 
@@ -151,11 +160,11 @@ The **Exports** tab produces three files:
 
 ## 7. App tabs
 
-1. **Upload & Settings** — upload the CSV, see the row/conversation/message summary, verify required columns.
+1. **Upload & Settings** — upload the CSV, see the row/journey/source-conversation/message summary, verify required columns.
 2. **Prompts** — edit the system prompt, output structure, and user-prompt template for both evaluators. Save as new versions, switch active version, reset to default. All versions are stored in SQLite.
 3. **Run Evaluation** — see the estimated AI-call count, start the run, watch progress, optionally cancel. Includes a "Past runs" section to load or delete previously saved runs.
 4. **Dashboard** — management metrics, classification breakdowns, top issue types, top frustration causes, agent/skill breakdowns.
-5. **Conversation Review** — pick a conversation, view its summary card, native chat-bubble transcript, and the message-level evaluation card directly under each agent message.
+5. **Journey Review** — pick a customer journey, view its summary card, native chat-bubble transcript, and the message-level evaluation card directly under each agent message.
 6. **Exports** — download CSVs and the full JSON.
 7. **Debug** — raw prompts, raw responses, parse errors, failed records, sanitized run config.
 
@@ -180,14 +189,14 @@ Custom fields you add to the output structure are preserved through the validato
 
 ## 7b. Saving and reloading runs
 
-Every evaluation run is written to SQLite as it progresses (message-level results, conversation-level results, errors, prompt versions used, and run config). In the **Run Evaluation** tab, the "Past runs" expander lists everything that has ever been saved with id, CSV name, status, and timestamp. Selecting a run and clicking **Load this run** repopulates the Dashboard, Conversation Review, Exports, and Debug tabs from the database — no need to re-run the evaluation.
+Every evaluation run is written to SQLite as it progresses (message-level results, journey-level results, errors, prompt versions used, and run config). In the **Run Evaluation** tab, the "Past runs" expander lists everything that has ever been saved with id, CSV name, status, and timestamp. Selecting a run and clicking **Load this run** repopulates the Dashboard, Journey Review, Exports, and Debug tabs from the database — no need to re-run the evaluation.
 
 ---
 
 ## 8. Cost / token safeguards
 
-- Max conversations to process.
-- Max agent messages per conversation.
+- Max customer journeys to process.
+- Max target messages per journey.
 - Optional truncation of long message text.
 - Estimated AI call count shown before running.
 - Visible warning for large jobs.
@@ -198,7 +207,7 @@ Every evaluation run is written to SQLite as it progresses (message-level result
 ## 9. Troubleshooting
 
 **"This CSV is missing required columns…"**
-The CSV does not contain one of `CONVERSATION_ID`, `MESSAGE_INDEX`, `MESSAGE_TIME`, `SENDER_ROLE`, or `MESSAGE_TEXT`. Re-export from Snowflake using the message-level query.
+The CSV does not contain one of `CUSTOMER_PHONE`, `APPENDED_MESSAGE_INDEX`, `MESSAGE_TIME`, `SENDER_ROLE`, or `MESSAGE_TEXT`. Re-export from Snowflake using the customer-journey message-level query.
 
 **"Could not load models"**
 Check the base URL is reachable, the API key is correct, and that the endpoint exposes the OpenAI `/models` route.

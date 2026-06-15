@@ -231,8 +231,11 @@ def flatten_conversation_row(
 
     row = {
         "conversation_id": conv_result.get("conversation_id", ""),
+        "customer_journey_id": conv_result.get("conversation_id", ""),
         "customer_name": get_md("customer_name"),
         "customer_phone": get_md("customer_phone"),
+        "source_conversation_ids": get_md("source_conversation_ids", "conversation_ids"),
+        "source_conversation_count": get_md("source_conversation_count"),
         "conversation_start_date": get_md("conversation_start_date"),
         "conversation_end_date": get_md("conversation_end_date"),
         "conversation_status": get_md("conversation_status"),
@@ -302,7 +305,10 @@ def flatten_message_row(message_result: dict) -> dict:
     pj = message_result.get("parsed_json") or {}
     return {
         "conversation_id": message_result.get("conversation_id", ""),
+        "customer_journey_id": message_result.get("conversation_id", ""),
+        "source_conversation_id": message_result.get("source_conversation_id"),
         "target_message_id": message_result.get("target_message_id", ""),
+        "appended_message_index": message_result.get("message_index"),
         "message_index": message_result.get("message_index"),
         "message_time": message_result.get("message_time"),
         "target_message_text": message_result.get("target_message_text"),
