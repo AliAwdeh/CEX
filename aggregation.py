@@ -65,6 +65,26 @@ def _flatten_quantifiable_metrics(metrics: Any) -> dict[str, Any]:
     return out
 
 
+def _flatten_conversation_score(score: Any) -> dict[str, Any]:
+    """Flatten model-produced conversation score into table-friendly columns."""
+    if not isinstance(score, dict):
+        return {}
+
+    return {
+        "score_resolution": score.get("resolution_score"),
+        "score_context_understanding": score.get("context_understanding_score"),
+        "score_customer_effort": score.get("customer_effort_score"),
+        "score_frustration_risk": score.get(
+            "trust_frustration_risk_score",
+            score.get("frustration_risk_score"),
+        ),
+        "score_raw_total": score.get("raw_total_score"),
+        "score_final": score.get("final_score"),
+        "score_rating": score.get("score_rating"),
+        "score_explanation": score.get("score_explanation"),
+    }
+
+
 def quantifiable_metric_columns(df: pd.DataFrame) -> list[str]:
     """Return flattened quantifiable metric columns in a stable order."""
     return sorted([c for c in df.columns if c.startswith("metric__")])
@@ -266,6 +286,8 @@ def flatten_conversation_row(
         ),
         "positive_signals": " | ".join(cl.get("positive_signals", []) or []),
         "negative_signals": " | ".join(cl.get("negative_signals", []) or []),
+        "classification_reason": cl.get("classification_reason"),
+        "quantifiable_metrics_reason": cl.get("quantifiable_metrics_reason"),
         "management_summary": cl.get("management_summary"),
         "recommended_actions": " | ".join(cl.get("recommended_actions", []) or []),
         "manual_review_required": cl.get("manual_review_required"),
@@ -296,6 +318,7 @@ def flatten_conversation_row(
     ]
     for f in cm_fields:
         row[f] = computed_metadata.get(f)
+    row.update(_flatten_conversation_score(cl.get("conversation_score")))
     row.update(_flatten_quantifiable_metrics(cl.get("quantifiable_metrics")))
     return row
 

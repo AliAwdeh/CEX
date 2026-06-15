@@ -294,10 +294,20 @@ def _display_column_name(column: str) -> str:
         "unhandled_resolution_subtype": "Unresolved status",
         "final_customer_sentiment": "Customer feeling at end",
         "max_frustration_level": "Highest frustration level",
+        "score_resolution": "Resolution score",
+        "score_context_understanding": "Context & Understanding score",
+        "score_customer_effort": "Customer Effort score",
+        "score_frustration_risk": "Frustration & Risk score",
+        "score_raw_total": "Raw conversation score",
+        "score_final": "Final conversation score",
+        "score_rating": "Score rating",
+        "score_explanation": "Score explanation",
         "main_issue_type": "Main problem type",
         "main_issue_origin": "Where the main problem came from",
         "main_issue_summary": "Main problem summary",
         "customer_impact": "Customer impact",
+        "classification_reason": "Classification reason",
+        "quantifiable_metrics_reason": "Metric reason",
         "manual_review_required": "Needs human review",
         "manual_review_reason": "Reason for human review",
         "metric_value": "Metric value",
@@ -1727,12 +1737,17 @@ def _render_kpi_strip(filtered: pd.DataFrame, msg_df: pd.DataFrame, agg: dict, t
     review_flag = int(agg.get("manual_review_count", 0))
     high_frust = int(agg.get("high_frustration_count", 0))
     msg_count = int(len(msg_df)) if msg_df is not None else 0
+    avg_score_text = ""
+    if "score_final" in filtered.columns:
+        score_series = pd.to_numeric(filtered["score_final"], errors="coerce").dropna()
+        if not score_series.empty:
+            avg_score_text = f" · Avg score {score_series.mean():.1f}"
 
     cards = [
         _kpi_card_html(
             "Total journeys",
             f"{total:,}",
-            f"{msg_count:,} agent messages · {review_flag:,} flagged for review · {high_frust:,} high-frustration",
+            f"{msg_count:,} agent messages · {review_flag:,} flagged for review · {high_frust:,} high-frustration{avg_score_text}",
             [
                 ("Flagged", review_flag, _DASH_COLORS["review_yes"]),
                 ("Not flagged", max(total - review_flag, 0), _DASH_COLORS["review_no"]),
@@ -2265,6 +2280,8 @@ _OVERVIEW_JOURNEY_COLUMNS = {
     "conversation_id": "ID",
     "customer_name": "Customer",
     "final_classification": "Classification",
+    "score_final": "Score",
+    "score_rating": "Rating",
     "main_issue_type": "Main issue",
     "main_issue_origin": "Origin",
     "max_frustration_level": "Max frustration",
@@ -2279,7 +2296,7 @@ def _overview_journey_table(node_df: pd.DataFrame) -> pd.DataFrame:
     """Build the issue-focused journey list shown when a leaf is expanded."""
     cols = [c for c in _OVERVIEW_JOURNEY_COLUMNS if c in node_df.columns]
     view = node_df[cols].copy()
-    for c in ("main_issue_type", "main_issue_origin", "max_frustration_level", "final_customer_sentiment"):
+    for c in ("main_issue_type", "main_issue_origin", "max_frustration_level", "final_customer_sentiment", "score_rating"):
         if c in view.columns:
             view[c] = view[c].apply(humanize_label)
     view = view.rename(columns=_OVERVIEW_JOURNEY_COLUMNS)
@@ -2893,26 +2910,29 @@ def tab_review() -> None:
         st.warning("No customer journeys match the current filters.")
         return
 
-    metric_row(
-        [
-            ("Customer journeys shown", f"{len(filtered_df):,}", None),
-            (
-                "Handled",
-                f"{int((filtered_df.get('handled_status') == 'handled').sum()):,}",
-                None,
-            ),
-            (
-                "Need human review",
-                f"{int(filtered_df.get('manual_review_required', pd.Series(dtype=bool)).fillna(False).astype(bool).sum()):,}",
-                None,
-            ),
-            (
-                "High frustration",
-                f"{int(filtered_df.get('max_frustration_level', pd.Series(dtype=str)).isin(['high', 'cancellation_risk']).sum()):,}",
-                None,
-            ),
-        ]
-    )
+    review_metrics = [
+        ("Customer journeys shown", f"{len(filtered_df):,}", None),
+        (
+            "Handled",
+            f"{int((filtered_df.get('handled_status') == 'handled').sum()):,}",
+            None,
+        ),
+        (
+            "Need human review",
+            f"{int(filtered_df.get('manual_review_required', pd.Series(dtype=bool)).fillna(False).astype(bool).sum()):,}",
+            None,
+        ),
+        (
+            "High frustration",
+            f"{int(filtered_df.get('max_frustration_level', pd.Series(dtype=str)).isin(['high', 'cancellation_risk']).sum()):,}",
+            None,
+        ),
+    ]
+    if "score_final" in filtered_df.columns:
+        avg_score = pd.to_numeric(filtered_df["score_final"], errors="coerce").dropna()
+        if not avg_score.empty:
+            review_metrics.append(("Avg score", f"{avg_score.mean():.1f}", None))
+    metric_row(review_metrics)
 
     options = []
     label_to_id = {}
@@ -2922,7 +2942,9 @@ def tab_review() -> None:
         phone = row.get("customer_phone") or cid
         source_count = row.get("source_conversation_count") or "—"
         result = row.get("final_classification") or "Unknown"
-        label = f"{phone} • {cust} • {source_count} source convs • {result}"
+        score = row.get("score_final")
+        score_part = f" • score {score}" if pd.notna(score) and str(score).strip() else ""
+        label = f"{phone} • {cust} • {source_count} source convs • {result}{score_part}"
         options.append(label)
         label_to_id[label] = cid
 

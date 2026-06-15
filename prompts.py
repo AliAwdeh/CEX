@@ -257,7 +257,21 @@ Rules:
 - Always specify whether the main issue originated from our side, customer side, shared, unclear, or none.
 - Explain impact from the customer's perspective.
 - Keep the management summary concise and business-friendly.
-- Set manual_review_required to true if confidence is low, cancellation risk exists, high frustration exists, the final status is unclear, or JSON/message-level errors affected the evaluation."""
+- Set manual_review_required to true if confidence is low, cancellation risk exists, high frustration exists, the final status is unclear, or JSON/message-level errors affected the evaluation.
+
+Conversation score:
+- Return conversation_score as a compact numeric summary of the customer journey.
+- The score is out of 100 and must be the sum of: resolution_score /20, context_understanding_score /20, customer_effort_score /20, and trust_frustration_risk_score /40.
+- Resolution score should follow final_classification first: handled/minimal should be high, handled/many should be moderate-high, unhandled/minimal should be moderate-low, and unhandled/many/caused/frustration should be low.
+- Context & Understanding score should mainly reflect intent_understanding_errors, information_retention_failures, misleading_information_count, repeated_response_count, date_timeline_errors, and attachment_information_processing_failures.
+- Customer Effort score should mainly reflect customer_effort_score, document_request_fragmentation, avoidable_agent_message_count, and wasted_customer_trip_count. Higher score means lower customer effort.
+- Trust/Frustration/Risk score should prioritize payment and money risk, then frustration: duplicate_payment_risk_count, payment_confusion_count, refund_request_count, cancellation_request_count, compensation_request_count, customer_financial_burden_event_count, complaint_threat_count, lost_trust_statement_count, and legal_compliance_risk_count.
+- Payment issues are high priority. If payment proof was ignored, the customer was asked to pay again, a duplicate payment risk exists, a refund/cancellation is mishandled, or payment guidance is confusing, reduce trust_frustration_risk_score strongly even if the customer tone is calm.
+- raw_total_score is the direct sum before guardrail caps or classification alignment. final_score is the final score after any caps/adjustments.
+- score_rating bands: 90-100 Excellent, 75-89 Good, 60-74 Fair, 40-59 Poor, 0-39 Critical.
+- score_explanation must briefly explain why the score is high or low, naming the strongest drivers instead of repeating the number.
+- classification_reason must explain why final_classification was selected.
+- quantifiable_metrics_reason must briefly explain the key metric values that affected classification or score."""
 
 
 DEFAULT_CONVERSATION_LEVEL_OUTPUT_SCHEMA = """{
@@ -393,7 +407,19 @@ DEFAULT_CONVERSATION_LEVEL_OUTPUT_SCHEMA = """{
   "recommended_actions": ["short actionable recommendation"],
   "manual_review_required": "true|false",
   "manual_review_reason": "short reason or none",
-  "confidence": "low|medium|high"
+  "confidence": "low|medium|high",
+  "conversation_score": {
+    "resolution_score": "number 0-20",
+    "context_understanding_score": "number 0-20",
+    "customer_effort_score": "number 0-20",
+    "trust_frustration_risk_score": "number 0-40",
+    "raw_total_score": "number 0-100",
+    "final_score": "number 0-100",
+    "score_rating": "Excellent|Good|Fair|Poor|Critical",
+    "score_explanation": "short explanation of the score drivers"
+  },
+  "classification_reason": "short reason explaining why final_classification was selected",
+  "quantifiable_metrics_reason": "short reason explaining the key metric values that affected classification or score"
 }"""
 
 

@@ -121,6 +121,43 @@ def _badge(label: str, value: str, color: str) -> str:
     )
 
 
+def _format_score(value: Any, maximum: int) -> str:
+    try:
+        num = float(value)
+    except (TypeError, ValueError):
+        return "-"
+    if num.is_integer():
+        return f"{int(num)} / {maximum}"
+    return f"{num:.1f} / {maximum}"
+
+
+def _score_color(value: Any, rating: str | None = None) -> str:
+    rating_key = str(rating or "").strip().lower()
+    if rating_key == "excellent":
+        return "#16a34a"
+    if rating_key == "good":
+        return "#65a30d"
+    if rating_key == "fair":
+        return "#d97706"
+    if rating_key == "poor":
+        return "#dc2626"
+    if rating_key == "critical":
+        return "#7f1d1d"
+    try:
+        num = float(value)
+    except (TypeError, ValueError):
+        return "#6b7280"
+    if num >= 90:
+        return "#16a34a"
+    if num >= 75:
+        return "#65a30d"
+    if num >= 60:
+        return "#d97706"
+    if num >= 40:
+        return "#dc2626"
+    return "#7f1d1d"
+
+
 def metric_row(metrics: list[tuple[str, Any, str | None]]) -> None:
     """Render a row of st.metric cards from (label, value, delta) tuples."""
     cols = st.columns(len(metrics))
@@ -559,6 +596,9 @@ def render_conversation_summary_card(conv_result: dict) -> None:
     sentiment = pj.get("final_customer_sentiment", "unknown")
     max_fl = pj.get("max_frustration_level", "none")
     main = pj.get("main_issue") or {}
+    score = pj.get("conversation_score") or {}
+    if not isinstance(score, dict):
+        score = {}
 
     head_colors = {
         "Handled with Minimal Issues": "#16a34a",
@@ -619,6 +659,46 @@ def render_conversation_summary_card(conv_result: dict) -> None:
     badges.append(_badge("Confidence", pj.get("confidence", "—"), "#475569"))
     st.markdown("".join(badges), unsafe_allow_html=True)
 
+    if score:
+        final_score = score.get("final_score")
+        raw_total = score.get("raw_total_score")
+        rating = score.get("score_rating") or "-"
+        score_color = _score_color(final_score, rating)
+        st.markdown(
+            f"""
+            <div style="margin:14px 0 10px 0; padding:14px 18px; border-radius:10px;
+                        background:#0f172a; border:1px solid {score_color};">
+              <div style="font-size:0.82rem; color:#cbd5e1; font-weight:800; text-transform:uppercase; letter-spacing:0.04em;">
+                Conversation score
+              </div>
+              <div style="display:flex; align-items:baseline; gap:10px; margin-top:4px;">
+                <span style="font-size:2.1rem; font-weight:900; color:{score_color};">{html.escape(_format_score(final_score, 100))}</span>
+                <span style="font-size:1rem; color:#e5e7eb; font-weight:800;">{html.escape(str(rating))}</span>
+              </div>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+        metric_row(
+            [
+                ("Resolution", _format_score(score.get("resolution_score"), 20), None),
+                ("Context & Understanding", _format_score(score.get("context_understanding_score"), 20), None),
+                ("Customer Effort", _format_score(score.get("customer_effort_score"), 20), None),
+                (
+                    "Frustration & Risk",
+                    _format_score(
+                        score.get("trust_frustration_risk_score", score.get("frustration_risk_score")),
+                        40,
+                    ),
+                    None,
+                ),
+                ("Raw total", _format_score(raw_total, 100), None),
+            ]
+        )
+        if score.get("score_explanation"):
+            st.markdown("**Why this score was assigned**")
+            st.write(score.get("score_explanation"))
+
     cols = st.columns([1, 1, 1])
     with cols[0]:
         st.markdown("**ID**")
@@ -665,6 +745,17 @@ def render_conversation_summary_card(conv_result: dict) -> None:
 
     st.markdown("### Business Summary")
     st.write(pj.get("management_summary") or "—")
+
+    classification_reason = pj.get("classification_reason")
+    metrics_reason = pj.get("quantifiable_metrics_reason")
+    if classification_reason or metrics_reason:
+        st.markdown("### Decision Reasoning")
+        if classification_reason:
+            st.markdown("**Classification reason**")
+            st.write(classification_reason)
+        if metrics_reason:
+            st.markdown("**Metric reason**")
+            st.write(metrics_reason)
 
     positives = pj.get("positive_signals") or []
     negatives = pj.get("negative_signals") or []

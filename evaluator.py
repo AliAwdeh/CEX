@@ -336,6 +336,66 @@ def _normalize_quantifiable_metrics(value: Any) -> list[dict]:
     return out
 
 
+def _score_number(value: Any, minimum: float, maximum: float) -> int | float:
+    try:
+        num = float(value)
+    except (TypeError, ValueError):
+        num = 0.0
+    num = max(minimum, min(maximum, num))
+    return int(num) if num.is_integer() else num
+
+
+def _rating_from_score(score: Any) -> str:
+    try:
+        value = float(score)
+    except (TypeError, ValueError):
+        value = 0.0
+    if value >= 90:
+        return "Excellent"
+    if value >= 75:
+        return "Good"
+    if value >= 60:
+        return "Fair"
+    if value >= 40:
+        return "Poor"
+    return "Critical"
+
+
+def _normalize_conversation_score(value: Any) -> dict:
+    if not isinstance(value, dict):
+        return {}
+
+    resolution = _score_number(value.get("resolution_score"), 0, 20)
+    context = _score_number(value.get("context_understanding_score"), 0, 20)
+    effort = _score_number(value.get("customer_effort_score"), 0, 20)
+    frustration_risk = _score_number(
+        value.get("trust_frustration_risk_score", value.get("frustration_risk_score")),
+        0,
+        40,
+    )
+    raw_total = _score_number(
+        value.get("raw_total_score", float(resolution) + float(context) + float(effort) + float(frustration_risk)),
+        0,
+        100,
+    )
+    final_score = _score_number(value.get("final_score", raw_total), 0, 100)
+
+    rating = str(value.get("score_rating") or "").strip()
+    if rating not in {"Excellent", "Good", "Fair", "Poor", "Critical"}:
+        rating = _rating_from_score(final_score)
+
+    return {
+        "resolution_score": resolution,
+        "context_understanding_score": context,
+        "customer_effort_score": effort,
+        "trust_frustration_risk_score": frustration_risk,
+        "raw_total_score": raw_total,
+        "final_score": final_score,
+        "score_rating": rating,
+        "score_explanation": str(value.get("score_explanation", "") or ""),
+    }
+
+
 def validate_conversation_level_result(data: dict) -> dict:
     """Coerce a parsed conversation-level JSON object into the strict schema shape."""
     if not isinstance(data, dict):
@@ -507,6 +567,9 @@ def validate_conversation_level_result(data: dict) -> dict:
     out["positive_signals"] = [str(x) for x in (data.get("positive_signals") or []) if x]
     out["negative_signals"] = [str(x) for x in (data.get("negative_signals") or []) if x]
     out["quantifiable_metrics"] = _normalize_quantifiable_metrics(data.get("quantifiable_metrics"))
+    out["conversation_score"] = _normalize_conversation_score(data.get("conversation_score"))
+    out["classification_reason"] = str(data.get("classification_reason", "") or "")
+    out["quantifiable_metrics_reason"] = str(data.get("quantifiable_metrics_reason", "") or "")
     out["management_summary"] = str(data.get("management_summary", "") or "")
     out["recommended_actions"] = [str(x) for x in (data.get("recommended_actions") or []) if x]
     out["manual_review_required"] = _normalize_bool_flag(data.get("manual_review_required"), default=False)
@@ -882,6 +945,18 @@ def run_evaluation(
                 "positive_signals": [],
                 "negative_signals": [],
                 "quantifiable_metrics": [],
+                "conversation_score": {
+                    "resolution_score": 0,
+                    "context_understanding_score": 0,
+                    "customer_effort_score": 0,
+                    "trust_frustration_risk_score": 0,
+                    "raw_total_score": 0,
+                    "final_score": 0,
+                    "score_rating": "Critical",
+                    "score_explanation": "Conversation-level evaluator did not return parseable JSON.",
+                },
+                "classification_reason": "The conversation-level evaluator failed, so the result is treated as unresolved and high risk for review.",
+                "quantifiable_metrics_reason": "No reliable metric counts were returned because parsing failed.",
                 "management_summary": "Automatic evaluation could not parse a result for this conversation. Manual review required.",
                 "recommended_actions": ["Review this conversation manually."],
                 "manual_review_required": True,
