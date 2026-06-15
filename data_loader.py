@@ -1,4 +1,4 @@
-"""CSV loading, validation, and conversation preparation."""
+"""CSV loading, validation, and customer journey preparation."""
 
 from __future__ import annotations
 
@@ -8,14 +8,19 @@ from typing import Any
 import pandas as pd
 
 
+JOURNEY_ID_COLUMN = "CUSTOMER_PHONE"
+MESSAGE_ORDER_COLUMN = "APPENDED_MESSAGE_INDEX"
+LEGACY_MESSAGE_ORDER_COLUMN = "MESSAGE_INDEX"
+
 REQUIRED_COLUMNS = [
-    "MESSAGE_INDEX",
+    JOURNEY_ID_COLUMN,
+    MESSAGE_ORDER_COLUMN,
     "MESSAGE_TIME",
     "SENDER_ROLE",
     "MESSAGE_TEXT",
 ]
 
-ID_COLUMNS = ["THREAD_ID", "CONVERSATION_ID"]
+ID_COLUMNS = [JOURNEY_ID_COLUMN]
 
 
 METADATA_COLUMNS = [
@@ -29,6 +34,8 @@ METADATA_COLUMNS = [
     "CONVERSATION_AGENT_LOGIN_NAME",
     "CUSTOMER_NAME",
     "CUSTOMER_PHONE",
+    "CONVERSATION_IDS",
+    "SOURCE_CONVERSATION_COUNT",
     "TOTAL_VISIBLE_MESSAGES",
     "CUSTOMER_MESSAGE_COUNT",
     "AGENT_MESSAGE_COUNT",
@@ -51,13 +58,13 @@ def validate_csv(df: pd.DataFrame) -> tuple[bool, list[str], str]:
     Returns (is_valid, missing_columns, message).
     """
     missing = [c for c in REQUIRED_COLUMNS if c not in df.columns]
-    if not any(c in df.columns for c in ID_COLUMNS):
-        missing = ["THREAD_ID or CONVERSATION_ID", *missing]
     if missing:
         msg = (
             "This CSV is missing required columns needed for evaluation:\n- "
             + "\n- ".join(missing)
-            + "\n\nPlease export the CSV using the expected Snowflake query structure."
+            + "\n\nThe current data model expects one row per visible message in a "
+            "customer journey: CUSTOMER_PHONE is the journey key and "
+            "APPENDED_MESSAGE_INDEX is the message order within that journey."
         )
         return False, missing, msg
     return True, [], "CSV passes validation."
@@ -67,9 +74,13 @@ def normalize_dataframe(df: pd.DataFrame) -> pd.DataFrame:
     """Normalize types and clean key columns; do not drop required columns."""
     df = df.copy()
 
-    # Coerce MESSAGE_INDEX numeric and sort-safe.
-    if "MESSAGE_INDEX" in df.columns:
-        df["MESSAGE_INDEX"] = pd.to_numeric(df["MESSAGE_INDEX"], errors="coerce")
+    # Coerce the appended journey order numeric and mirror it into MESSAGE_INDEX
+    # for the older downstream evaluator/export code paths.
+    if MESSAGE_ORDER_COLUMN in df.columns:
+        df[MESSAGE_ORDER_COLUMN] = pd.to_numeric(df[MESSAGE_ORDER_COLUMN], errors="coerce")
+        df[LEGACY_MESSAGE_ORDER_COLUMN] = df[MESSAGE_ORDER_COLUMN]
+    elif LEGACY_MESSAGE_ORDER_COLUMN in df.columns:
+        df[LEGACY_MESSAGE_ORDER_COLUMN] = pd.to_numeric(df[LEGACY_MESSAGE_ORDER_COLUMN], errors="coerce")
 
     # Stringify MESSAGE_TEXT to avoid NaN type issues downstream.
     if "MESSAGE_TEXT" in df.columns:
@@ -79,14 +90,14 @@ def normalize_dataframe(df: pd.DataFrame) -> pd.DataFrame:
     if "SENDER_ROLE" in df.columns:
         df["SENDER_ROLE"] = df["SENDER_ROLE"].fillna("unknown").astype(str).str.strip().str.lower()
 
-    # Prefer THREAD_ID as the stable grouping key; keep CONVERSATION_ID as a compatibility alias.
-    if "THREAD_ID" in df.columns:
-        df["THREAD_ID"] = df["THREAD_ID"].astype(str)
-        if "CONVERSATION_ID" not in df.columns:
-            df["CONVERSATION_ID"] = df["THREAD_ID"]
-    elif "CONVERSATION_ID" in df.columns:
-        df["CONVERSATION_ID"] = df["CONVERSATION_ID"].astype(str)
-        df["THREAD_ID"] = df["CONVERSATION_ID"]
+    # CUSTOMER_PHONE is now the stable parent key for the full appended journey.
+    # Keep THREAD_ID/JOURNEY_ID aliases so older internal names keep working.
+    if JOURNEY_ID_COLUMN in df.columns:
+        df[JOURNEY_ID_COLUMN] = df[JOURNEY_ID_COLUMN].fillna("").astype(str)
+        df["JOURNEY_ID"] = df[JOURNEY_ID_COLUMN]
+        df["THREAD_ID"] = df[JOURNEY_ID_COLUMN]
+    if "CONVERSATION_ID" in df.columns:
+        df["CONVERSATION_ID"] = df["CONVERSATION_ID"].fillna("").astype(str)
 
     return df
 
@@ -111,9 +122,12 @@ def summarize_dataframe(df: pd.DataFrame) -> dict:
         "date_min": None,
         "date_max": None,
     }
-    id_col = "THREAD_ID" if "THREAD_ID" in df.columns else "CONVERSATION_ID"
+    id_col = JOURNEY_ID_COLUMN if JOURNEY_ID_COLUMN in df.columns else "THREAD_ID"
     if id_col in df.columns:
         summary["conversations"] = int(df[id_col].nunique())
+        summary["journeys"] = int(df[id_col].nunique())
+    if "CONVERSATION_ID" in df.columns:
+        summary["source_conversations"] = int(df["CONVERSATION_ID"].nunique())
     if "SENDER_ROLE" in df.columns:
         role_series = df["SENDER_ROLE"].astype(str).str.lower()
         summary["customer_messages"] = int((role_series == "customer").sum())
@@ -138,12 +152,12 @@ def summarize_dataframe(df: pd.DataFrame) -> dict:
 
 
 def get_conversation_groups(df: pd.DataFrame) -> list[tuple[str, pd.DataFrame]]:
-    """Return list of (conversation_id, sorted_dataframe) tuples."""
-    id_col = "THREAD_ID" if "THREAD_ID" in df.columns else "CONVERSATION_ID"
+    """Return list of (journey_id, sorted_dataframe) tuples."""
+    id_col = JOURNEY_ID_COLUMN if JOURNEY_ID_COLUMN in df.columns else "THREAD_ID"
     if id_col not in df.columns:
         return []
     out = []
-    sort_cols = [col for col in ("MESSAGE_INDEX", "MESSAGE_TIME") if col in df.columns]
+    sort_cols = [col for col in (MESSAGE_ORDER_COLUMN, LEGACY_MESSAGE_ORDER_COLUMN, "MESSAGE_TIME") if col in df.columns]
     for conv_id, group in df.groupby(id_col, sort=False):
         if sort_cols:
             sorted_group = group.sort_values(sort_cols, kind="stable").reset_index(drop=True)
@@ -154,30 +168,74 @@ def get_conversation_groups(df: pd.DataFrame) -> list[tuple[str, pd.DataFrame]]:
 
 
 def conversation_metadata_from_group(group: pd.DataFrame) -> dict:
-    """Extract conversation-level metadata from the first row of a conversation group."""
+    """Extract journey-level metadata from a grouped customer timeline."""
     if group.empty:
         return {}
     first = group.iloc[0]
+    last = group.iloc[-1]
     md: dict[str, Any] = {}
+
+    def clean(value: Any) -> Any:
+        if pd.isna(value):
+            return None
+        return str(value) if not isinstance(value, (int, float, bool)) else value
+
+    def unique_join(column: str) -> str | None:
+        if column not in group.columns:
+            return None
+        values: list[str] = []
+        for val in group[column].dropna().astype(str):
+            for part in val.split(","):
+                item = part.strip()
+                if item and item not in values:
+                    values.append(item)
+        return ", ".join(values) if values else None
+
     for col in METADATA_COLUMNS:
-        if col in group.columns:
-            val = first.get(col)
-            if pd.isna(val):
-                md[col.lower()] = None
-            else:
-                md[col.lower()] = str(val) if not isinstance(val, (int, float, bool)) else val
+        if col not in group.columns:
+            continue
+        key = col.lower()
+        if col == "CONVERSATION_START_DATE":
+            md[key] = clean(first.get(col))
+        elif col == "CONVERSATION_END_DATE":
+            md[key] = clean(last.get(col))
+        elif col in {"JOINED_SKILLS", "CONVERSATION_IDS"}:
+            md[key] = unique_join(col)
+        elif col in {"TOTAL_VISIBLE_MESSAGES", "CUSTOMER_MESSAGE_COUNT", "AGENT_MESSAGE_COUNT"}:
+            md[key] = clean(first.get(col))
+        else:
+            md[key] = clean(first.get(col))
+
+    journey_id = clean(first.get(JOURNEY_ID_COLUMN)) if JOURNEY_ID_COLUMN in group.columns else None
+    source_ids = unique_join("CONVERSATION_IDS") or unique_join("CONVERSATION_ID")
+    md["customer_journey_id"] = journey_id
+    md["journey_id"] = journey_id
+    md["source_conversation_ids"] = source_ids
+    md["source_conversation_count"] = len([x for x in (source_ids or "").split(",") if x.strip()])
+    md["total_visible_messages"] = int(len(group))
+    if "SENDER_ROLE" in group.columns:
+        roles = group["SENDER_ROLE"].fillna("unknown").astype(str).str.lower()
+        md["customer_message_count"] = int((roles == "customer").sum())
+        md["agent_message_count"] = int((roles == "agent").sum())
+        md["unknown_message_count"] = int(((roles != "customer") & (roles != "agent")).sum())
     return md
 
 
 def message_records_from_group(group: pd.DataFrame, conversation_id: str) -> list[dict]:
-    """Return list of message dicts for a conversation group, in order."""
+    """Return message dicts for a customer journey, in appended order."""
     records: list[dict] = []
     for _, row in group.iterrows():
-        msg_index = row.get("MESSAGE_INDEX")
+        msg_index = row.get(MESSAGE_ORDER_COLUMN, row.get(LEGACY_MESSAGE_ORDER_COLUMN))
         records.append(
             {
                 "message_id": generate_message_id(conversation_id, msg_index),
                 "message_index": int(msg_index) if pd.notna(msg_index) else None,
+                "appended_message_index": int(msg_index) if pd.notna(msg_index) else None,
+                "source_conversation_id": (
+                    str(row.get("CONVERSATION_ID"))
+                    if "CONVERSATION_ID" in group.columns and pd.notna(row.get("CONVERSATION_ID"))
+                    else None
+                ),
                 "message_time": str(row.get("MESSAGE_TIME", "")) if pd.notna(row.get("MESSAGE_TIME")) else "",
                 "sender_role": str(row.get("SENDER_ROLE", "unknown")),
                 "raw_sender_role": (

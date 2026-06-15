@@ -17,6 +17,7 @@ import ui_components as ui_components_module
 
 from api_client import APIConfig, DEFAULT_BASE_URL, build_client, fetch_models
 from data_loader import (
+    JOURNEY_ID_COLUMN,
     METADATA_COLUMNS,
     REQUIRED_COLUMNS,
     estimate_call_counts,
@@ -62,6 +63,7 @@ from ui_components import (
 
 try:
     import plotly.express as px
+    import plotly.graph_objects as go
     HAS_PLOTLY = True
 except Exception:
     HAS_PLOTLY = False
@@ -83,6 +85,7 @@ def _init_state() -> None:
         "df_norm": None,
         "csv_summary": None,
         "csv_name": None,
+        "run_name": "",
         "available_models": [],
         "models_loaded_at": None,
         "model_load_error": None,
@@ -269,8 +272,12 @@ def _display_column_name(column: str) -> str:
         return f"{metric_category_display_name(column)} / {metric_display_name(column)}"
     special = {
         "conversation_id": "ID",
+        "customer_journey_id": "ID",
         "customer_name": "Customer name",
         "customer_phone": "Customer phone",
+        "source_conversation_id": "Source conversation ID",
+        "source_conversation_ids": "Source conversation IDs",
+        "source_conversation_count": "Source conversations",
         "conversation_start_date": "Started",
         "conversation_end_date": "Ended",
         "conversation_status": "Conversation status",
@@ -295,7 +302,8 @@ def _display_column_name(column: str) -> str:
         "manual_review_reason": "Reason for human review",
         "metric_value": "Metric value",
         "target_message_id": "Target message ID",
-        "message_index": "Message index",
+        "appended_message_index": "Appended message index",
+        "message_index": "Appended message index",
         "message_time": "Message time",
         "target_message_text": "Assistant message",
     }
@@ -807,6 +815,75 @@ def _render_plotly(fig) -> None:
     st.plotly_chart(fig, use_container_width=True, config={"displayModeBar": True, "responsive": True})
 
 
+def _segment_table(df: pd.DataFrame, column: str, label: str, *, base_count: int | None = None) -> pd.DataFrame:
+    """Return count/share rows for a dashboard segment column."""
+    if df.empty or column not in df.columns:
+        return pd.DataFrame(columns=[label, "Count", "Share", "_pct"])
+    base = int(base_count if base_count is not None else len(df)) or 1
+    counts = df[column].fillna("unknown").astype(str).value_counts(dropna=False)
+    rows = []
+    for value, count in counts.items():
+        count = int(count)
+        rows.append(
+            {
+                label: humanize_label(value),
+                "Count": count,
+                "Share": f"{(count / base * 100):.1f}%",
+                "_pct": count / base * 100,
+            }
+        )
+    return pd.DataFrame(rows)
+
+
+def _render_segment_block(
+    title: str,
+    df: pd.DataFrame,
+    label_col: str,
+    *,
+    color_col: str | None = None,
+    chart: bool = True,
+) -> None:
+    """Render a compact dashboard block as chart plus table."""
+    st.markdown(f"#### {title}")
+    if df.empty:
+        st.caption("No data.")
+        return
+    display_df = df[[label_col, "Count", "Share"]].copy()
+    if chart and HAS_PLOTLY:
+        chart_df = df.copy()
+        fig = px.bar(
+            chart_df,
+            x="Count",
+            y=label_col,
+            color=color_col or label_col,
+            orientation="h",
+            text="Share",
+            hover_data=["Count", "Share"],
+        )
+        _plotly_layout(fig, height=max(260, min(520, 68 + len(chart_df) * 38)), yaxis=dict(autorange="reversed"))
+        _render_plotly(fig)
+    _render_display_table(display_df, height=min(320, 74 + len(display_df) * 36))
+
+
+def _comparison_matrix(
+    df: pd.DataFrame,
+    row_col: str,
+    col_col: str,
+    *,
+    row_label: str,
+    col_label: str,
+) -> pd.DataFrame:
+    if df.empty or row_col not in df.columns or col_col not in df.columns:
+        return pd.DataFrame()
+    work = df[[row_col, col_col]].copy()
+    work[row_col] = work[row_col].fillna("unknown").astype(str).apply(humanize_label)
+    work[col_col] = work[col_col].fillna("unknown").astype(str).apply(humanize_label)
+    matrix = pd.crosstab(work[row_col], work[col_col])
+    matrix.index.name = row_label
+    matrix.columns.name = col_label
+    return matrix.reset_index()
+
+
 # --------- Sidebar ---------
 
 
@@ -884,14 +961,14 @@ def render_sidebar() -> None:
         st.markdown("---")
         st.markdown("### Evaluation safeguards")
         st.number_input(
-            "Max conversations to process",
+            "Max customer journeys to process",
             min_value=1,
             max_value=10000,
             step=1,
             key="max_conversations",
         )
         st.number_input(
-            "Max target messages per conversation",
+            "Max target messages per journey",
             min_value=1,
             max_value=2000,
             step=1,
@@ -936,9 +1013,9 @@ def render_sidebar() -> None:
 
 
 def tab_upload() -> None:
-    st.subheader("Upload Conversation CSV")
+    st.subheader("Upload Customer Journey CSV")
     st.caption(
-        "Upload the Snowflake-exported CSV. One row per visible message. "
+        "Upload the Snowflake-exported CSV. One row per visible message in the appended customer journey. "
         "Tool calls and internal/system messages must already be removed."
     )
 
@@ -974,7 +1051,8 @@ def tab_upload() -> None:
     metric_row(
         [
             ("Rows", f"{summary.get('rows', 0):,}", None),
-            ("Conversations", f"{summary.get('conversations', 0):,}", None),
+            ("Customer journeys", f"{summary.get('journeys', summary.get('conversations', 0)):,}", None),
+            ("Source conversations", f"{summary.get('source_conversations', 0):,}", None),
             ("Customer messages", f"{summary.get('customer_messages', 0):,}", None),
             ("Assistant messages", f"{summary.get('agent_messages', 0):,}", None),
             ("Unknown messages", f"{summary.get('unknown_messages', 0):,}", None),
@@ -1182,12 +1260,23 @@ def tab_run() -> None:
         else:
             df_runs = pd.DataFrame(runs)
             df_runs["label"] = df_runs.apply(
-                lambda r: f"#{r['id']} • {r.get('csv_name') or '—'} • {r['status']} • {r['started_at']}",
+                lambda r: (
+                    f"#{r['id']} • {r.get('name') or 'Untitled run'} • "
+                    f"{r.get('csv_name') or '—'} • {r['status']} • {r['started_at']}"
+                ),
                 axis=1,
             )
             sel = st.selectbox("Select a saved run to load", df_runs["label"].tolist(), index=0)
             sel_id = int(df_runs.iloc[df_runs.index[df_runs["label"] == sel][0]]["id"])
-            col_load, col_del = st.columns([1, 1])
+            selected_run = df_runs[df_runs["id"] == sel_id].iloc[0].to_dict()
+            rename_key = f"rename_run_{sel_id}"
+            st.text_input(
+                "Rename selected run",
+                key=rename_key,
+                value=selected_run.get("name") or "",
+                placeholder="Untitled run",
+            )
+            col_load, col_rename, col_del = st.columns([1, 1, 1])
             with col_load:
                 if st.button("Load this run", use_container_width=True):
                     try:
@@ -1205,6 +1294,14 @@ def tab_run() -> None:
                         st.success(f"Loaded run #{sel_id}.")
                     except Exception as e:
                         st.error(f"Could not load run: {e}")
+            with col_rename:
+                if st.button("Save name", use_container_width=True, type="secondary"):
+                    try:
+                        db.rename_run(sel_id, (st.session_state.get(rename_key) or "").strip())
+                        st.success(f"Renamed run #{sel_id}.")
+                        st.rerun()
+                    except Exception as e:
+                        st.error(f"Could not rename run: {e}")
             with col_del:
                 if st.button("Delete this run", use_container_width=True, type="secondary"):
                     try:
@@ -1227,16 +1324,23 @@ def tab_run() -> None:
             "Click 'Load available models' to populate the list."
         )
 
+    st.text_input(
+        "Run name",
+        key="run_name",
+        placeholder="e.g., June renewal journeys - agent review",
+        help="Saved with this run and shown in Past runs.",
+    )
+
     target_role = str(st.session_state.message_target_role or "agent")
 
-    # ---- Conversation selection (first-N vs. random sample) -----------------
+    # ---- Customer journey selection (first-N vs. random sample) -------------
     all_ids = (
-        df["CONVERSATION_ID"].astype(str).drop_duplicates().tolist()
-        if "CONVERSATION_ID" in df.columns
+        df[JOURNEY_ID_COLUMN].astype(str).drop_duplicates().tolist()
+        if JOURNEY_ID_COLUMN in df.columns
         else []
     )
     selected_ids = st.session_state.selected_conversation_ids
-    st.markdown("### Conversation selection")
+    st.markdown("### Customer journey selection")
     pick_cols = st.columns([1, 1, 1, 2])
     with pick_cols[0]:
         if st.button(
@@ -1265,7 +1369,7 @@ def tab_run() -> None:
         st.caption(
             f"**{len(selected_ids):,} pinned**"
             if selected_ids
-            else "_No selection — runs use the first N from the CSV._"
+            else "_No selection — runs use the first N customer journeys from the CSV._"
         )
     with pick_cols[3]:
         if selected_ids:
@@ -1277,7 +1381,7 @@ def tab_run() -> None:
     # Build the estimate. When a random selection is active, count over the
     # pinned IDs; otherwise apply the max_conversations slice.
     if selected_ids:
-        df_for_estimate = df[df["CONVERSATION_ID"].astype(str).isin(set(map(str, selected_ids)))]
+        df_for_estimate = df[df[JOURNEY_ID_COLUMN].astype(str).isin(set(map(str, selected_ids)))]
         estimate = estimate_call_counts(
             df_for_estimate,
             max_conversations=None,
@@ -1302,9 +1406,9 @@ def tab_run() -> None:
     )
     metric_row(
         [
-            ("Conversations to evaluate", f"{estimate['conversations']:,}", None),
+            ("Customer journeys to evaluate", f"{estimate['conversations']:,}", None),
             (f"{role_label.capitalize()}-message AI calls", f"{estimate['message_level_calls']:,}", None),
-            ("Conversation-level AI calls", f"{estimate['conversation_level_calls']:,}", None),
+            ("Journey-level AI calls", f"{estimate['conversation_level_calls']:,}", None),
             ("Total estimated AI calls", f"{estimate['total_calls']:,}", None),
         ]
     )
@@ -1313,7 +1417,7 @@ def tab_run() -> None:
     if large_job:
         st.warning(
             f"This run will make ~{estimate['total_calls']:,} AI calls. "
-            "Consider lowering Max conversations or Max target messages per conversation in the sidebar."
+            "Consider lowering Max customer journeys or Max target messages per journey in the sidebar."
         )
 
     run_col, cancel_col, _ = st.columns([1, 1, 4])
@@ -1356,19 +1460,22 @@ def tab_run() -> None:
             "retries": config.api.retries,
             "concurrency": config.api.concurrency,
             "max_conversations": config.max_conversations,
-            "max_target_messages_per_conversation": config.max_agent_messages_per_conv,
+            "max_target_messages_per_journey": config.max_agent_messages_per_conv,
             "truncate_messages": config.truncate_messages,
             "max_chars_per_message": config.max_chars_per_message,
             "include_unknown_in_history": config.include_unknown_in_history,
             "stop_on_error": config.stop_on_error,
             "save_raw_responses": config.save_raw_responses,
             "message_target_role": config.message_target_role,
+            "run_name": (st.session_state.run_name or "").strip(),
         }
+        run_name = (st.session_state.run_name or "").strip() or None
         run_id = db.start_run(
             csv_name=st.session_state.csv_name,
             run_config=run_config_serializable,
             message_prompt_id=ml_prompt_id,
             conversation_prompt_id=cl_prompt_id,
+            name=run_name,
         )
         st.session_state.current_run_id = run_id
         st.session_state.loaded_run_label = None
@@ -1381,8 +1488,8 @@ def tab_run() -> None:
             phase = evt.get("phase")
             if phase == "conversation_start":
                 current_box.info(
-                    f"Conversation {evt.get('conversation_index')}/{evt.get('total_conversations')} — "
-                    f"ID `{evt.get('conversation_id')}` — "
+                    f"Journey {evt.get('conversation_index')}/{evt.get('total_conversations')} — "
+                    f"Customer `{evt.get('conversation_id')}` — "
                     f"{evt.get('agent_messages', 0)} target messages"
                 )
             elif phase == "message_done":
@@ -1405,7 +1512,7 @@ def tab_run() -> None:
                 frac = 0.0
             bar.progress(
                 frac,
-                text=f"Conversations {progress_state['convs_done']}/{total_conv} • Calls {progress_state['calls_done']}/{total_msg}",
+                text=f"Journeys {progress_state['convs_done']}/{total_conv} • Calls {progress_state['calls_done']}/{total_msg}",
             )
             counter_box.markdown(
                 f"**Successes:** {progress_state['successes']}  |  **Failures:** {progress_state['failures']}"
@@ -1450,7 +1557,7 @@ def tab_run() -> None:
             )
             st.session_state.run_results = results
             progress_box.success(
-                f"Evaluation finished. {len(results.conversation_results)} conversations processed, "
+                f"Evaluation finished. {len(results.conversation_results)} customer journeys processed, "
                 f"{len(results.message_level_results)} message-level calls, "
                 f"{len(results.errors)} errors. Saved as run #{run_id}."
             )
@@ -1478,7 +1585,7 @@ def tab_run() -> None:
         st.markdown("### Last run")
         metric_row(
             [
-                ("Conversations", f"{len(rr.conversation_results):,}", None),
+                ("Customer journeys", f"{len(rr.conversation_results):,}", None),
                 ("Message calls", f"{len(rr.message_level_results):,}", None),
                 ("Errors", f"{len(rr.errors):,}", None),
                 ("Duration (s)", f"{(rr.finished_at or 0) - (rr.started_at or 0):.1f}", None),
@@ -1491,6 +1598,544 @@ def tab_run() -> None:
 
 
 # --------- Tab: Dashboard ---------
+
+# Color palette used across the dashboard (tuned for the dark theme).
+_DASH_COLORS = {
+    "panel_bg": "#11172a",
+    "panel_top": "#0c1224",
+    "panel_border": "#1f2a44",
+    "text": "#f1f5f9",
+    "muted": "#94a3b8",
+    "dim": "#64748b",
+    "track": "#1f2937",
+    "handled": "#10b981",
+    "unhandled": "#ef4444",
+    "many": "#f97316",
+    "minimal": "#22c55e",
+    "frustrated": "#f59e0b",
+    "calm": "#38bdf8",
+    "our_side": "#fb923c",
+    "customer": "#60a5fa",
+    "shared": "#c084fc",
+    "none": "#64748b",
+    "unclear": "#475569",
+    "review_yes": "#a78bfa",
+    "review_no": "#334155",
+    "heat_low": "#1e293b",
+    "heat_mid": "#7c2d12",
+    "heat_high": "#ef4444",
+}
+
+
+def _pct(part: float, whole: float) -> float:
+    return float(part) / float(whole) * 100.0 if whole else 0.0
+
+
+def _safe_col(df: pd.DataFrame, col: str, default: Any = "") -> pd.Series:
+    if col in df.columns:
+        return df[col]
+    return pd.Series([default] * len(df), index=df.index)
+
+
+def _kpi_card_html(label: str, value: str, sub: str, segments: list[tuple[str, int, str]]) -> str:
+    """Render a KPI card with a mini stacked bar and color-coded legend."""
+    total = sum(max(int(c), 0) for _, c, _ in segments) or 1
+    bar = ""
+    legend = ""
+    for name, count, color in segments:
+        if count <= 0:
+            continue
+        share = max(int(count), 0) / total * 100
+        bar += (
+            f'<div style="flex:{share:.4f}; min-width:0; background:{color};"'
+            f' title="{html_lib.escape(name)}: {count}"></div>'
+        )
+        legend += (
+            f'<span style="display:inline-flex;align-items:center;gap:5px;margin-right:11px;line-height:1.4;">'
+            f'<span style="display:inline-block;width:9px;height:9px;border-radius:2px;background:{color};"></span>'
+            f'<span style="color:{_DASH_COLORS["muted"]};">{html_lib.escape(name)}</span>'
+            f'<b style="color:{_DASH_COLORS["text"]};">{count:,}</b></span>'
+        )
+    return (
+        f'<div style="border:1px solid {_DASH_COLORS["panel_border"]};'
+        f'border-radius:14px;padding:14px 16px 12px;'
+        f'background:linear-gradient(180deg,{_DASH_COLORS["panel_bg"]} 0%,{_DASH_COLORS["panel_top"]} 100%);">'
+        f'<div style="font-size:0.7rem;letter-spacing:0.10em;text-transform:uppercase;'
+        f'color:{_DASH_COLORS["muted"]};margin-bottom:6px;">{html_lib.escape(label)}</div>'
+        f'<div style="font-size:1.7rem;font-weight:800;line-height:1.1;color:{_DASH_COLORS["text"]};">{html_lib.escape(value)}</div>'
+        f'<div style="font-size:0.76rem;color:{_DASH_COLORS["muted"]};margin-top:3px;margin-bottom:11px;">{sub}</div>'
+        f'<div style="display:flex;height:8px;border-radius:6px;overflow:hidden;background:{_DASH_COLORS["track"]};">{bar}</div>'
+        f'<div style="font-size:0.7rem;margin-top:8px;">{legend}</div>'
+        f'</div>'
+    )
+
+
+def _node_html(label: str, count: int, parent: int, total: int, depth: int, color: str) -> str:
+    """Render one node in a cascading tree, showing share of parent and of total."""
+    of_parent = _pct(count, parent)
+    of_total = _pct(count, total)
+    indent = depth * 16
+    return (
+        f'<div style="padding:5px 0 5px {indent + 12}px;border-left:2px solid {color};margin-left:{indent}px;">'
+        f'<div style="display:flex;justify-content:space-between;gap:10px;align-items:baseline;">'
+        f'<div style="color:{_DASH_COLORS["text"]};font-size:0.86rem;"><b>{html_lib.escape(label)}</b>'
+        f' <span style="color:{_DASH_COLORS["muted"]};font-weight:400;">· {count:,}</span></div>'
+        f'<div style="color:{_DASH_COLORS["muted"]};font-size:0.74rem;white-space:nowrap;">'
+        f'{of_parent:.1f}% of parent · <span style="color:{color};">{of_total:.1f}% of total</span></div>'
+        f'</div>'
+        f'<div style="margin-top:4px;height:5px;border-radius:3px;background:{_DASH_COLORS["track"]};overflow:hidden;">'
+        f'<div style="width:{of_parent:.2f}%;height:100%;background:{color};"></div>'
+        f'</div></div>'
+    )
+
+
+def _section_header(title: str, caption: str | None = None) -> None:
+    st.markdown(
+        f'<div style="margin-top:8px;margin-bottom:4px;">'
+        f'<div style="font-size:1.15rem;font-weight:700;color:{_DASH_COLORS["text"]};">{html_lib.escape(title)}</div>'
+        + (
+            f'<div style="font-size:0.82rem;color:{_DASH_COLORS["muted"]};margin-top:2px;">{html_lib.escape(caption)}</div>'
+            if caption else ""
+        )
+        + '</div>',
+        unsafe_allow_html=True,
+    )
+
+
+def _render_kpi_strip(filtered: pd.DataFrame, msg_df: pd.DataFrame, agg: dict, total: int) -> None:
+    handled = int((_safe_col(filtered, "handled_status") == "handled").sum())
+    unhandled = int((_safe_col(filtered, "handled_status") == "unhandled").sum())
+    many = int((_safe_col(filtered, "cx_issue_severity") == "many").sum())
+    minimal = int((_safe_col(filtered, "cx_issue_severity") == "zero_minimal").sum())
+
+    if "frustration_detected" in filtered.columns:
+        frustrated = int(filtered["frustration_detected"].fillna(False).astype(bool).sum())
+    else:
+        frustrated = 0
+    calm = total - frustrated
+
+    if "main_issue_origin" in filtered.columns:
+        oc = filtered["main_issue_origin"].fillna("none").astype(str).value_counts().to_dict()
+    else:
+        oc = {}
+    our_side = int(oc.get("our_side", 0))
+    customer = int(oc.get("customer", 0))
+    shared = int(oc.get("shared", 0))
+    no_issue = int(oc.get("none", 0))
+    unclear = max(total - our_side - customer - shared - no_issue, 0)
+
+    review_flag = int(agg.get("manual_review_count", 0))
+    high_frust = int(agg.get("high_frustration_count", 0))
+    msg_count = int(len(msg_df)) if msg_df is not None else 0
+
+    cards = [
+        _kpi_card_html(
+            "Total journeys",
+            f"{total:,}",
+            f"{msg_count:,} agent messages · {review_flag:,} flagged for review · {high_frust:,} high-frustration",
+            [
+                ("Flagged", review_flag, _DASH_COLORS["review_yes"]),
+                ("Not flagged", max(total - review_flag, 0), _DASH_COLORS["review_no"]),
+            ],
+        ),
+        _kpi_card_html(
+            "Outcome",
+            f"{_pct(handled, total):.1f}% handled",
+            f"Handled {handled:,} · Not handled {unhandled:,}",
+            [
+                ("Handled", handled, _DASH_COLORS["handled"]),
+                ("Not handled", unhandled, _DASH_COLORS["unhandled"]),
+            ],
+        ),
+        _kpi_card_html(
+            "Issue severity",
+            f"{_pct(many, total):.1f}% many",
+            f"Many {many:,} · Minimal {minimal:,}",
+            [
+                ("Many", many, _DASH_COLORS["many"]),
+                ("Minimal", minimal, _DASH_COLORS["minimal"]),
+            ],
+        ),
+        _kpi_card_html(
+            "Frustration",
+            f"{_pct(frustrated, total):.1f}% frustrated",
+            f"Frustrated {frustrated:,} · Calm {calm:,}",
+            [
+                ("Frustrated", frustrated, _DASH_COLORS["frustrated"]),
+                ("Calm", calm, _DASH_COLORS["calm"]),
+            ],
+        ),
+        _kpi_card_html(
+            "Issue origin",
+            f"{_pct(our_side, total):.1f}% our side",
+            f"Our {our_side:,} · Customer {customer:,} · Shared {shared:,} · None {no_issue:,}",
+            [
+                ("Our side", our_side, _DASH_COLORS["our_side"]),
+                ("Customer", customer, _DASH_COLORS["customer"]),
+                ("Shared", shared, _DASH_COLORS["shared"]),
+                ("None", no_issue, _DASH_COLORS["none"]),
+                ("Unclear", unclear, _DASH_COLORS["unclear"]),
+            ],
+        ),
+    ]
+    cols = st.columns(5, gap="small")
+    for col, card in zip(cols, cards):
+        with col:
+            st.markdown(card, unsafe_allow_html=True)
+
+
+def _render_outcome_sunburst(filtered: pd.DataFrame) -> None:
+    if filtered.empty or not HAS_PLOTLY or "handled_status" not in filtered.columns:
+        st.caption("Sunburst unavailable.")
+        return
+    work = filtered.copy()
+    work["Outcome"] = work["handled_status"].fillna("unknown").map(
+        {"handled": "Handled", "unhandled": "Not handled"}
+    ).fillna("Unknown")
+    work["Severity"] = _safe_col(work, "cx_issue_severity", "unknown").fillna("unknown").map(
+        {"many": "Many", "zero_minimal": "Minimal"}
+    ).fillna("Unknown")
+    if "frustration_detected" in work.columns:
+        work["Frustration"] = work["frustration_detected"].fillna(False).astype(bool).map(
+            {True: "Frustrated", False: "Calm"}
+        )
+    else:
+        work["Frustration"] = "Unknown"
+
+    grp = work.groupby(["Outcome", "Severity", "Frustration"]).size().reset_index(name="Count")
+    grp = grp[grp["Count"] > 0]
+    if grp.empty:
+        st.caption("No data.")
+        return
+    fig = px.sunburst(
+        grp,
+        path=["Outcome", "Severity", "Frustration"],
+        values="Count",
+        color="Outcome",
+        color_discrete_map={
+            "Handled": _DASH_COLORS["handled"],
+            "Not handled": _DASH_COLORS["unhandled"],
+            "Unknown": _DASH_COLORS["none"],
+        },
+        branchvalues="total",
+    )
+    fig.update_traces(textinfo="label+percent parent", insidetextorientation="radial")
+    _plotly_layout(fig, height=440, margin=dict(t=8, b=8, l=8, r=8))
+    _render_plotly(fig)
+
+
+def _render_outcome_cascade(filtered: pd.DataFrame, total: int) -> None:
+    if filtered.empty or total == 0:
+        st.caption("No data.")
+        return
+    chunks: list[str] = [
+        f'<div style="font-size:0.84rem;color:{_DASH_COLORS["muted"]};margin-bottom:8px;">'
+        f'All journeys · <b style="color:{_DASH_COLORS["text"]};">{total:,}</b></div>'
+    ]
+    for outcome_val, outcome_label, outcome_color in (
+        ("handled", "Handled", _DASH_COLORS["handled"]),
+        ("unhandled", "Not handled", _DASH_COLORS["unhandled"]),
+    ):
+        outcome_df = filtered[_safe_col(filtered, "handled_status") == outcome_val]
+        outcome_count = int(len(outcome_df))
+        if outcome_count == 0:
+            continue
+        chunks.append(_node_html(outcome_label, outcome_count, total, total, 0, outcome_color))
+        for sev_val, sev_label, sev_color in (
+            ("many", "Many issues", _DASH_COLORS["many"]),
+            ("zero_minimal", "Minimal / zero issues", _DASH_COLORS["minimal"]),
+        ):
+            sev_df = outcome_df[_safe_col(outcome_df, "cx_issue_severity") == sev_val]
+            sev_count = int(len(sev_df))
+            if sev_count == 0:
+                continue
+            chunks.append(_node_html(sev_label, sev_count, outcome_count, total, 1, sev_color))
+            if "frustration_detected" in sev_df.columns:
+                fr_yes = int(sev_df["frustration_detected"].fillna(False).astype(bool).sum())
+            else:
+                fr_yes = 0
+            fr_no = sev_count - fr_yes
+            if fr_yes:
+                chunks.append(_node_html("Frustrated", fr_yes, sev_count, total, 2, _DASH_COLORS["frustrated"]))
+            if fr_no:
+                chunks.append(_node_html("Calm", fr_no, sev_count, total, 2, _DASH_COLORS["calm"]))
+    st.markdown("".join(chunks), unsafe_allow_html=True)
+
+
+def _render_issue_sunburst(filtered: pd.DataFrame) -> None:
+    if not HAS_PLOTLY or filtered.empty or "main_issue_origin" not in filtered.columns:
+        st.caption("Origin sunburst unavailable.")
+        return
+    work = filtered.copy()
+    work["Origin"] = work["main_issue_origin"].fillna("none").astype(str).apply(humanize_label)
+    work["Issue type"] = _safe_col(work, "main_issue_type", "none").fillna("none").astype(str).apply(humanize_label)
+    work["Severity"] = _safe_col(work, "cx_issue_severity", "unknown").fillna("unknown").map(
+        {"many": "Many", "zero_minimal": "Minimal"}
+    ).fillna("Unknown")
+    grp = work.groupby(["Origin", "Issue type", "Severity"]).size().reset_index(name="Count")
+    grp = grp[grp["Count"] > 0]
+    if grp.empty:
+        st.caption("No data.")
+        return
+    fig = px.sunburst(
+        grp,
+        path=["Origin", "Issue type", "Severity"],
+        values="Count",
+        color="Origin",
+        color_discrete_map={
+            "Our Side": _DASH_COLORS["our_side"],
+            "Customer": _DASH_COLORS["customer"],
+            "Shared": _DASH_COLORS["shared"],
+            "None": _DASH_COLORS["none"],
+            "Unclear": _DASH_COLORS["unclear"],
+        },
+        branchvalues="total",
+    )
+    fig.update_traces(textinfo="label+percent parent", insidetextorientation="radial")
+    _plotly_layout(fig, height=440, margin=dict(t=8, b=8, l=8, r=8))
+    _render_plotly(fig)
+
+
+def _render_issue_cascade(filtered: pd.DataFrame, total: int) -> None:
+    if filtered.empty or "main_issue_origin" not in filtered.columns:
+        st.caption("No data.")
+        return
+    chunks: list[str] = [
+        f'<div style="font-size:0.84rem;color:{_DASH_COLORS["muted"]};margin-bottom:8px;">'
+        f'Issues across <b style="color:{_DASH_COLORS["text"]};">{total:,}</b> journeys</div>'
+    ]
+    origin_palette = {
+        "our_side": _DASH_COLORS["our_side"],
+        "customer": _DASH_COLORS["customer"],
+        "shared": _DASH_COLORS["shared"],
+        "none": _DASH_COLORS["none"],
+        "unclear": _DASH_COLORS["unclear"],
+    }
+    origins = (
+        filtered["main_issue_origin"].fillna("none").astype(str).value_counts()
+    )
+    for origin_val, origin_count in origins.items():
+        color = origin_palette.get(origin_val, _DASH_COLORS["dim"])
+        chunks.append(
+            _node_html(humanize_label(origin_val), int(origin_count), total, total, 0, color)
+        )
+        sub_df = filtered[filtered["main_issue_origin"].fillna("none") == origin_val]
+        type_counts = (
+            _safe_col(sub_df, "main_issue_type", "none").fillna("none").astype(str).value_counts()
+        )
+        for type_val, type_count in type_counts.head(6).items():
+            chunks.append(
+                _node_html(
+                    humanize_label(type_val),
+                    int(type_count),
+                    int(origin_count),
+                    total,
+                    1,
+                    color,
+                )
+            )
+    st.markdown("".join(chunks), unsafe_allow_html=True)
+
+
+def _render_frustration_funnel(filtered: pd.DataFrame, total: int) -> None:
+    if not HAS_PLOTLY or filtered.empty:
+        st.caption("Funnel unavailable.")
+        return
+    frust_detected = (
+        int(filtered["frustration_detected"].fillna(False).astype(bool).sum())
+        if "frustration_detected" in filtered.columns else 0
+    )
+    if "frustration_timing" in filtered.columns:
+        multi_or_during = int(
+            filtered["frustration_timing"].fillna("").isin(["during", "multiple"]).sum()
+        )
+    else:
+        multi_or_during = 0
+    if "max_frustration_level" in filtered.columns:
+        high_or_cancel = int(
+            filtered["max_frustration_level"].fillna("").isin(["high", "cancellation_risk"]).sum()
+        )
+        cancel = int((filtered["max_frustration_level"].fillna("") == "cancellation_risk").sum())
+    else:
+        high_or_cancel = cancel = 0
+    steps = [
+        ("All journeys", total, _DASH_COLORS["calm"]),
+        ("Frustration detected", frust_detected, _DASH_COLORS["frustrated"]),
+        ("During or multi-timing", multi_or_during, "#fb7185"),
+        ("High / cancellation level", high_or_cancel, _DASH_COLORS["unhandled"]),
+        ("Cancellation risk", cancel, "#b91c1c"),
+    ]
+    fig = go.Figure(
+        go.Funnel(
+            y=[s[0] for s in steps],
+            x=[s[1] for s in steps],
+            textposition="inside",
+            textinfo="value+percent initial",
+            marker={"color": [s[2] for s in steps]},
+            connector={"line": {"color": _DASH_COLORS["panel_border"], "width": 1}},
+        )
+    )
+    _plotly_layout(fig, height=380, margin=dict(t=10, b=10, l=10, r=10))
+    _render_plotly(fig)
+
+
+def _render_frustration_cascade(filtered: pd.DataFrame, total: int) -> None:
+    if filtered.empty or "frustration_detected" not in filtered.columns:
+        st.caption("No data.")
+        return
+    chunks: list[str] = []
+    frust_yes_df = filtered[filtered["frustration_detected"].fillna(False).astype(bool)]
+    frust_yes = int(len(frust_yes_df))
+    frust_no = total - frust_yes
+    chunks.append(
+        _node_html("Frustration detected", frust_yes, total, total, 0, _DASH_COLORS["frustrated"])
+    )
+    if "frustration_timing" in frust_yes_df.columns:
+        for timing in ["start", "during", "multiple"]:
+            t_df = frust_yes_df[frust_yes_df["frustration_timing"].fillna("") == timing]
+            t_count = int(len(t_df))
+            if t_count == 0:
+                continue
+            chunks.append(
+                _node_html(
+                    humanize_label(timing), t_count, frust_yes, total, 1, _DASH_COLORS["frustrated"]
+                )
+            )
+            if "max_frustration_level" in t_df.columns:
+                level_counts = t_df["max_frustration_level"].fillna("none").astype(str).value_counts()
+                level_palette = {
+                    "low": "#fde68a",
+                    "medium": "#fb923c",
+                    "high": _DASH_COLORS["unhandled"],
+                    "cancellation_risk": "#b91c1c",
+                    "none": _DASH_COLORS["dim"],
+                }
+                for lvl, lvl_count in level_counts.items():
+                    chunks.append(
+                        _node_html(
+                            humanize_label(lvl),
+                            int(lvl_count),
+                            t_count,
+                            total,
+                            2,
+                            level_palette.get(lvl, _DASH_COLORS["dim"]),
+                        )
+                    )
+    chunks.append(
+        _node_html("No visible frustration", frust_no, total, total, 0, _DASH_COLORS["calm"])
+    )
+    st.markdown("".join(chunks), unsafe_allow_html=True)
+
+
+def _render_timing_level_heatmap(filtered: pd.DataFrame) -> None:
+    if not HAS_PLOTLY or filtered.empty:
+        return
+    if "frustration_timing" not in filtered.columns or "max_frustration_level" not in filtered.columns:
+        return
+    timing_order = ["none", "start", "during", "multiple"]
+    level_order = ["none", "low", "medium", "high", "cancellation_risk"]
+    work = filtered[["frustration_timing", "max_frustration_level"]].copy()
+    work["frustration_timing"] = work["frustration_timing"].fillna("none").astype(str)
+    work["max_frustration_level"] = work["max_frustration_level"].fillna("none").astype(str)
+    mat = pd.crosstab(work["frustration_timing"], work["max_frustration_level"])
+    rows = [r for r in timing_order if r in mat.index]
+    cols = [c for c in level_order if c in mat.columns]
+    if not rows or not cols:
+        return
+    mat = mat.reindex(index=rows, columns=cols, fill_value=0)
+    fig = px.imshow(
+        mat.values,
+        x=[humanize_label(c) for c in mat.columns],
+        y=[humanize_label(r) for r in mat.index],
+        labels=dict(x="Max frustration level", y="Frustration timing", color="Journeys"),
+        text_auto=True,
+        color_continuous_scale=[_DASH_COLORS["heat_low"], _DASH_COLORS["heat_mid"], _DASH_COLORS["heat_high"]],
+        aspect="auto",
+    )
+    _plotly_layout(fig, height=320, margin=dict(t=10, b=10, l=10, r=10))
+    _render_plotly(fig)
+
+
+def _render_overall_sankey(filtered: pd.DataFrame) -> None:
+    if not HAS_PLOTLY or filtered.empty:
+        st.caption("Sankey unavailable.")
+        return
+    work = filtered.copy()
+    work["L1 Outcome"] = _safe_col(work, "handled_status", "unknown").fillna("unknown").map(
+        {"handled": "Handled", "unhandled": "Not handled"}
+    ).fillna("Unknown")
+    work["L2 Severity"] = _safe_col(work, "cx_issue_severity", "unknown").fillna("unknown").map(
+        {"many": "Many issues", "zero_minimal": "Minimal / zero"}
+    ).fillna("Unknown")
+    work["L3 Origin"] = _safe_col(work, "main_issue_origin", "none").fillna("none").astype(str).apply(humanize_label)
+    work["L4 Frustration"] = _safe_col(work, "frustration_timing", "none").fillna("none").astype(str).apply(humanize_label)
+
+    levels = ["L1 Outcome", "L2 Severity", "L3 Origin", "L4 Frustration"]
+    label_to_id: dict[tuple[int, str], int] = {}
+    labels: list[str] = []
+    node_colors: list[str] = []
+
+    color_map = {
+        "Handled": _DASH_COLORS["handled"],
+        "Not handled": _DASH_COLORS["unhandled"],
+        "Many issues": _DASH_COLORS["many"],
+        "Minimal / zero": _DASH_COLORS["minimal"],
+        "Our Side": _DASH_COLORS["our_side"],
+        "Customer": _DASH_COLORS["customer"],
+        "Shared": _DASH_COLORS["shared"],
+        "None": _DASH_COLORS["none"],
+        "Unclear": _DASH_COLORS["unclear"],
+        "Start": "#fde68a",
+        "During": "#fb923c",
+        "Multiple": _DASH_COLORS["unhandled"],
+    }
+    for i, lev in enumerate(levels):
+        for val in work[lev].dropna().unique().tolist():
+            key = (i, val)
+            if key not in label_to_id:
+                label_to_id[key] = len(labels)
+                labels.append(str(val))
+                node_colors.append(color_map.get(str(val), _DASH_COLORS["dim"]))
+
+    src: list[int] = []
+    tgt: list[int] = []
+    val: list[int] = []
+    link_colors: list[str] = []
+    for ai, a in enumerate(levels[:-1]):
+        b = levels[ai + 1]
+        pair_counts = work.groupby([a, b]).size()
+        for (av, bv), count in pair_counts.items():
+            src_id = label_to_id[(ai, av)]
+            tgt_id = label_to_id[(ai + 1, bv)]
+            src.append(src_id)
+            tgt.append(tgt_id)
+            val.append(int(count))
+            base = node_colors[src_id]
+            link_colors.append(_hex_to_rgba(base, 0.28))
+
+    fig = go.Figure(
+        go.Sankey(
+            arrangement="snap",
+            node=dict(
+                label=labels,
+                pad=18,
+                thickness=16,
+                color=node_colors,
+                line=dict(color=_DASH_COLORS["panel_border"], width=0.5),
+            ),
+            link=dict(source=src, target=tgt, value=val, color=link_colors),
+        )
+    )
+    _plotly_layout(fig, height=460, margin=dict(t=10, b=10, l=10, r=10))
+    _render_plotly(fig)
+
+
+def _hex_to_rgba(hex_color: str, alpha: float) -> str:
+    h = hex_color.lstrip("#")
+    if len(h) != 6:
+        return f"rgba(148,163,184,{alpha})"
+    r, g, b = int(h[0:2], 16), int(h[2:4], 16), int(h[4:6], 16)
+    return f"rgba({r},{g},{b},{alpha})"
 
 
 # --------- Overview tab: classification family tree ---------
@@ -1825,178 +2470,64 @@ def tab_dashboard() -> None:
     filters = _conversation_filters_with_keys(conv_df, "dashboard_filters")
     filtered = _apply_conversation_filters_fresh(conv_df, filters)
     agg = dashboard_aggregates(filtered)
+    total = int(agg.get("total", 0))
 
-    metric_row(
-        [
-            ("Total Conversations", f"{agg['total']:,}", None),
-            ("Handled %", f"{agg['handled_pct']:.1f}%", None),
-            ("Unhandled %", f"{agg['unhandled_pct']:.1f}%", None),
-            ("Many Issues %", f"{agg['many_issues_pct']:.1f}%", None),
-        ]
-    )
-    metric_row(
-        [
-            ("High Frustration", f"{agg['high_frustration_count']:,}", None),
-            ("Cancellation Risk", f"{agg['cancellation_risk_count']:,}", None),
-            ("Manual Review", f"{agg['manual_review_count']:,}", None),
-            ("Errors", f"{len(st.session_state.run_results.errors):,}", None),
-        ]
-    )
+    if total == 0:
+        st.info("No journeys match the current filters.")
+        return
+
+    _render_kpi_strip(filtered, msg_df, agg, total)
 
     st.markdown("---")
-    classification_order = [
-        "Handled with Minimal Issues",
-        "Handled with Many Issues",
-        "Handled with Minimal Issues and Frustration",
-        "Handled with Many Issues and Frustration",
-        "Handled with Minimal Caused Issues and Frustration",
-        "Handled with Many Caused Issues and Frustration",
-        "Not Handled with Minimal Issues",
-        "Not Handled with Many Issues",
-        "Not Handled with Minimal Issues and Frustration",
-        "Not Handled with Many Issues and Frustration",
-        "Not Handled with Minimal Caused Issues and Frustration",
-        "Not Handled with Many Caused Issues and Frustration",
-    ]
-    total_filtered = int(len(filtered))
-    if "final_classification" in filtered.columns and total_filtered:
-        class_counts = filtered["final_classification"].fillna("Unknown").value_counts()
-    else:
-        class_counts = pd.Series(dtype=int)
-
-    classification_rows = []
-    seen_classes = set()
-    for classification in classification_order:
-        count = int(class_counts.get(classification, 0))
-        pct = (count / total_filtered * 100.0) if total_filtered else 0.0
-        classification_rows.append(
-            {
-                "Classification": classification,
-                "Count": count,
-                "Percentage": pct,
-                "Share": f"{pct:.1f}%",
-                "Outcome": "Handled" if classification.startswith("Handled") else "Unhandled",
-            }
-        )
-        seen_classes.add(classification)
-    for classification, count in class_counts.items():
-        if classification in seen_classes:
-            continue
-        pct = (int(count) / total_filtered * 100.0) if total_filtered else 0.0
-        classification_rows.append(
-            {
-                "Classification": classification,
-                "Count": int(count),
-                "Percentage": pct,
-                "Share": f"{pct:.1f}%",
-                "Outcome": "Other",
-            }
-        )
-    cls_df = pd.DataFrame(classification_rows)
-
-    st.markdown("#### Final classification percentages")
-    _render_display_table(
-        cls_df[["Classification", "Count", "Share"]],
+    _section_header(
+        "Outcome tree",
+        "Distribution at each level: Outcome → Issue severity → Frustration. Each ring slice and each bar shows its share of its parent.",
     )
-    if HAS_PLOTLY and not cls_df.empty:
-        fig = px.bar(
-            cls_df,
-            x="Percentage",
-            y="Classification",
-            color="Outcome",
-            orientation="h",
-            text="Share",
-            hover_data=["Count"],
-        )
-        _plotly_layout(
-            fig,
-            height=430,
-            xaxis_title="Percent of filtered conversations",
-            yaxis_title="",
-            xaxis=dict(range=[0, 100]),
-            yaxis=dict(autorange="reversed"),
-        )
-        _render_plotly(fig)
-    elif not cls_df.empty:
-        _render_simple_bar_chart(
-            cls_df,
-            "Classification",
-            "Percentage",
-            height=360,
-            max_value=100,
-            value_suffix="%",
-        )
+    out_cols = st.columns([1.25, 1], gap="medium")
+    with out_cols[0]:
+        _render_outcome_sunburst(filtered)
+    with out_cols[1]:
+        _render_outcome_cascade(filtered, total)
 
     st.markdown("---")
-    c_breakdown_1, c_breakdown_2 = st.columns(2)
-    with c_breakdown_1:
-        st.markdown("#### Issue origin distribution")
-        if agg["issue_origin_counts"]:
-            io_df = pd.DataFrame(
-                [{"Origin": humanize_label(k), "Count": v} for k, v in agg["issue_origin_counts"].items() if k.lower() != "none"]
-            ).sort_values("Count", ascending=True)
-            io_df = io_df[io_df["Count"] > 0]
-            if io_df.empty:
-                st.write("No issue origins identified.")
-            elif HAS_PLOTLY:
-                total_origins = max(int(io_df["Count"].sum()), 1)
-                io_df["Share"] = io_df["Count"].apply(lambda c: f"{(c / total_origins * 100):.1f}%")
-                io_df["Label"] = io_df.apply(lambda r: f"{int(r['Count'])} ({r['Share']})", axis=1)
-                origin_colors = {
-                    "Our side": "#ef4444",
-                    "Shared": "#f59e0b",
-                    "Customer side": "#2563eb",
-                    "Third party": "#14b8a6",
-                    "Unclear": "#64748b",
-                }
-                fig = px.bar(
-                    io_df,
-                    x="Count",
-                    y="Origin",
-                    orientation="h",
-                    color="Origin",
-                    color_discrete_map=origin_colors,
-                    text="Label",
-                    hover_data={"Share": True, "Count": True, "Origin": False, "Label": False},
-                )
-                fig.update_traces(textposition="outside", cliponaxis=False)
-                fig.update_layout(showlegend=False)
-                _plotly_layout(
-                    fig,
-                    height=320,
-                    xaxis_title="Conversations",
-                    yaxis_title="",
-                    margin=dict(l=10, r=40, t=10, b=30),
-                )
-                _render_plotly(fig)
-            else:
-                _render_simple_bar_chart(io_df, "Origin", "Count", height=300)
-        else:
-            st.write("No data.")
-
-    with c_breakdown_2:
-        st.markdown("#### Unhandled subtype")
-        if agg["unhandled_subtype_counts"]:
-            subtype_df = pd.DataFrame(
-                [{"Subtype": humanize_label(k), "Count": v} for k, v in agg["unhandled_subtype_counts"].items() if k.lower() != "not applicable"]
-            )
-            subtype_df = subtype_df[subtype_df["Count"] > 0]
-            subtype_total = max(int(subtype_df["Count"].sum()), 1)
-            subtype_df["Share"] = subtype_df["Count"].apply(lambda c: f"{(c / subtype_total * 100):.1f}%")
-            if HAS_PLOTLY:
-                fig = px.pie(subtype_df, names="Subtype", values="Count", hole=0.55)
-                fig.update_traces(textposition="inside", textinfo="percent+label")
-                _plotly_layout(fig, height=340)
-                _render_plotly(fig)
-            else:
-                _render_simple_bar_chart(subtype_df, "Subtype", "Count", height=300)
-        else:
-            st.write("No data.")
+    _section_header(
+        "Issue tree",
+        "Where issues originate and what kind they are. Inner ring is the origin; outer rings are the most common issue types and severity inside each origin.",
+    )
+    issue_cols = st.columns([1.25, 1], gap="medium")
+    with issue_cols[0]:
+        _render_issue_sunburst(filtered)
+    with issue_cols[1]:
+        _render_issue_cascade(filtered, total)
 
     st.markdown("---")
-    c1, c2 = st.columns(2)
-    with c1:
-        st.markdown("#### Top issue types")
+    _section_header(
+        "Frustration tree",
+        "Funnel from all journeys down to cancellation risk. The breakdown beside it shows how frustration timing splits into max severity. The heatmap below crosses both.",
+    )
+    frust_cols = st.columns([1.25, 1], gap="medium")
+    with frust_cols[0]:
+        _render_frustration_funnel(filtered, total)
+    with frust_cols[1]:
+        _render_frustration_cascade(filtered, total)
+    _render_timing_level_heatmap(filtered)
+
+    st.markdown("---")
+    _section_header(
+        "End-to-end flow",
+        "Trace every journey across four decision points: Outcome → Severity → Issue origin → Frustration timing. Hover any band to read the count.",
+    )
+    _render_overall_sankey(filtered)
+
+    st.markdown("---")
+    _section_header("Top issue types and frustration causes")
+    cause_cols = st.columns(2, gap="medium")
+    with cause_cols[0]:
+        st.markdown(
+            f'<div style="font-size:0.92rem;color:{_DASH_COLORS["text"]};font-weight:700;margin-bottom:4px;">'
+            f'Main issue types (journey-level)</div>',
+            unsafe_allow_html=True,
+        )
         if agg["issue_type_counts"]:
             it_df = (
                 pd.DataFrame([{"Issue type": k, "Count": v} for k, v in agg["issue_type_counts"].items()])
@@ -2006,41 +2537,64 @@ def tab_dashboard() -> None:
                 .head(12)
             )
             if HAS_PLOTLY:
-                fig = px.scatter(
+                fig = px.bar(
                     it_df,
                     x="Count",
                     y="Issue type",
-                    size="Count",
-                    color="Count",
+                    orientation="h",
                     text="Count",
+                    color="Count",
+                    color_continuous_scale=["#1e293b", _DASH_COLORS["many"], _DASH_COLORS["unhandled"]],
                 )
-                fig.update_traces(textposition="middle right")
-                _plotly_layout(fig, height=400, yaxis=dict(autorange="reversed"))
+                fig.update_traces(textposition="outside")
+                _plotly_layout(
+                    fig,
+                    height=400,
+                    yaxis=dict(autorange="reversed"),
+                    coloraxis_showscale=False,
+                )
                 _render_plotly(fig)
             else:
                 _render_simple_bar_chart(it_df, "Issue type", "Count", height=360)
         else:
-            st.write("No data.")
-
-    with c2:
-        st.markdown("#### Top frustration causes")
+            st.caption("No issue types recorded.")
+    with cause_cols[1]:
+        st.markdown(
+            f'<div style="font-size:0.92rem;color:{_DASH_COLORS["text"]};font-weight:700;margin-bottom:4px;">'
+            f'Frustration causes (message-level)</div>',
+            unsafe_allow_html=True,
+        )
         causes = top_frustration_causes(msg_df, top_n=15)
         if not causes.empty:
             causes = causes.copy()
             causes["frustration_cause"] = causes["frustration_cause"].apply(humanize_label)
             if HAS_PLOTLY:
-                fig = px.bar(causes, x="count", y="frustration_cause", orientation="h", text="count")
-                _plotly_layout(fig, height=400, yaxis=dict(autorange="reversed"))
+                fig = px.bar(
+                    causes,
+                    x="count",
+                    y="frustration_cause",
+                    orientation="h",
+                    text="count",
+                    color="count",
+                    color_continuous_scale=["#1e293b", _DASH_COLORS["frustrated"], _DASH_COLORS["unhandled"]],
+                )
+                fig.update_traces(textposition="outside")
+                _plotly_layout(
+                    fig,
+                    height=400,
+                    yaxis=dict(autorange="reversed"),
+                    coloraxis_showscale=False,
+                )
                 _render_plotly(fig)
             else:
                 _render_simple_bar_chart(causes, "frustration_cause", "count", height=360)
         else:
-            st.write("No frustration causes identified.")
+            st.caption("No frustration causes identified.")
 
     st.markdown("---")
-    st.markdown("### Quantifiable conversation metrics")
-    st.caption(
-        "Scroll down to the detailed category sections below if you want to see the definition of any metric."
+    _section_header(
+        "Quantifiable metrics tree",
+        "Category → metric, sized by total volume. Expand any category to see its metrics and the journeys that contributed.",
     )
     metric_totals = agg.get("metric_totals", pd.DataFrame())
     if not metric_totals.empty:
@@ -2054,32 +2608,51 @@ def tab_dashboard() -> None:
             metric_view["Conversations > 0"], errors="coerce"
         ).fillna(0).astype(int)
 
-        f1, f2, f3, f4 = st.columns([1.3, 1.3, 1, 1])
-        with f1:
-            category_options = sorted(metric_view["Category"].dropna().unique().tolist())
-            selected_categories = st.multiselect(
-                "Metric categories",
-                category_options,
-                default=[],
-                help="Leave empty to include all categories.",
+        tree_view = metric_view[metric_view["Total"] > 0].copy()
+        if HAS_PLOTLY and not tree_view.empty:
+            fig = px.treemap(
+                tree_view,
+                path=["Category", "Metric"],
+                values="Total",
+                color="Category",
+                hover_data={"Total": True, "Conversations > 0": True, "Average when flagged": ":.2f"},
             )
-        with f2:
-            metric_search = st.text_input("Search metrics", value="")
-        with f3:
-            only_nonzero = st.toggle("Only nonzero", value=True)
-        with f4:
-            min_total = st.number_input("Minimum total", min_value=0.0, value=0.0, step=1.0)
+            fig.update_traces(
+                textinfo="label+value",
+                marker=dict(line=dict(width=0.6, color=_DASH_COLORS["panel_border"])),
+            )
+            _plotly_layout(fig, height=420, margin=dict(t=10, b=10, l=10, r=10))
+            _render_plotly(fig)
+        elif tree_view.empty:
+            st.caption("All quantifiable metrics are zero across the filtered journeys.")
 
-        sort_mode = st.selectbox(
-            "Sort metrics by",
-            [
-                "Total descending",
-                "Contributing conversations descending",
-                "Category then metric",
-                "Average when flagged descending",
-            ],
-            index=0,
-        )
+        with st.expander("Filter and sort metrics", expanded=False):
+            f1, f2, f3, f4 = st.columns([1.3, 1.3, 1, 1])
+            with f1:
+                category_options = sorted(metric_view["Category"].dropna().unique().tolist())
+                selected_categories = st.multiselect(
+                    "Metric categories",
+                    category_options,
+                    default=[],
+                    help="Leave empty to include all categories.",
+                )
+            with f2:
+                metric_search = st.text_input("Search metrics", value="")
+            with f3:
+                only_nonzero = st.toggle("Only nonzero", value=True)
+            with f4:
+                min_total = st.number_input("Minimum total", min_value=0.0, value=0.0, step=1.0)
+
+            sort_mode = st.selectbox(
+                "Sort metrics by",
+                [
+                    "Total descending",
+                    "Contributing journeys descending",
+                    "Category then metric",
+                    "Average when flagged descending",
+                ],
+                index=0,
+            )
 
         if selected_categories:
             metric_view = metric_view[metric_view["Category"].isin(selected_categories)]
@@ -2131,6 +2704,8 @@ def tab_dashboard() -> None:
             contributor_base_cols = [
                 "conversation_id",
                 "customer_name",
+                "customer_phone",
+                "source_conversation_ids",
                 "conversation_start_date",
                 "final_classification",
                 "handled_status",
@@ -2173,7 +2748,7 @@ def tab_dashboard() -> None:
                 else:
                     category_conversations = 0
                 with st.expander(
-                    f"{category} - {len(category_metrics)} metrics, {category_conversations} contributing conversations",
+                    f"{category} - {len(category_metrics)} metrics, {category_conversations} contributing journeys",
                     expanded=len(metric_view["Category"].unique()) == 1,
                 ):
                     category_table = category_metrics[
@@ -2218,7 +2793,7 @@ def tab_dashboard() -> None:
                             ],
                         )
                         st.caption(
-                            f"{len(contributor_table):,} conversations contributed to "
+                            f"{len(contributor_table):,} customer journeys contributed to "
                             f"{selected_metric}."
                         )
                         _render_display_table(contributor_table, height=360)
@@ -2227,7 +2802,11 @@ def tab_dashboard() -> None:
     else:
         st.caption("No quantifiable metrics returned by the conversation-level evaluator yet.")
 
-    st.markdown("#### Date / time summary")
+    st.markdown("---")
+    _section_header(
+        "Activity over time",
+        "Journeys per day across the filtered set.",
+    )
     if "conversation_start_date" in filtered.columns and not filtered.empty:
         try:
             parsed = pd.to_datetime(filtered["conversation_start_date"], errors="coerce")
@@ -2235,8 +2814,19 @@ def tab_dashboard() -> None:
             daily = ts.groupby("_d").size().reset_index(name="count")
             if not daily.empty:
                 if HAS_PLOTLY:
-                    fig = px.line(daily, x="_d", y="count", markers=True)
-                    _plotly_layout(fig, height=300, xaxis_title="Date", yaxis_title="Conversations")
+                    fig = px.area(
+                        daily,
+                        x="_d",
+                        y="count",
+                        labels={"_d": "Date", "count": "Customer journeys"},
+                    )
+                    fig.update_traces(
+                        line=dict(color=_DASH_COLORS["customer"], width=2),
+                        fillcolor=_hex_to_rgba(_DASH_COLORS["customer"], 0.18),
+                        mode="lines+markers",
+                        marker=dict(size=5, color=_DASH_COLORS["customer"]),
+                    )
+                    _plotly_layout(fig, height=300, margin=dict(t=10, b=10, l=10, r=10))
                     _render_plotly(fig)
                 else:
                     _render_simple_line_chart(daily, "_d", "count", height=300)
@@ -2247,104 +2837,16 @@ def tab_dashboard() -> None:
     else:
         st.caption("No start date column available.")
 
-    st.markdown("---")
-    st.markdown("### Conversation results")
-    display_cols = [
-        "conversation_id",
-        "customer_name",
-        "customer_phone",
-        "conversation_start_date",
-        "final_classification",
-        "handled_status",
-        "cx_issue_severity",
-        "frustration_detected",
-        "customer_started_frustrated",
-        "customer_became_frustrated_during_chat",
-        "customer_ended_frustrated",
-        "frustration_timing",
-        "unhandled_resolution_subtype",
-        "final_customer_sentiment",
-        "max_frustration_level",
-        "main_issue_type",
-        "main_issue_origin",
-        "main_issue_summary",
-        "customer_impact",
-        "all_detected_issues",
-        "positive_signals",
-        "negative_signals",
-        "management_summary",
-        "recommended_actions",
-        "manual_review_required",
-        "manual_review_reason",
-        "confidence",
-    ]
-    display_cols.extend(quantifiable_metric_columns(filtered))
-    existing_cols = [c for c in display_cols if c in filtered.columns]
-    conversation_table = _prepare_display_table(
-        filtered[existing_cols],
-        [
-            "handled_status",
-            "cx_issue_severity",
-            "frustration_detected",
-            "frustration_timing",
-            "unhandled_resolution_subtype",
-            "final_customer_sentiment",
-            "max_frustration_level",
-            "main_issue_type",
-            "main_issue_origin",
-            "confidence",
-        ],
+    st.caption(
+        "Per-journey and per-message tables live in the Journey Review and Exports tabs."
     )
-    _render_display_table(conversation_table, height=520)
-
-    st.markdown("### Message-level results")
-    message_display_cols = [
-        "conversation_id",
-        "target_message_id",
-        "message_index",
-        "message_time",
-        "target_message_text",
-        "message_level_effect",
-        "frustration_level_after_message",
-        "frustration_change",
-        "customer_effort_level",
-        "clarity_level",
-        "context_handling",
-        "issue_origin",
-        "issue_type",
-        "frustration_cause",
-        "evidence",
-        "business_impact",
-        "recommended_fix",
-        "parse_status",
-        "error_message",
-    ]
-    message_existing_cols = [c for c in message_display_cols if c in msg_df.columns]
-    if message_existing_cols:
-        message_table = _prepare_display_table(
-            msg_df[message_existing_cols],
-            [
-                "message_level_effect",
-                "frustration_level_after_message",
-                "frustration_change",
-                "customer_effort_level",
-                "clarity_level",
-                "context_handling",
-                "issue_origin",
-                "issue_type",
-                "parse_status",
-            ],
-        )
-        _render_display_table(message_table, height=520)
-    else:
-        st.caption("No message-level results available.")
 
 
-# --------- Tab: Conversation Review ---------
+# --------- Tab: Customer Journey Review ---------
 
 
 def tab_review() -> None:
-    st.subheader("Conversation Review")
+    st.subheader("Customer Journey Review")
     if not _has_results():
         st.info("Run an evaluation first.")
         return
@@ -2352,18 +2854,18 @@ def tab_review() -> None:
     rr = st.session_state.run_results
     conv_df = _conv_dataframe_from_results()
     if conv_df.empty:
-        st.info("No conversation results are available yet.")
+        st.info("No customer journey results are available yet.")
         return
 
     st.caption(
-        "Browse conversations by result, customer frustration, review priority, or the main customer problem."
+        "Browse customer journeys by result, customer frustration, review priority, or the main customer problem."
     )
 
     review_filters = _conversation_filters_with_keys(conv_df, "review_filters")
     filtered_df = _apply_conversation_filters_fresh(conv_df, review_filters)
 
     search = st.text_input(
-        "Search by ID, customer name, result, or problem summary",
+        "Search by ID, customer name, phone, source conversation ID, result, or problem summary",
         value="",
     ).strip()
     if search:
@@ -2371,6 +2873,8 @@ def tab_review() -> None:
         search_cols = [
             "conversation_id",
             "customer_name",
+            "customer_phone",
+            "source_conversation_ids",
             "final_classification",
             "main_issue_summary",
         ]
@@ -2381,12 +2885,12 @@ def tab_review() -> None:
         filtered_df = filtered_df[mask]
 
     if filtered_df.empty:
-        st.warning("No conversations match the current filters.")
+        st.warning("No customer journeys match the current filters.")
         return
 
     metric_row(
         [
-            ("Conversations shown", f"{len(filtered_df):,}", None),
+            ("Customer journeys shown", f"{len(filtered_df):,}", None),
             (
                 "Handled",
                 f"{int((filtered_df.get('handled_status') == 'handled').sum()):,}",
@@ -2410,30 +2914,34 @@ def tab_review() -> None:
     for row in filtered_df.to_dict(orient="records"):
         cid = row.get("conversation_id", "")
         cust = row.get("customer_name") or "—"
+        phone = row.get("customer_phone") or cid
+        source_count = row.get("source_conversation_count") or "—"
         result = row.get("final_classification") or "Unknown"
-        label = f"{cid} • {cust} • {result}"
+        label = f"{phone} • {cust} • {source_count} source convs • {result}"
         options.append(label)
         label_to_id[label] = cid
 
-    selection = st.selectbox("Open a conversation", options, index=0)
+    selection = st.selectbox("Open a customer journey", options, index=0)
     target_id = label_to_id[selection]
     target_cr = next((c for c in rr.conversation_results if c.get("conversation_id") == target_id), None)
     if not target_cr:
-        st.error("Conversation not found.")
+        st.error("Customer journey not found.")
         return
 
     _render_conversation_summary_card_fresh(target_cr)
 
-    st.markdown("### Full Conversation")
+    st.markdown("### Full Customer Journey")
     st.caption(
-        "The full conversation is shown below. Where available, assistant replies also include a short quality check underneath."
+        "The full appended customer journey is shown below. Where available, assistant replies also include a short quality check underneath."
     )
     transcript = target_cr.get("transcript") or []
     msgs = target_cr.get("message_level_results") or []
-    render_conversation_transcript_with_evals(
-        transcript=transcript,
-        message_results=msgs,
-    )
+    _, chat_col, _ = st.columns([0.15, 9.7, 0.15])
+    with chat_col:
+        render_conversation_transcript_with_evals(
+            transcript=transcript,
+            message_results=msgs,
+        )
 
 
 # --------- Tab: Exports ---------
@@ -2455,7 +2963,7 @@ def tab_exports() -> None:
         "timeout": st.session_state.timeout,
         "retries": st.session_state.retries,
         "max_conversations": st.session_state.max_conversations,
-        "max_target_messages_per_conversation": st.session_state.max_agent_messages_per_conv,
+        "max_target_messages_per_journey": st.session_state.max_agent_messages_per_conv,
         "truncate_messages": st.session_state.truncate_messages,
         "max_chars_per_message": st.session_state.max_chars_per_message,
         "include_unknown_in_history": st.session_state.include_unknown_in_history,
@@ -2477,12 +2985,12 @@ def tab_exports() -> None:
 
     c1, c2, c3 = st.columns(3)
     with c1:
-        st.markdown("#### Conversation-Level CSV")
-        st.caption("One row per conversation, ready for spreadsheets.")
+        st.markdown("#### Journey-Level CSV")
+        st.caption("One row per customer journey, ready for spreadsheets.")
         st.download_button(
-            "Download conversation_results.csv",
+            "Download journey_results.csv",
             data=conv_bytes,
-            file_name="cx_conversation_results.csv",
+            file_name="cx_journey_results.csv",
             mime="text/csv",
             use_container_width=True,
         )
@@ -2509,7 +3017,7 @@ def tab_exports() -> None:
 
     st.markdown("---")
     st.markdown("### Preview")
-    tab_a, tab_b = st.tabs(["Conversation-level preview", "Message-level preview"])
+    tab_a, tab_b = st.tabs(["Journey-level preview", "Message-level preview"])
     with tab_a:
         conv_df = _conv_dataframe_from_results()
         st.dataframe(conv_df.head(50), use_container_width=True)
@@ -2539,7 +3047,9 @@ def tab_debug() -> None:
     if failed_msgs:
         st.write(f"{len(failed_msgs)} failed message-level evaluations.")
         for m in failed_msgs[:50]:
-            label = f"`{m.get('conversation_id')}` #{m.get('message_index')} — {m.get('parse_status')}"
+            source = m.get("source_conversation_id")
+            source_part = f" source `{source}`" if source else ""
+            label = f"`{m.get('conversation_id')}` #{m.get('message_index')}{source_part} — {m.get('parse_status')}"
             with st.expander(label):
                 st.markdown("**Error message**")
                 st.code(m.get("error_message") or "—")
@@ -2550,10 +3060,10 @@ def tab_debug() -> None:
     else:
         st.caption("No failed message-level evaluations.")
 
-    st.markdown("### Failed conversation-level evaluations")
+    st.markdown("### Failed journey-level evaluations")
     failed_convs = [c for c in rr.conversation_results if c.get("parse_status") != "ok"]
     if failed_convs:
-        st.write(f"{len(failed_convs)} failed conversation-level evaluations.")
+        st.write(f"{len(failed_convs)} failed journey-level evaluations.")
         for c in failed_convs[:50]:
             with st.expander(f"`{c.get('conversation_id')}` — {c.get('parse_status')}"):
                 st.markdown("**Error message**")
@@ -2563,18 +3073,18 @@ def tab_debug() -> None:
                 st.markdown("**Debug info**")
                 st.json(c.get("debug") or {}, expanded=False)
     else:
-        st.caption("No failed conversation-level evaluations.")
+        st.caption("No failed journey-level evaluations.")
 
     st.markdown("### Inspect a specific record")
-    st.caption("Pick any conversation to view raw payloads, parsed JSON, and debug info.")
+    st.caption("Pick any customer journey to view raw payloads, parsed JSON, and debug info.")
     ids = [c.get("conversation_id", "") for c in rr.conversation_results]
     if ids:
         sel = st.selectbox("ID", ids)
         target = next((c for c in rr.conversation_results if c.get("conversation_id") == sel), None)
         if target:
-            with st.expander("Conversation-level parsed JSON"):
+            with st.expander("Journey-level parsed JSON"):
                 st.json(target.get("parsed_json") or {}, expanded=False)
-            with st.expander("Conversation-level raw model response"):
+            with st.expander("Journey-level raw model response"):
                 st.code(target.get("raw_model_response") or "—")
             with st.expander("Computed metadata"):
                 visible_cm = {
@@ -2611,7 +3121,7 @@ def tab_debug() -> None:
         "timeout": st.session_state.timeout,
         "retries": st.session_state.retries,
         "max_conversations": st.session_state.max_conversations,
-        "max_target_messages_per_conversation": st.session_state.max_agent_messages_per_conv,
+        "max_target_messages_per_journey": st.session_state.max_agent_messages_per_conv,
         "truncate_messages": st.session_state.truncate_messages,
         "max_chars_per_message": st.session_state.max_chars_per_message,
         "include_unknown_in_history": st.session_state.include_unknown_in_history,
@@ -2629,9 +3139,9 @@ def main() -> None:
     _apply_theme()
     render_sidebar()
 
-    st.title("CX Conversation Evaluator")
+    st.title("CX Customer Journey Evaluator")
     st.caption(
-        "AI-as-a-Judge evaluation of customer/assistant conversations. "
+        "AI-as-a-Judge evaluation of appended customer journeys across one or more source conversations. "
         "Built for management review — focused on outcomes, frustration, and root cause."
     )
 
@@ -2646,7 +3156,7 @@ def main() -> None:
             "Run Evaluation",
             "Overview",
             "Dashboard",
-            "Conversation Review",
+            "Journey Review",
             "Exports",
             "Debug",
         ]

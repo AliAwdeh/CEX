@@ -38,15 +38,85 @@ _EFFECT_COLORS = {
     "major_issue": "#dc2626",
 }
 
+_SEVERITY_STYLES = {
+    "green": {
+        "bg": "#0f3f2e",
+        "border": "#22c55e",
+        "text": "#ecfdf5",
+        "label": "Clean",
+    },
+    "yellow": {
+        "bg": "#4a3410",
+        "border": "#f59e0b",
+        "text": "#fffbeb",
+        "label": "Watch",
+    },
+    "red": {
+        "bg": "#4c1111",
+        "border": "#ef4444",
+        "text": "#fef2f2",
+        "label": "Issue",
+    },
+    "gray": {
+        "bg": "#1f2937",
+        "border": "#64748b",
+        "text": "#f8fafc",
+        "label": "Review",
+    },
+}
+
+
+def _message_severity(message_result: dict | None) -> str:
+    """Return green/yellow/red/gray for the side review control."""
+    if not message_result:
+        return "gray"
+    if message_result.get("parse_status") != "ok":
+        return "red"
+    pj = message_result.get("parsed_json") or {}
+    effect = pj.get("message_level_effect")
+    frustration = pj.get("frustration_level_after_message")
+    change = pj.get("frustration_change")
+    if effect == "major_issue" or frustration in {"high", "cancellation_risk"} or change == "created":
+        return "red"
+    if effect in {"minor_issue", "neutral"} and (
+        frustration in {"medium", "low"} or change == "increased"
+    ):
+        return "yellow"
+    return "green"
+
+
+def _severity_badge(severity: str, text: str | None = None) -> str:
+    style = _SEVERITY_STYLES.get(severity, _SEVERITY_STYLES["gray"])
+    label = text or style["label"]
+    return (
+        f"<div style=\"display:inline-flex;align-items:center;justify-content:center;"
+        f"min-width:92px;padding:6px 10px;border-radius:8px;background:{style['bg']};"
+        f"border:1px solid {style['border']};color:{style['text']};font-weight:800;"
+        f"font-size:0.78rem;letter-spacing:0;text-align:center;\">"
+        f"{html.escape(label)}</div>"
+    )
+
 
 def _badge(label: str, value: str, color: str) -> str:
     """Render a colored pill label/value badge."""
     safe_value = html.escape(str(value))
     safe_label = html.escape(str(label))
+    palette = {
+        "#16a34a": ("#0f3f2e", "#ecfdf5"),
+        "#65a30d": ("#365314", "#f7fee7"),
+        "#d97706": ("#4a3410", "#fffbeb"),
+        "#dc2626": ("#4c1111", "#fef2f2"),
+        "#b91c1c": ("#4c1111", "#fef2f2"),
+        "#7f1d1d": ("#4c1111", "#fef2f2"),
+        "#0891b2": ("#164e63", "#ecfeff"),
+        "#475569": ("#1f2937", "#f8fafc"),
+        "#6b7280": ("#1f2937", "#f8fafc"),
+    }
+    bg, fg = palette.get(color, ("#f8fafc", "#111827"))
     return (
         f"<span style=\"display:inline-block;padding:2px 8px;margin:2px 6px 2px 0;"
-        f"border-radius:9999px;background:{color}20;color:{color};"
-        f"border:1px solid {color}55;font-size:0.78rem;font-weight:600;\">"
+        f"border-radius:9999px;background:{bg};color:{fg};"
+        f"border:1px solid {color};font-size:0.78rem;font-weight:700;\">"
         f"{safe_label}: {safe_value}</span>"
     )
 
@@ -101,6 +171,9 @@ def render_transcript(messages: list[dict]) -> None:
         meta_bits = []
         if idx is not None:
             meta_bits.append(f"#{idx}")
+        source_id = m.get("source_conversation_id")
+        if source_id:
+            meta_bits.append(f"Source {html.escape(str(source_id))}")
         meta_bits.append(role.capitalize())
         if when:
             meta_bits.append(html.escape(str(when)))
@@ -116,11 +189,120 @@ def render_transcript(messages: list[dict]) -> None:
 def _highlight_box(color: str, text: str) -> str:
     """Compact colored callout used to flag major issues / cancellation risk."""
     return (
-        f"<div style=\"background:{color}15;border-left:4px solid {color};"
-        f"padding:6px 10px;border-radius:4px;color:#111;font-weight:600;"
+        f"<div style=\"background:#111827;border-left:4px solid {color};"
+        f"padding:6px 10px;border-radius:4px;color:#f8fafc;font-weight:700;"
         f"font-size:0.82rem;margin-top:4px;\">"
         f"{html.escape(text)}</div>"
     )
+
+
+def _bubble_html(msg: dict, display_role: str, *, align: str, accent: str | None = None) -> str:
+    """Return a high-contrast message bubble."""
+    role = (msg.get("sender_role") or "unknown").lower()
+    idx = msg.get("message_index")
+    when = str(msg.get("message_time") or "")
+    text = str(msg.get("message_text", "") or "")
+    palette = {
+        "customer": {
+            "bg": "#1e293b",
+            "border": "#64748b",
+            "text": "#f8fafc",
+            "meta": "#cbd5e1",
+        },
+        "agent": {
+            "bg": "#0f3a5f",
+            "border": "#38bdf8",
+            "text": "#f8fafc",
+            "meta": "#bae6fd",
+        },
+        "unknown": {
+            "bg": "#312e81",
+            "border": "#818cf8",
+            "text": "#f8fafc",
+            "meta": "#c7d2fe",
+        },
+    }.get(role, {
+        "bg": "#f1f5f9",
+        "border": "#cbd5e1",
+        "text": "#1f2937",
+        "meta": "#475569",
+    })
+    bits = [html.escape(display_role)]
+    if idx is not None:
+        bits.append(f"#{html.escape(str(idx))}")
+    if when:
+        bits.append(html.escape(when))
+    radius = "16px 16px 16px 4px" if align == "left" else "16px 16px 4px 16px"
+    accent_style = ""
+    if accent:
+        side = "border-left" if align == "left" else "border-right"
+        accent_style = f"{side}:4px solid {accent};"
+    return (
+        f"<div style=\"display:flex;justify-content:{'flex-start' if align == 'left' else 'flex-end'};"
+        f"margin:4px 0;\">"
+        f"<div style=\"max-width:980px;width:fit-content;padding:12px 15px;border-radius:{radius};"
+        f"background:{palette['bg']};border:1px solid {palette['border']};color:{palette['text']} !important;"
+        f"{accent_style}box-shadow:0 10px 22px rgba(0,0,0,0.22);\">"
+        f"<div style=\"font-size:0.78rem;font-weight:900;color:{palette['meta']};margin-bottom:6px;\">"
+        f"{' · '.join(bits)}</div>"
+        f"<div style=\"white-space:pre-wrap;word-break:break-word;line-height:1.5;font-size:0.98rem;color:{palette['text']} !important;\">"
+        f"{html.escape(text) if text else '<em>(empty message)</em>'}</div>"
+        f"</div></div>"
+    )
+
+
+def _source_divider(source_id: Any) -> str:
+    label = f"Source conversation {source_id}" if source_id else "Source conversation unknown"
+    return (
+        "<div style=\"display:flex;align-items:center;gap:12px;margin:18px 0 12px 0;\">"
+        "<div style=\"height:1px;background:#475569;flex:1;\"></div>"
+        "<div style=\"background:#111827;color:#e5e7eb;border:1px solid #475569;"
+        "border-radius:999px;padding:4px 12px;font-size:0.78rem;font-weight:800;\">"
+        f"{html.escape(str(label))}</div>"
+        "<div style=\"height:1px;background:#475569;flex:1;\"></div>"
+        "</div>"
+    )
+
+
+def _render_message_run_details(message_result: dict) -> None:
+    """Render the full hidden message run detail panel."""
+    pj = message_result.get("parsed_json") or {}
+    status = message_result.get("parse_status", "ok")
+    idx = message_result.get("message_index")
+    source_id = message_result.get("source_conversation_id")
+
+    metric_row(
+        [
+            ("Status", status, None),
+            ("Appended index", idx if idx is not None else "—", None),
+            ("Source conversation", source_id or "—", None),
+        ]
+    )
+
+    if status != "ok":
+        st.warning(message_result.get("error_message") or "Message evaluation failed.")
+
+    cols = st.columns(2)
+    with cols[0]:
+        st.markdown("**Effect**")
+        st.write(humanize_label(pj.get("message_level_effect")) or "—")
+        st.markdown("**Frustration after message**")
+        st.write(humanize_label(pj.get("frustration_level_after_message")) or "—")
+        st.markdown("**Issue type / origin**")
+        st.write(
+            f"{humanize_label(pj.get('issue_type')) or '—'} / "
+            f"{humanize_label(pj.get('issue_origin')) or '—'}"
+        )
+    with cols[1]:
+        st.markdown("**Evidence**")
+        st.write(pj.get("evidence") or "—")
+        st.markdown("**Business impact**")
+        st.write(pj.get("business_impact") or "—")
+        st.markdown("**Recommended fix**")
+        st.write(pj.get("recommended_fix") or "—")
+
+    with st.expander("Message run JSON", expanded=False):
+        st.json(message_result, expanded=False)
 
 
 def render_inline_evaluation(message_result: dict) -> None:
@@ -200,13 +382,12 @@ def render_conversation_transcript_with_evals(
     transcript: list[dict],
     message_results: list[dict] | None,
 ) -> None:
-    """Render a transcript using native chat bubbles, with the message-level
-    evaluation card attached directly under each assistant message.
+    """Render a centered transcript with hidden message-run details.
 
     Header label rules:
-    - Customer / unknown rows show the raw sender role from the CSV.
-    - Assistant rows are shown with a generic assistant label; names are not
-      shown in the frontend.
+    - RAW_SENDER_ROLE=System shows Broadcast.
+    - RAW_SENDER_ROLE=Bot shows Assistant.
+    - RAW_SENDER_ROLE=Agent shows MESSAGE_AGENT_FULL_NAME when available.
     """
     if not transcript:
         st.info("No messages to display.")
@@ -232,47 +413,83 @@ def render_conversation_transcript_with_evals(
         f"{n_major} major · {n_minor} minor · {n_recovered} recovered"
     )
 
+    st.markdown(
+        """
+        <style>
+          div[data-testid="stExpander"] summary {
+            font-weight: 800;
+          }
+          div[data-testid="stExpander"] {
+            border-color: #334155;
+          }
+        </style>
+        """,
+        unsafe_allow_html=True,
+    )
+
+    previous_source = object()
     for msg in transcript:
         role = (msg.get("sender_role") or "unknown").lower()
         raw_role = msg.get("raw_sender_role")
         raw_role_norm = str(raw_role).strip().lower() if raw_role else ""
         idx = msg.get("message_index")
-        when = msg.get("message_time") or ""
-        text = str(msg.get("message_text", "") or "")
+        source_id = msg.get("source_conversation_id")
+
+        if source_id != previous_source:
+            st.markdown(_source_divider(source_id), unsafe_allow_html=True)
+            previous_source = source_id
 
         if role == "customer":
-            chat_role, avatar = "user", "🧑"
-            display_role = str(raw_role) if raw_role else "customer"
-        elif role == "agent":
-            chat_role, avatar = "assistant", "🤖"
-            if raw_role_norm == "agent":
+            if raw_role_norm == "system":
+                display_role = "Broadcast"
+            elif raw_role_norm == "bot":
                 display_role = "Assistant"
+            elif raw_role_norm == "agent":
+                display_role = str(msg.get("agent_full_name") or "").strip() or "Agent"
             else:
+                display_role = str(raw_role) if raw_role else "Customer"
+            align = "left"
+        elif role == "agent":
+            if raw_role_norm == "system":
+                display_role = "Broadcast"
+            elif raw_role_norm == "bot":
                 display_role = "Assistant"
+            elif raw_role_norm == "agent":
+                display_role = str(msg.get("agent_full_name") or "").strip() or "Agent"
+            else:
+                display_role = str(msg.get("agent_full_name") or "").strip() or "Assistant"
+            align = "right"
         else:
-            chat_role, avatar = "ai", "❔"
-            display_role = str(raw_role) if raw_role else "unknown"
+            if raw_role_norm == "system":
+                display_role = "Broadcast"
+            elif raw_role_norm == "bot":
+                display_role = "Assistant"
+            elif raw_role_norm == "agent":
+                display_role = str(msg.get("agent_full_name") or "").strip() or "Agent"
+            else:
+                display_role = str(raw_role) if raw_role else "Unknown"
+            align = "left"
 
-        with st.chat_message(chat_role, avatar=avatar):
-            header_bits = [f"**{display_role}**"]
-            if idx is not None:
-                header_bits.append(f"#{idx}")
-            if when:
-                header_bits.append(str(when))
-            st.markdown(" · ".join(header_bits))
-            st.write(text if text else "_(empty message)_")
+        eval_record = eval_by_idx.get(idx)
+        severity = _message_severity(eval_record)
+        style = _SEVERITY_STYLES.get(severity, _SEVERITY_STYLES["gray"])
+        accent = style["border"] if eval_record else None
 
-            # Attach the message-level evaluation card to whichever message
-            # was actually evaluated (assistant in assistant mode, customer in
-            # customer mode). ``eval_by_idx`` only contains entries for
-            # target messages, so this works for both modes.
-            eval_record = eval_by_idx.get(idx)
+        bubble_col, review_col = st.columns([10.5, 0.5], vertical_alignment="center")
+
+        with bubble_col:
+            st.markdown(_bubble_html(msg, display_role, align=align, accent=accent), unsafe_allow_html=True)
+
+        with review_col:
             if eval_record:
+                with st.popover("i", use_container_width=True):
+                    st.markdown(_severity_badge(severity), unsafe_allow_html=True)
+                    _render_message_run_details(eval_record)
+            else:
                 st.markdown(
-                    "<div style=\"height:1px;background:#e5e7eb;margin:8px 0;\"></div>",
+                    "<div style=\"width:1px;height:1px;\"></div>",
                     unsafe_allow_html=True,
                 )
-                render_inline_evaluation(eval_record)
 
 
 def render_message_evaluation_panel(message_result: dict) -> None:
@@ -298,7 +515,9 @@ def render_message_evaluation_panel(message_result: dict) -> None:
     st.markdown("".join(badges), unsafe_allow_html=True)
 
     if idx is not None:
-        st.caption(f"Message index: {idx}")
+        source_id = message_result.get("source_conversation_id")
+        source_text = f" • Source conversation: {source_id}" if source_id else ""
+        st.caption(f"Appended message index: {idx}{source_text}")
 
     st.markdown("**Assistant message**")
     st.write(text or "_(empty)_")
@@ -325,7 +544,7 @@ def render_message_evaluation_panel(message_result: dict) -> None:
 
 
 def render_conversation_summary_card(conv_result: dict) -> None:
-    """Render a clean summary card for a conversation."""
+    """Render a clean summary card for a customer journey."""
     pj = conv_result.get("parsed_json") or {}
     md = conv_result.get("conversation_metadata") or {}
     cm = conv_result.get("computed_metadata") or {}
@@ -400,7 +619,7 @@ def render_conversation_summary_card(conv_result: dict) -> None:
     badges.append(_badge("Confidence", pj.get("confidence", "—"), "#475569"))
     st.markdown("".join(badges), unsafe_allow_html=True)
 
-    cols = st.columns([1, 1])
+    cols = st.columns([1, 1, 1])
     with cols[0]:
         st.markdown("**ID**")
         st.write(conv_result.get("conversation_id", ""))
@@ -409,12 +628,26 @@ def render_conversation_summary_card(conv_result: dict) -> None:
         st.markdown("**Phone**")
         st.write(md.get("customer_phone") or "—")
     with cols[1]:
+        st.markdown("**Customer journey ID**")
+        st.write(conv_result.get("conversation_id", ""))
+        st.markdown("**Source conversations**")
+        st.write(md.get("source_conversation_count") or "—")
+        st.markdown("**Source conversation IDs**")
+        st.write(md.get("source_conversation_ids") or "—")
+    with cols[2]:
         st.markdown("**Started**")
         st.write(md.get("conversation_start_date") or "—")
         st.markdown("**Ended**")
         st.write(md.get("conversation_end_date") or "—")
-        st.markdown("**Conversation status**")
-        st.write(md.get("conversation_status") or "—")
+
+    objective_cols = st.columns([1, 2])
+    with objective_cols[0]:
+        st.markdown("**Customer goal type**")
+        st.write(humanize_label(pj.get("customer_objective_type")) or "—")
+    with objective_cols[1]:
+        st.markdown("**Customer primary objective**")
+        st.write(pj.get("customer_primary_objective") or "—")
+
     st.markdown("---")
     st.markdown("### Main Customer Problem")
     if main.get("issue_exists"):
@@ -494,12 +727,32 @@ def render_conversation_summary_card(conv_result: dict) -> None:
         reason = pj.get("manual_review_reason") or "This conversation needs a closer human check."
         st.warning(f"Human review recommended: {reason}")
 
-    with st.expander("Technical details"):
+    with st.expander("Journey run details and JSON", expanded=False):
         visible_cm = {
             k: v for k, v in cm.items()
             if k not in {"agent_messages", "agent_messages_evaluated"}
         }
-        st.json(visible_cm, expanded=False)
+        detail_cols = st.columns(3)
+        with detail_cols[0]:
+            st.markdown("**Computed totals**")
+            st.json(visible_cm, expanded=False)
+        with detail_cols[1]:
+            st.markdown("**Journey metadata**")
+            st.json(md, expanded=False)
+        with detail_cols[2]:
+            st.markdown("**Run status**")
+            st.json(
+                {
+                    "parse_status": conv_result.get("parse_status"),
+                    "error_message": conv_result.get("error_message"),
+                    "evaluation_target_role": conv_result.get("evaluation_target_role"),
+                },
+                expanded=False,
+            )
+        st.markdown("**Conversation-level parsed JSON**")
+        st.json(pj, expanded=False)
+        with st.expander("Full journey result object", expanded=False):
+            st.json(conv_result, expanded=False)
 
 
 def conversation_filters(conv_df: pd.DataFrame, key_prefix: str = "conv_filters") -> dict:

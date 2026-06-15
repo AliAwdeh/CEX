@@ -100,6 +100,7 @@ CREATE TABLE IF NOT EXISTS message_results (
     conversation_id TEXT NOT NULL,
     target_message_id TEXT,
     message_index INTEGER,
+    source_conversation_id TEXT,
     message_time TEXT,
     target_message_text TEXT,
     parse_status TEXT NOT NULL,
@@ -165,6 +166,7 @@ class Database:
         self._conn.execute("PRAGMA journal_mode = WAL")
         with self._lock:
             self._conn.executescript(SCHEMA)
+        self._ensure_runtime_columns()
         self._seed_default_prompts()
 
     def close(self) -> None:
@@ -196,6 +198,16 @@ class Database:
 
     def _fetchone(self, sql: str, params: Iterable = ()) -> Optional[sqlite3.Row]:
         return self._exec(sql, params).fetchone()
+
+    def _ensure_runtime_columns(self) -> None:
+        """Apply small additive migrations for existing local SQLite files."""
+        with self._lock:
+            cols = {
+                row["name"]
+                for row in self._conn.execute("PRAGMA table_info(message_results)").fetchall()
+            }
+            if "source_conversation_id" not in cols:
+                self._conn.execute("ALTER TABLE message_results ADD COLUMN source_conversation_id TEXT")
 
     # -------- settings (free-form key/value) --------
 
@@ -452,14 +464,16 @@ class Database:
         now = _now_iso()
         cur = self._exec(
             "INSERT INTO message_results"
-            "(run_id, conversation_id, target_message_id, message_index, message_time, target_message_text,"
-            " parse_status, error_message, raw_response, parsed_json, debug_json, input_history_json, created_at)"
-            " VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "(run_id, conversation_id, target_message_id, message_index, source_conversation_id,"
+            " message_time, target_message_text, parse_status, error_message, raw_response,"
+            " parsed_json, debug_json, input_history_json, created_at)"
+            " VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (
                 int(run_id),
                 str(mr.get("thread_id") or mr.get("conversation_id", "")),
                 mr.get("target_message_id"),
                 int(mr["message_index"]) if mr.get("message_index") is not None else None,
+                mr.get("source_conversation_id"),
                 mr.get("message_time"),
                 mr.get("target_message_text"),
                 mr.get("parse_status", "ok"),
@@ -562,6 +576,8 @@ class Database:
                 "run_id": int(run_id),
                 "target_message_id": d.get("target_message_id"),
                 "message_index": d.get("message_index"),
+                "appended_message_index": d.get("message_index"),
+                "source_conversation_id": d.get("source_conversation_id"),
                 "message_time": d.get("message_time"),
                 "target_message_text": d.get("target_message_text"),
                 "parse_status": d.get("parse_status"),
