@@ -1493,6 +1493,326 @@ def tab_run() -> None:
 # --------- Tab: Dashboard ---------
 
 
+# --------- Overview tab: classification family tree ---------
+#
+# The 12 final_classification labels are organized into a three-level tree for
+# management. The split between "Pending unresolved" and "Totally unresolved"
+# (both inside Not Handled) comes from unhandled_resolution_subtype, NOT from the
+# classification label itself, so the same 6 unhandled labels appear under both.
+
+# Experience bucket per leaf: good = zero_minimal issues, bad = many issues.
+_OVERVIEW_GOOD_HANDLED = [
+    "Handled with Minimal Issues",
+    "Handled with Minimal Issues and Frustration",
+    "Handled with Minimal Caused Issues and Frustration",
+]
+_OVERVIEW_BAD_HANDLED = [
+    "Handled with Many Issues",
+    "Handled with Many Issues and Frustration",
+    "Handled with Many Caused Issues and Frustration",
+]
+_OVERVIEW_GOOD_UNHANDLED = [
+    "Not Handled with Minimal Issues",
+    "Not Handled with Minimal Issues and Frustration",
+    "Not Handled with Minimal Caused Issues and Frustration",
+]
+_OVERVIEW_BAD_UNHANDLED = [
+    "Not Handled with Many Issues",
+    "Not Handled with Many Issues and Frustration",
+    "Not Handled with Many Caused Issues and Frustration",
+]
+
+
+def _overview_tree_spec() -> list[dict]:
+    """Describe the family tree: families -> subgroups -> experience -> labels.
+
+    Each node carries the filter predicate columns it matches on. Leaves are the
+    final_classification labels; subgroup membership for unhandled also depends on
+    unhandled_resolution_subtype.
+    """
+    return [
+        {
+            "key": "handled",
+            "title": "1. Handled",
+            "tone": "good",
+            "handled_status": "handled",
+            "subtype": None,
+            "experiences": [
+                {"title": "Good experience", "tone": "good", "labels": _OVERVIEW_GOOD_HANDLED},
+                {"title": "Bad experience", "tone": "bad", "labels": _OVERVIEW_BAD_HANDLED},
+            ],
+        },
+        {
+            "key": "pending",
+            "title": "2.1 Not Handled — Pending Unresolved",
+            "tone": "warn",
+            "handled_status": "unhandled",
+            "subtype": "pending_unresolved",
+            "experiences": [
+                {"title": "Good experience", "tone": "good", "labels": _OVERVIEW_GOOD_UNHANDLED},
+                {"title": "Bad experience", "tone": "bad", "labels": _OVERVIEW_BAD_UNHANDLED},
+            ],
+        },
+        {
+            "key": "totally",
+            "title": "2.2 Not Handled — Totally Unresolved",
+            "tone": "bad",
+            "handled_status": "unhandled",
+            "subtype": "totally_unresolved",
+            "experiences": [
+                {"title": "Good experience", "tone": "good", "labels": _OVERVIEW_GOOD_UNHANDLED},
+                {"title": "Bad experience", "tone": "bad", "labels": _OVERVIEW_BAD_UNHANDLED},
+            ],
+        },
+    ]
+
+
+def _overview_tone_color(tone: str) -> str:
+    """Map a node tone to a dashboard color (looked up at call time)."""
+    return {
+        "good": _DASH_COLORS["handled"],
+        "warn": _DASH_COLORS["many"],
+        "bad": _DASH_COLORS["unhandled"],
+    }.get(tone, _DASH_COLORS["none"])
+
+
+def _overview_node_df(
+    conv_df: pd.DataFrame,
+    handled_status: str,
+    subtype: str | None,
+    labels: list[str] | None = None,
+) -> pd.DataFrame:
+    """Slice the conversation table for one node of the family tree."""
+    if conv_df.empty or "handled_status" not in conv_df.columns:
+        return conv_df.iloc[0:0]
+
+    mask = conv_df["handled_status"].astype(str).str.strip().str.lower() == handled_status
+
+    if subtype is not None and "unhandled_resolution_subtype" in conv_df.columns:
+        sub = conv_df["unhandled_resolution_subtype"].astype(str).str.strip().str.lower()
+        mask &= sub == subtype
+
+    if labels is not None and "final_classification" in conv_df.columns:
+        mask &= conv_df["final_classification"].isin(labels)
+
+    return conv_df[mask]
+
+
+def _overview_count_bar(label: str, count: int, total: int, color: str, depth: int = 0) -> str:
+    """One row in the tree: label, count, % of total, and a progress bar."""
+    share = _pct(count, total)
+    indent = depth * 18
+    return (
+        f'<div style="padding:6px 0 6px {indent + 12}px;border-left:3px solid {color};'
+        f'margin-left:{indent}px;margin-bottom:2px;">'
+        f'<div style="display:flex;justify-content:space-between;gap:12px;align-items:baseline;">'
+        f'<div style="color:{_DASH_COLORS["text"]};font-size:0.9rem;">{html_lib.escape(label)}</div>'
+        f'<div style="color:{_DASH_COLORS["muted"]};font-size:0.8rem;white-space:nowrap;">'
+        f'<b style="color:{color};">{count:,}</b> · {share:.1f}%</div>'
+        f'</div>'
+        f'<div style="margin-top:4px;height:5px;border-radius:3px;background:{_DASH_COLORS["track"]};overflow:hidden;">'
+        f'<div style="width:{share:.2f}%;height:100%;background:{color};"></div>'
+        f'</div></div>'
+    )
+
+
+_OVERVIEW_JOURNEY_COLUMNS = {
+    "conversation_id": "ID",
+    "customer_name": "Customer",
+    "final_classification": "Classification",
+    "main_issue_type": "Main issue",
+    "main_issue_origin": "Origin",
+    "max_frustration_level": "Max frustration",
+    "final_customer_sentiment": "Final sentiment",
+    "main_issue_summary": "Issue summary",
+    "customer_impact": "Customer impact",
+    "manual_review_required": "Needs review",
+}
+
+
+def _overview_journey_table(node_df: pd.DataFrame) -> pd.DataFrame:
+    """Build the issue-focused journey list shown when a leaf is expanded."""
+    cols = [c for c in _OVERVIEW_JOURNEY_COLUMNS if c in node_df.columns]
+    view = node_df[cols].copy()
+    for c in ("main_issue_type", "main_issue_origin", "max_frustration_level", "final_customer_sentiment"):
+        if c in view.columns:
+            view[c] = view[c].apply(humanize_label)
+    view = view.rename(columns=_OVERVIEW_JOURNEY_COLUMNS)
+    return view
+
+
+def _overview_metric_table(node_df: pd.DataFrame) -> pd.DataFrame:
+    """Aggregate quantifiable metrics across the journeys in a slice."""
+    metric_cols = quantifiable_metric_columns(node_df)
+    if not metric_cols or node_df.empty:
+        return pd.DataFrame()
+    rows = []
+    for col in metric_cols:
+        series = pd.to_numeric(node_df[col], errors="coerce").fillna(0)
+        contributing = int((series > 0).sum())
+        total = float(series.sum())
+        if total <= 0:
+            continue
+        rows.append(
+            {
+                "Category": metric_category_display_name(col),
+                "Metric": metric_display_name(col),
+                "Total": total,
+                "Journeys affected": contributing,
+                "Avg when flagged": (float(series[series > 0].mean()) if contributing else 0.0),
+            }
+        )
+    if not rows:
+        return pd.DataFrame()
+    return pd.DataFrame(rows).sort_values(
+        ["Total", "Journeys affected"], ascending=[False, False]
+    )
+
+
+def tab_overview() -> None:
+    st.subheader("Overview")
+    st.caption(
+        "Management view of where journeys land across the handled / not-handled "
+        "families, focused on surfacing problems and their measurable impact."
+    )
+    if not _has_results():
+        st.info("Run an evaluation first.")
+        return
+
+    conv_df = _conv_dataframe_from_results()
+    if conv_df.empty:
+        st.info("No journeys to summarize.")
+        return
+
+    filters = _conversation_filters_with_keys(conv_df, "overview_filters")
+    filtered = apply_conversation_filters(conv_df, filters)
+    total = int(len(filtered))
+
+    if total == 0:
+        st.info("No journeys match the current filters.")
+        return
+
+    tree = _overview_tree_spec()
+
+    # --- Family summary cards ---
+    st.markdown("---")
+    family_cols = st.columns(len(tree), gap="medium")
+    family_slices: dict[str, pd.DataFrame] = {}
+    for col, family in zip(family_cols, tree):
+        fdf = _overview_node_df(filtered, family["handled_status"], family["subtype"])
+        family_slices[family["key"]] = fdf
+        count = int(len(fdf))
+        color = _overview_tone_color(family["tone"])
+        good_n = sum(
+            len(_overview_node_df(filtered, family["handled_status"], family["subtype"], exp["labels"]))
+            for exp in family["experiences"] if exp["tone"] == "good"
+        )
+        bad_n = count - good_n
+        with col:
+            st.markdown(
+                _kpi_card_html(
+                    family["title"],
+                    f"{count:,}",
+                    f"{_pct(count, total):.1f}% of {total:,} journeys",
+                    [("Bad experience", bad_n, _DASH_COLORS["unhandled"]),
+                     ("Good experience", good_n, _DASH_COLORS["handled"])],
+                ),
+                unsafe_allow_html=True,
+            )
+
+    # --- The family tree with drill-down ---
+    st.markdown("---")
+    _section_header(
+        "Classification family tree",
+        "Each family splits into good vs bad experience, then into the exact "
+        "classification labels. Expand any leaf to see the journeys and their issues.",
+    )
+
+    for family in tree:
+        fdf = family_slices[family["key"]]
+        fcount = int(len(fdf))
+        fcolor = _overview_tone_color(family["tone"])
+        st.markdown(_overview_count_bar(family["title"], fcount, total, fcolor, depth=0), unsafe_allow_html=True)
+        if fcount == 0:
+            continue
+
+        # Bad experience first (problem-focused), then good.
+        ordered_exps = sorted(family["experiences"], key=lambda e: 0 if e["tone"] == "bad" else 1)
+        for exp in ordered_exps:
+            edf = _overview_node_df(filtered, family["handled_status"], family["subtype"], exp["labels"])
+            ecount = int(len(edf))
+            ecolor = _overview_tone_color(exp["tone"])
+            st.markdown(_overview_count_bar(exp["title"], ecount, total, ecolor, depth=1), unsafe_allow_html=True)
+            if ecount == 0:
+                continue
+
+            for label in exp["labels"]:
+                ldf = _overview_node_df(filtered, family["handled_status"], family["subtype"], [label])
+                lcount = int(len(ldf))
+                if lcount == 0:
+                    continue
+                st.markdown(_overview_count_bar(label, lcount, total, ecolor, depth=2), unsafe_allow_html=True)
+                with st.expander(f"Journeys — {label} ({lcount})", expanded=False):
+                    st.dataframe(_overview_journey_table(ldf), use_container_width=True, hide_index=True)
+                    mt = _overview_metric_table(ldf)
+                    if not mt.empty:
+                        st.markdown("**Measurable issues in these journeys**")
+                        st.dataframe(mt, use_container_width=True, hide_index=True)
+
+    # --- Quantifiable metrics, problem-oriented, for the current view ---
+    st.markdown("---")
+    _section_header(
+        "Where the damage concentrates",
+        "Quantifiable issue metrics totalled across the filtered journeys. "
+        "Use the filters to focus on a category or a minimum impact.",
+    )
+
+    metric_table = _overview_metric_table(filtered)
+    if metric_table.empty:
+        st.caption("No quantifiable issues recorded for the current selection.")
+        return
+
+    mf1, mf2, mf3 = st.columns([1.4, 1.4, 1])
+    with mf1:
+        cat_opts = sorted(metric_table["Category"].unique().tolist())
+        sel_cats = st.multiselect(
+            "Metric categories", cat_opts, default=[],
+            help="Leave empty to include all categories.", key="overview_metric_cats",
+        )
+    with mf2:
+        search = st.text_input("Search metrics", value="", key="overview_metric_search")
+    with mf3:
+        min_total = st.number_input(
+            "Minimum total", min_value=0.0, value=0.0, step=1.0, key="overview_metric_min",
+        )
+
+    view = metric_table.copy()
+    if sel_cats:
+        view = view[view["Category"].isin(sel_cats)]
+    if search.strip():
+        needle = search.strip().lower()
+        view = view[
+            view["Metric"].astype(str).str.lower().str.contains(needle, na=False)
+            | view["Category"].astype(str).str.lower().str.contains(needle, na=False)
+        ]
+    if min_total > 0:
+        view = view[view["Total"] >= float(min_total)]
+
+    if view.empty:
+        st.caption("No metrics match the selected filters.")
+        return
+
+    top = view.head(15)
+    if HAS_PLOTLY:
+        fig = px.bar(
+            top, x="Total", y="Metric", color="Category", orientation="h",
+            text="Total", hover_data=["Journeys affected", "Avg when flagged"],
+        )
+        _plotly_layout(fig, height=520, yaxis=dict(autorange="reversed"))
+        _render_plotly(fig)
+    st.dataframe(view, use_container_width=True, hide_index=True)
+
+
 def tab_dashboard() -> None:
     st.subheader("Management Dashboard")
     if not _has_results():
@@ -2324,6 +2644,7 @@ def main() -> None:
             "Upload & Settings",
             "Prompts",
             "Run Evaluation",
+            "Overview",
             "Dashboard",
             "Conversation Review",
             "Exports",
@@ -2337,12 +2658,14 @@ def main() -> None:
     with tabs[2]:
         tab_run()
     with tabs[3]:
-        tab_dashboard()
+        tab_overview()
     with tabs[4]:
-        tab_review()
+        tab_dashboard()
     with tabs[5]:
-        tab_exports()
+        tab_review()
     with tabs[6]:
+        tab_exports()
+    with tabs[7]:
         tab_debug()
 
 
