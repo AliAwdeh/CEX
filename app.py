@@ -2329,12 +2329,13 @@ def tab_overview() -> None:
         st.info("No journeys to summarize.")
         return
 
-    filters = _conversation_filters_with_keys(conv_df, "overview_filters")
-    filtered = apply_conversation_filters(conv_df, filters)
+    # Overview shows the full evaluated set; it intentionally has no top-level
+    # filter panel. Use the per-section metric filters below instead.
+    filtered = conv_df
     total = int(len(filtered))
 
     if total == 0:
-        st.info("No journeys match the current filters.")
+        st.info("No journeys to summarize.")
         return
 
     tree = _overview_tree_spec()
@@ -2425,7 +2426,15 @@ def tab_overview() -> None:
             help="Leave empty to include all categories.", key="overview_metric_cats",
         )
     with mf2:
-        search = st.text_input("Search metrics", value="", key="overview_metric_search")
+        # Options depend on the selected categories so the list stays manageable.
+        metric_pool = metric_table
+        if sel_cats:
+            metric_pool = metric_pool[metric_pool["Category"].isin(sel_cats)]
+        metric_opts = sorted(metric_pool["Metric"].unique().tolist())
+        sel_metrics = st.multiselect(
+            "Metrics", metric_opts, default=[],
+            help="Leave empty to include all metrics.", key="overview_metric_names",
+        )
     with mf3:
         min_total = st.number_input(
             "Minimum total", min_value=0.0, value=0.0, step=1.0, key="overview_metric_min",
@@ -2434,12 +2443,8 @@ def tab_overview() -> None:
     view = metric_table.copy()
     if sel_cats:
         view = view[view["Category"].isin(sel_cats)]
-    if search.strip():
-        needle = search.strip().lower()
-        view = view[
-            view["Metric"].astype(str).str.lower().str.contains(needle, na=False)
-            | view["Category"].astype(str).str.lower().str.contains(needle, na=False)
-        ]
+    if sel_metrics:
+        view = view[view["Metric"].isin(sel_metrics)]
     if min_total > 0:
         view = view[view["Total"] >= float(min_total)]
 
