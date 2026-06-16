@@ -2194,6 +2194,7 @@ def _overview_tree_spec() -> list[dict]:
         {
             "key": "handled",
             "title": "1. Handled",
+            "short_name": "Handled",
             "tone": "good",
             "handled_status": "handled",
             "subtype": None,
@@ -2205,6 +2206,7 @@ def _overview_tree_spec() -> list[dict]:
         {
             "key": "pending",
             "title": "2.1 Not Handled — Pending Unresolved",
+            "short_name": "Pending Unresolved",
             "tone": "warn",
             "handled_status": "unhandled",
             "subtype": "pending_unresolved",
@@ -2216,6 +2218,7 @@ def _overview_tree_spec() -> list[dict]:
         {
             "key": "totally",
             "title": "2.2 Not Handled — Totally Unresolved",
+            "short_name": "Totally Unresolved",
             "tone": "bad",
             "handled_status": "unhandled",
             "subtype": "totally_unresolved",
@@ -2388,61 +2391,143 @@ def tab_overview() -> None:
         "Bad experience shown first.",
     )
 
-    for family in tree:
+    family_tree_cols = st.columns(len(tree), gap="large")
+    for col, family in zip(family_tree_cols, tree):
         fdf = family_slices[family["key"]]
         fcount = int(len(fdf))
         fcolor = _overview_tone_color(family["tone"])
 
-        # Family header row
-        st.markdown(
-            f'<div style="margin-top:18px;padding:8px 14px;background:{fcolor}22;'
-            f'border-left:5px solid {fcolor};border-radius:6px;">'
-            f'<span style="font-size:1rem;font-weight:800;color:{fcolor};">'
-            f'{html_lib.escape(family["title"])}</span>'
-            f'<span style="font-size:0.85rem;color:{_DASH_COLORS["muted"]};margin-left:12px;">'
-            f'{fcount:,} journeys &nbsp;·&nbsp; {_pct(fcount, total):.1f}% of total</span>'
-            f'</div>',
-            unsafe_allow_html=True,
+        with col:
+            # Family header
+            st.markdown(
+                f'<div style="padding:10px 14px;background:{fcolor}22;'
+                f'border:2px solid {fcolor};border-radius:8px;margin-bottom:10px;">'
+                f'<div style="font-size:0.95rem;font-weight:800;color:{fcolor};">'
+                f'{html_lib.escape(family["title"])}</div>'
+                f'<div style="font-size:0.82rem;color:{_DASH_COLORS["muted"]};margin-top:2px;">'
+                f'{fcount:,} journeys &nbsp;·&nbsp; {_pct(fcount, total):.1f}% of total</div>'
+                f'</div>',
+                unsafe_allow_html=True,
+            )
+
+            if fcount == 0:
+                st.caption("No journeys in this family.")
+                continue
+
+            # Classification table: bad experience first, then good
+            ordered_exps = sorted(family["experiences"], key=lambda e: 0 if e["tone"] == "bad" else 1)
+            table_rows = []
+            for exp in ordered_exps:
+                for label in exp["labels"]:
+                    ldf = _overview_node_df(filtered, family["handled_status"], family["subtype"], [label])
+                    lcount = int(len(ldf))
+                    # Derive responsibility from classification label:
+                    # "Caused" in label = our side caused it; else external/no issue
+                    if "Caused" in label:
+                        responsibility = "Our side"
+                    elif "with Many Issues" in label or "with Minimal Issues" in label:
+                        responsibility = "External"
+                    else:
+                        responsibility = "—"
+                    # Shorten the display label — Responsibility column already
+                    # covers "Caused/Our side", so strip the redundant parts.
+                    if "Frustration" in label:
+                        if "Many" in label:
+                            display_label = "Many Issues + Frustration"
+                        else:
+                            display_label = "Minimal Issues + Frustration"
+                    elif "Many" in label:
+                        display_label = "Many Issues"
+                    else:
+                        display_label = "Minimal Issues"
+                    table_rows.append({
+                        "Classification": display_label,
+                        "Responsibility": responsibility,
+                        "Journeys": lcount,
+                        f"% of {family['short_name']}": f"{_pct(lcount, fcount):.1f}%",
+                        "% of total": f"{_pct(lcount, total):.1f}%",
+                    })
+
+            tdf = pd.DataFrame(table_rows)
+            tdf = tdf[tdf["Journeys"] > 0]
+            if not tdf.empty:
+                st.dataframe(tdf, use_container_width=True, hide_index=True)
+
+
+    # --- Issues table ---
+    st.markdown("---")
+    _section_header(
+        "Detected issues across all journeys",
+        "What went wrong — grouped by issue type and origin. "
+        "Shows every journey where a main issue was identified.",
+    )
+
+    issue_cols_needed = ["main_issue_type", "main_issue_origin", "main_issue_summary", "customer_impact", "final_classification"]
+    available = [c for c in issue_cols_needed if c in filtered.columns]
+    if not available:
+        st.caption("No issue data available.")
+        return
+
+    issues_df = filtered[filtered["main_issue_type"].notna() & (filtered["main_issue_type"].astype(str).str.lower() != "none")].copy()
+    if issues_df.empty:
+        st.caption("No issues detected across evaluated journeys.")
+        return
+
+    # Filter controls
+    if1, if2 = st.columns([1, 1])
+    with if1:
+        type_opts = sorted(issues_df["main_issue_type"].dropna().unique().tolist())
+        sel_types = st.multiselect(
+            "Issue type", [humanize_label(t) for t in type_opts], default=[], key="overview_issue_type",
         )
+    with if2:
+        if "main_issue_origin" in issues_df.columns:
+            origin_opts = sorted(issues_df["main_issue_origin"].dropna().unique().tolist())
+            sel_origins = st.multiselect(
+                "Issue origin", [humanize_label(o) for o in origin_opts], default=[], key="overview_issue_origin",
+            )
+        else:
+            sel_origins = []
 
-        if fcount == 0:
-            st.caption("No journeys in this family.")
-            continue
+    view = issues_df.copy()
+    if sel_types:
+        view = view[view["main_issue_type"].apply(humanize_label).isin(sel_types)]
+    if sel_origins and "main_issue_origin" in view.columns:
+        view = view[view["main_issue_origin"].apply(humanize_label).isin(sel_origins)]
 
-        # Build table rows: bad experience first, then good
-        ordered_exps = sorted(family["experiences"], key=lambda e: 0 if e["tone"] == "bad" else 1)
-        table_rows = []
-        for exp in ordered_exps:
-            for label in exp["labels"]:
-                ldf = _overview_node_df(filtered, family["handled_status"], family["subtype"], [label])
-                lcount = int(len(ldf))
-                table_rows.append({
-                    "Experience": exp["title"],
-                    "Classification": label,
-                    "Journeys": lcount,
-                    "% of family": f"{_pct(lcount, fcount):.1f}%",
-                    "% of total": f"{_pct(lcount, total):.1f}%",
-                })
+    if view.empty:
+        st.caption("No issues match the selected filters.")
+        return
 
-        tdf = pd.DataFrame(table_rows)
-        tdf = tdf[tdf["Journeys"] > 0]
-        if tdf.empty:
-            st.caption("No journeys.")
-            continue
+    # Group by issue type + origin, count journeys per group
+    group_cols = [c for c in ["main_issue_type", "main_issue_origin"] if c in view.columns]
+    grouped = (
+        view.groupby(group_cols)
+        .size()
+        .reset_index(name="Journeys")
+        .sort_values("Journeys", ascending=False)
+    )
+    for c in group_cols:
+        grouped[c] = grouped[c].apply(humanize_label)
+    grouped = grouped.rename(columns={
+        "main_issue_type": "Issue type",
+        "main_issue_origin": "Origin",
+    })
 
-        st.dataframe(tdf, use_container_width=True, hide_index=True)
+    st.caption(f"{len(view):,} journeys with detected issues — {len(grouped):,} distinct issue types")
+    st.dataframe(grouped, use_container_width=True, hide_index=True)
 
     # --- Quantifiable metrics table ---
     st.markdown("---")
     _section_header(
-        "Where the damage concentrates",
-        "Quantifiable issue metrics totalled across all journeys. "
-        "Filter by category or metric to focus on specific problem areas.",
+        "Quantifiable metrics breakdown",
+        "Numeric impact metrics totalled across all journeys. "
+        "Filter by category or metric to focus on specific areas.",
     )
 
     metric_table = _overview_metric_table(filtered)
     if metric_table.empty:
-        st.caption("No quantifiable issues recorded for the current selection.")
+        st.caption("No quantifiable issues recorded.")
         return
 
     mf1, mf2, mf3 = st.columns([1.4, 1.4, 1])
@@ -2453,7 +2538,6 @@ def tab_overview() -> None:
             help="Leave empty to include all categories.", key="overview_metric_cats",
         )
     with mf2:
-        # Options depend on the selected categories so the list stays manageable.
         metric_pool = metric_table
         if sel_cats:
             metric_pool = metric_pool[metric_pool["Category"].isin(sel_cats)]
@@ -2479,14 +2563,6 @@ def tab_overview() -> None:
         st.caption("No metrics match the selected filters.")
         return
 
-    top = view.head(15)
-    if HAS_PLOTLY:
-        fig = px.bar(
-            top, x="Total", y="Metric", color="Category", orientation="h",
-            text="Total", hover_data=["Journeys affected", "Avg when flagged"],
-        )
-        _plotly_layout(fig, height=520, yaxis=dict(autorange="reversed"))
-        _render_plotly(fig)
     st.dataframe(view, use_container_width=True, hide_index=True)
 
 
