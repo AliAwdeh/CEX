@@ -2346,8 +2346,6 @@ def tab_overview() -> None:
         st.info("No journeys to summarize.")
         return
 
-    # Overview shows the full evaluated set; it intentionally has no top-level
-    # filter panel. Use the per-section metric filters below instead.
     filtered = conv_df
     total = int(len(filtered))
 
@@ -2365,7 +2363,6 @@ def tab_overview() -> None:
         fdf = _overview_node_df(filtered, family["handled_status"], family["subtype"])
         family_slices[family["key"]] = fdf
         count = int(len(fdf))
-        color = _overview_tone_color(family["tone"])
         good_n = sum(
             len(_overview_node_df(filtered, family["handled_status"], family["subtype"], exp["labels"]))
             for exp in family["experiences"] if exp["tone"] == "good"
@@ -2383,51 +2380,64 @@ def tab_overview() -> None:
                 unsafe_allow_html=True,
             )
 
-    # --- The family tree with drill-down ---
+    # --- Classification breakdown table per family ---
     st.markdown("---")
     _section_header(
-        "Classification family tree",
-        "Each family splits into good vs bad experience, then into the exact "
-        "classification labels. Expand any leaf to see the journeys and their issues.",
+        "Journey classification breakdown",
+        "Each family split by experience and exact classification label. "
+        "Bad experience shown first.",
     )
 
     for family in tree:
         fdf = family_slices[family["key"]]
         fcount = int(len(fdf))
         fcolor = _overview_tone_color(family["tone"])
-        st.markdown(_overview_count_bar(family["title"], fcount, total, fcolor, depth=0), unsafe_allow_html=True)
+
+        # Family header row
+        st.markdown(
+            f'<div style="margin-top:18px;padding:8px 14px;background:{fcolor}22;'
+            f'border-left:5px solid {fcolor};border-radius:6px;">'
+            f'<span style="font-size:1rem;font-weight:800;color:{fcolor};">'
+            f'{html_lib.escape(family["title"])}</span>'
+            f'<span style="font-size:0.85rem;color:{_DASH_COLORS["muted"]};margin-left:12px;">'
+            f'{fcount:,} journeys &nbsp;·&nbsp; {_pct(fcount, total):.1f}% of total</span>'
+            f'</div>',
+            unsafe_allow_html=True,
+        )
+
         if fcount == 0:
+            st.caption("No journeys in this family.")
             continue
 
-        # Bad experience first (problem-focused), then good.
+        # Build table rows: bad experience first, then good
         ordered_exps = sorted(family["experiences"], key=lambda e: 0 if e["tone"] == "bad" else 1)
+        table_rows = []
         for exp in ordered_exps:
-            edf = _overview_node_df(filtered, family["handled_status"], family["subtype"], exp["labels"])
-            ecount = int(len(edf))
-            ecolor = _overview_tone_color(exp["tone"])
-            st.markdown(_overview_count_bar(exp["title"], ecount, total, ecolor, depth=1), unsafe_allow_html=True)
-            if ecount == 0:
-                continue
-
             for label in exp["labels"]:
                 ldf = _overview_node_df(filtered, family["handled_status"], family["subtype"], [label])
                 lcount = int(len(ldf))
-                if lcount == 0:
-                    continue
-                st.markdown(_overview_count_bar(label, lcount, total, ecolor, depth=2), unsafe_allow_html=True)
-                with st.expander(f"Journeys — {label} ({lcount})", expanded=False):
-                    st.dataframe(_overview_journey_table(ldf), use_container_width=True, hide_index=True)
-                    mt = _overview_metric_table(ldf)
-                    if not mt.empty:
-                        st.markdown("**Measurable issues in these journeys**")
-                        st.dataframe(mt, use_container_width=True, hide_index=True)
+                table_rows.append({
+                    "Experience": exp["title"],
+                    "Classification": label,
+                    "Journeys": lcount,
+                    "% of family": f"{_pct(lcount, fcount):.1f}%",
+                    "% of total": f"{_pct(lcount, total):.1f}%",
+                })
 
-    # --- Quantifiable metrics, problem-oriented, for the current view ---
+        tdf = pd.DataFrame(table_rows)
+        tdf = tdf[tdf["Journeys"] > 0]
+        if tdf.empty:
+            st.caption("No journeys.")
+            continue
+
+        st.dataframe(tdf, use_container_width=True, hide_index=True)
+
+    # --- Quantifiable metrics table ---
     st.markdown("---")
     _section_header(
         "Where the damage concentrates",
-        "Quantifiable issue metrics totalled across the filtered journeys. "
-        "Use the filters to focus on a category or a minimum impact.",
+        "Quantifiable issue metrics totalled across all journeys. "
+        "Filter by category or metric to focus on specific problem areas.",
     )
 
     metric_table = _overview_metric_table(filtered)
