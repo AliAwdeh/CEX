@@ -341,7 +341,7 @@ def _score_number(value: Any, minimum: float, maximum: float) -> int | float:
         num = float(value)
     except (TypeError, ValueError):
         num = 0.0
-    num = max(minimum, min(maximum, num))
+    num = float(max(minimum, min(maximum, num)))
     return int(num) if num.is_integer() else num
 
 
@@ -568,9 +568,36 @@ def validate_conversation_level_result(data: dict) -> dict:
     out["negative_signals"] = [str(x) for x in (data.get("negative_signals") or []) if x]
     out["quantifiable_metrics"] = _normalize_quantifiable_metrics(data.get("quantifiable_metrics"))
     out["conversation_score"] = _normalize_conversation_score(data.get("conversation_score"))
-    out["classification_reason"] = str(data.get("classification_reason", "") or "")
-    out["quantifiable_metrics_reason"] = str(data.get("quantifiable_metrics_reason", "") or "")
-    out["management_summary"] = str(data.get("management_summary", "") or "")
+    management_summary = str(data.get("management_summary", "") or "").strip()
+    classification_reason = str(data.get("classification_reason", "") or "").strip()
+    if classification_reason.lower() in {"", "none", "n/a", "na"}:
+        classification_reason = management_summary or (
+            f"{classification} selected from handled_status={handled_status}, "
+            f"cx_issue_severity={severity}, frustration_detected={frustration_detected}, "
+            f"and main_issue_origin={main_issue_origin}."
+        )
+    out["classification_reason"] = classification_reason
+
+    quantifiable_metrics_reason = str(data.get("quantifiable_metrics_reason", "") or "").strip()
+    if quantifiable_metrics_reason.lower() in {"", "none", "n/a", "na"}:
+        nonzero_metrics: list[str] = []
+        for category in out["quantifiable_metrics"]:
+            metrics = category.get("metrics", {})
+            if not isinstance(metrics, dict):
+                continue
+            for metric_name, metric_value in metrics.items():
+                try:
+                    numeric_value = float(metric_value)
+                except (TypeError, ValueError):
+                    continue
+                if numeric_value:
+                    nonzero_metrics.append(f"{metric_name}={metric_value}")
+        if nonzero_metrics:
+            quantifiable_metrics_reason = "Key non-zero metrics: " + ", ".join(nonzero_metrics[:6]) + "."
+        else:
+            quantifiable_metrics_reason = "No major metric penalties were returned; normalized metric counts were retained for review."
+    out["quantifiable_metrics_reason"] = quantifiable_metrics_reason
+    out["management_summary"] = management_summary
     out["recommended_actions"] = [str(x) for x in (data.get("recommended_actions") or []) if x]
     out["manual_review_required"] = _normalize_bool_flag(data.get("manual_review_required"), default=False)
     out["manual_review_reason"] = str(data.get("manual_review_reason", "") or "")

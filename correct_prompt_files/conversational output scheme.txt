@@ -1,0 +1,149 @@
+{
+"customer_objective_type": "Inquiry|Issue",
+"customer_primary_objective": "short description",
+"final_classification": "Handled with Minimal Issues|Handled with Many Issues|Handled with Minimal Issues and Frustration|Handled with Many Issues and Frustration|Handled with Minimal Caused Issues and Frustration|Handled with Many Caused Issues and Frustration|Not Handled with Minimal Caused Issues and Frustration|Not Handled with Many Caused Issues and Frustration|Not Handled with Minimal Issues and Frustration|Not Handled with Many Issues and Frustration|Not Handled with Minimal Issues|Not Handled with Many Issues",
+"handled_status": "handled|unhandled",
+"cx_issue_severity": "zero_minimal|many",
+"frustration_detected": true,
+"customer_started_frustrated": true,
+"customer_became_frustrated_during_chat": true,
+"customer_ended_frustrated": true,
+"frustration_timing": "start|during|end|multiple|none",
+"main_issue_origin": "our_side|customer_side|shared|third_party|unclear|none",
+"unhandled_resolution_subtype": "totally_unresolved|pending_unresolved|not_applicable",
+"final_customer_sentiment": "satisfied|neutral|frustrated|confused|dissatisfied|unknown",
+"max_frustration_level": "none|low|medium|high|cancellation_risk",
+"main_issue": {
+"issue_exists": true,
+"issue_origin": "our_side|customer_side|shared|third_party|unclear|none",
+"issue_type": "none|misunderstanding|repetition|delay|unclear_guidance|wrong_info|ignored_context|dead_end|tool_or_system_failure|poor_tone|missing_next_step|other",
+"issue_summary": "short business-friendly summary",
+"customer_impact": "short explanation of impact on customer journey"
+},
+"all_detected_issues": [
+{
+"issue_origin": "our_side|customer_side|shared|third_party|unclear",
+"issue_type": "misunderstanding|repetition|delay|unclear_guidance|wrong_info|ignored_context|dead_end|tool_or_system_failure|poor_tone|missing_next_step|other",
+"issue_summary": "string",
+"evidence": "string",
+"impact": "string"
+}
+],
+"quantifiable_metrics": [
+{
+"category": "Customer Understanding & Context Management",
+"metrics": {
+"intent_understanding_errors": 0,
+"information_retention_failures": 0,
+"misleading_information_count": 0,
+"date_timeline_errors": 0,
+"repeated_response_count": 0
+}
+},
+{
+"category": "Conversation Efficiency & Customer Effort",
+"metrics": {
+"document_request_fragmentation": 0,
+"customer_effort_score": 0,
+"wasted_customer_trip_count": 0,
+"estimated_customer_time_wasted_minutes": 0,
+"avoidable_agent_message_count": 0
+}
+},
+{
+"category": "Delays, Escalation & Service Delivery",
+"metrics": {
+"missed_transfer_count": 0,
+"manual_escalation_count": 0,
+"late_information_delivery_count": 0,
+"process_delay_minutes": 0,
+"sla_breach_count": 0,
+"critical_delay_count": 0
+}
+},
+{
+"category": "Technical & System Performance",
+"metrics": {
+"attachment_information_processing_failures": 0
+}
+},
+{
+"category": "Issue Attribution & Root Cause Analysis",
+"metrics": {
+"customer_side_issue_count": 0,
+"chatbot_company_side_issue_count": 0,
+"third_party_issue_count": 0,
+"total_issue_count": 0
+}
+},
+{
+"category": "Financial Impact & Revenue Risk",
+"metrics": {
+"customer_financial_burden_event_count": 0,
+"company_cost_exposure_event_count": 0,
+"estimated_monetary_loss_amount": 0,
+"potential_revenue_at_risk_amount": 0
+}
+},
+{
+"category": "Refunds, Cancellations & Compensation",
+"metrics": {
+"refund_request_count": 0,
+"cancellation_request_count": 0,
+"compensation_request_count": 0
+}
+},
+{
+"category": "Domain & Policy Accuracy",
+"metrics": {
+"insurance_coverage_error_count": 0,
+"visa_immigration_error_count": 0,
+"contractual_miscommunication_count": 0
+}
+},
+{
+"category": "Customer Satisfaction, Trust & Complaints",
+"metrics": {
+"complaint_threat_count": 0,
+"lost_trust_statement_count": 0
+}
+},
+{
+"category": "Appointments, Contact Information & Payments",
+"metrics": {
+"appointment_failure_count": 0,
+"wrong_location_count": 0,
+"wrong_contact_count": 0,
+"payment_confusion_count": 0,
+"duplicate_payment_risk_count": 0
+}
+},
+{
+"category": "Compliance & Risk Management",
+"metrics": {
+"legal_compliance_risk_count": 0
+}
+}
+],
+"positive_signals": ["short bullet"],
+"negative_signals": ["short bullet"],
+"management_summary": "concise business-friendly explanation of the classification",
+"recommended_actions": ["short actionable recommendation"],
+"manual_review_required": true,
+"manual_review_reason": "short reason or none",
+"confidence": "low|medium|high",
+"conversation_score": {
+"resolution_score": 0,
+"context_understanding_score": 0,
+"customer_effort_score": 0,
+"trust_frustration_risk_score": 0,
+"raw_total_score": 0,
+"final_score": 0,
+"score_rating": "Excellent|Good|Fair|Poor|Critical",
+"score_explanation": "short explanation"
+},
+"classification_reason": "short reason explaining why final_classification was selected",
+"quantifiable_metrics_reason": "short reason explaining the key metric values that affected classification or score"
+
+}
+

@@ -15,9 +15,9 @@ from openai import OpenAI
 
 DEFAULT_BASE_URL = "https://langcc.maidstech.ai/v1"
 
-# Hard upper limit on parallel in-flight requests. The Evaluator clamps the
-# user's concurrency setting to this value.
-MAX_CONCURRENCY = 64
+# Hard upper limit on parallel in-flight requests. The evaluator clamps the
+# user's concurrency setting to this value to avoid overloading the API proxy.
+MAX_CONCURRENCY = 16
 
 
 @dataclass
@@ -57,6 +57,21 @@ def fetch_models(client: OpenAI) -> list[str]:
     return ids
 
 
+def _looks_like_response_format_rejection(error: Exception) -> bool:
+    text = str(error).lower()
+    return "response_format" in text and any(
+        token in text
+        for token in (
+            "unsupported",
+            "not supported",
+            "unknown",
+            "unrecognized",
+            "invalid",
+            "extra",
+        )
+    )
+
+
 def chat_completion(
     client: OpenAI,
     config: APIConfig,
@@ -92,8 +107,10 @@ def chat_completion(
                 )
             except TypeError:
                 response = client.chat.completions.create(**kwargs)
-            except Exception:
+            except Exception as response_format_error:
                 # Some servers reject response_format; retry once without it before raising.
+                if not _looks_like_response_format_rejection(response_format_error):
+                    raise
                 response = client.chat.completions.create(**kwargs)
 
             content = ""

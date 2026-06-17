@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import json
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any
 
 
@@ -66,6 +67,20 @@ class PromptTemplate:
         )
 
 
+def _load_external_prompt_default(filename: str, fallback: str) -> str:
+    """Load a maintained prompt file, falling back when the file is missing or empty."""
+    root = Path(__file__).resolve().parent
+    for folder in ("correct_prompt_files", "prompts"):
+        path = root / folder / filename
+        try:
+            value = path.read_text(encoding="utf-8")
+        except OSError:
+            continue
+        if value.strip():
+            return value
+    return fallback
+
+
 # --------- Default message-level prompt ---------
 
 
@@ -110,6 +125,19 @@ Required schema:
 {output_schema}
 
 Rules:
+[new modified/added section start]
+Calibration rules for gpt5.4mini:
+- Do not mark major_issue only because a customer may need one follow-up clarification.
+- A single unclear phrase, complex but usable payment/salary/insurance/visa explanation, or normal follow-up should be neutral or minor_issue, not major_issue.
+- Do not infer medium/high frustration from confusion, effort, or predicted inconvenience alone. Medium/high frustration requires visible negative sentiment, complaint, repeated correction, escalation, distrust, cancellation/refund pressure, hostile wording, or clear deterioration.
+- Typed information and official proof are not equivalent. A request for a bank-issued screenshot, receipt, payment proof, attachment, ID copy, contract, visa document, or official confirmation is valid unless the exact required document was already visibly provided and contained the requested fields.
+- Do not mark a brief restatement as repetition when it follows "Ok", "yes", "sure", "understood", or similar and does not change the requirement or cause customer pushback.
+- Repeated document/screenshot requests are not automatically major issues when the prior document was unclear, incomplete, missing a required field, or not in the required format.
+- Repeated automated broadcasts/payment reminders alone are not major issues and do not create high frustration unless they cause visible confusion, repeated objection, duplicate payment risk, blocked progress, financial harm, or unresolved frustration.
+- If the customer was told to ignore an automated reminder, later repeated reminders for the same item are neutral or minor by default unless the customer reacts again, progress is blocked, or payment/financial risk is created.
+- If the agent reassures the customer that automated messages can be ignored and then provides a different substantive next step or document/process explanation, treat that as helpful or neutral unless it re-demands the exact ignored item or contradicts the reassurance.
+- Use wrong_info only when visible transcript evidence proves the information is incorrect or contradictory; otherwise use unclear_guidance or none.
+[new modified/added section end]
 - Return JSON only.
 - Use none when no issue exists.
 - Do not invent facts.
@@ -148,6 +176,20 @@ Return strict JSON only using the required schema.
 
 Input:
 {payload_json}"""
+
+
+DEFAULT_MESSAGE_LEVEL_SYSTEM_PROMPT = _load_external_prompt_default(
+    "message prompt",
+    DEFAULT_MESSAGE_LEVEL_SYSTEM_PROMPT,
+)
+DEFAULT_MESSAGE_LEVEL_OUTPUT_SCHEMA = _load_external_prompt_default(
+    "Message scheme",
+    DEFAULT_MESSAGE_LEVEL_OUTPUT_SCHEMA,
+)
+DEFAULT_MESSAGE_LEVEL_USER_TEMPLATE = _load_external_prompt_default(
+    "message user input",
+    DEFAULT_MESSAGE_LEVEL_USER_TEMPLATE,
+)
 
 
 DEFAULT_MESSAGE_LEVEL_PROMPT = PromptTemplate(
@@ -244,6 +286,22 @@ Required schema:
 {output_schema}
 
 Rules:
+[new modified/added section start]
+Conversation-level calibration rules for gpt5.4mini:
+- Layer 1 message-level evaluations are evidence, not absolute truth. Verify major_issue, high frustration, wrong_info, and repetition labels against the full transcript before using them for final_classification.
+- Do not let harmless message-level minor issues automatically become cx_issue_severity=many.
+- Do not classify as many issues solely because the customer asked multiple follow-up questions to understand payment, salary, insurance, pricing, renewal, visa, medical, government, or timeline details.
+- Use zero_minimal when the agent gives consistent answers, the customer progressively understands, the journey moves forward, and the customer acknowledges, confirms, pays, submits documents, says "Ok", says "understood", says "thank you", or otherwise proceeds.
+- Use many only when there is significant impact: repeated failed explanations, contradiction, ignored context, wrong information with process impact, avoidable loop, blocked progress, unresolved confusion, repeated customer effort, visible frustration, cancellation/refund/escalation pressure, complaint, or distrust.
+- Repeated automated broadcasts alone do not automatically constitute many issues. Treat them as minimal unless they cause visible confusion, repeated contact, duplicate payment risk, wrong payment, service blockage, or unresolved frustration.
+- If an agent already corrected or neutralized an automated reminder, later reminders for the same item do not by themselves make the journey many issues. Keep zero_minimal unless the customer reacts again, progress is blocked, duplicate/wrong payment risk appears, or confusion remains unresolved.
+- Down-weight message-level major/high labels for repeated automated reminders after an ignore/correction unless the customer visibly reacts again or the reminders create real operational/financial risk.
+- Treat a different substantive next step after an automated-reminder reassurance as potentially helpful clarification, not ignored context, unless it directly contradicts the reassurance or re-demands the same ignored item.
+- Typed information and official proof are not equivalent. Requests for official screenshots/documents/proofs are valid unless the exact required proof was already visibly provided correctly.
+- Do not classify the whole journey as unhandled only because one secondary detail was unavailable. If the primary objective was completed or the customer received a clear, safe, usable next step, classify as handled unless the unresolved detail blocks progress.
+- For medical or safety questions, if exact details cannot be confirmed but the agent gives safe triage guidance, warning signs, and doctor/pharmacist/clinic escalation, this is usually handled with a limitation, not unhandled.
+- Do not infer high frustration from confusion or predicted inconvenience alone. High frustration requires visible negative sentiment, complaint, repeated correction, distrust, escalation, cancellation/refund pressure, hostile wording, or clear deterioration.
+[new modified/added section end]
 - Return JSON only.
 - Do not invent information.
 - Handled vs Unhandled depends mainly on whether the customer objective was achieved or whether a clear acceptable next step was provided.
@@ -267,11 +325,29 @@ Conversation score:
 - Customer Effort score should mainly reflect customer_effort_score, document_request_fragmentation, avoidable_agent_message_count, and wasted_customer_trip_count. Higher score means lower customer effort.
 - Trust/Frustration/Risk score should prioritize payment and money risk, then frustration: duplicate_payment_risk_count, payment_confusion_count, refund_request_count, cancellation_request_count, compensation_request_count, customer_financial_burden_event_count, complaint_threat_count, lost_trust_statement_count, and legal_compliance_risk_count.
 - Payment issues are high priority. If payment proof was ignored, the customer was asked to pay again, a duplicate payment risk exists, a refund/cancellation is mishandled, or payment guidance is confusing, reduce trust_frustration_risk_score strongly even if the customer tone is calm.
-- raw_total_score is the direct sum before guardrail caps or classification alignment. final_score is the final score after any caps/adjustments.
+[new modified/added section start]
+Score calibration:
+- The score should reflect actual customer impact, not only message count or detected labels.
+- Do not heavily reduce the score for normal clarification questions, valid document proof requests, harmless restatements, corrected automated reminders, or unavailable secondary details when a safe usable next step was provided.
+- Handled journeys with zero_minimal issues should usually remain in the Good or Excellent range unless there is meaningful unresolved friction.
+- Handled journeys with minimal caused frustration should not automatically become Poor. Use Good or Fair depending on actual impact and recovery.
+- payment_confusion_count = 1 should reduce the score mildly if clarified quickly and no duplicate payment risk occurred.
+- Reduce trust_frustration_risk_score strongly only when payment proof was ignored, the customer was asked to pay again after proof, duplicate payment risk exists, refund/cancellation is mishandled, money appears lost/unrecovered, or payment confusion remains unresolved.
+- Prefer final_score = raw_total_score unless there is a concrete visible reason to adjust it. Do not apply generic classification caps that make the score harsher than the actual customer impact.
+[new modified/added section end]
+[new modified/added section start]
+- raw_total_score is the direct sum before any final adjustment.
+- final_score is the final score after any concrete, evidence-based adjustment. In normal cases, final_score should equal raw_total_score.
+- Do not apply generic caps only because the classification contains "many issues" or "frustration". Adjust final_score only when the visible transcript shows severe unresolved risk, duplicate payment risk, mishandled refund/cancellation, compliance/legal risk, or an unhandled dead end.
+[new modified/added section end]
 - score_rating bands: 90-100 Excellent, 75-89 Good, 60-74 Fair, 40-59 Poor, 0-39 Critical.
 - score_explanation must briefly explain why the score is high or low, naming the strongest drivers instead of repeating the number.
 - classification_reason must explain why final_classification was selected.
-- quantifiable_metrics_reason must briefly explain the key metric values that affected classification or score."""
+- quantifiable_metrics_reason must briefly explain the key metric values that affected classification or score.
+[new modified/added section start]
+- classification_reason and quantifiable_metrics_reason must never be empty, "none", or "N/A".
+- If no major metric penalties exist, still explain that the score/classification is based on clear handling, low effort, and no major metric penalties.
+[new modified/added section end]"""
 
 
 DEFAULT_CONVERSATION_LEVEL_OUTPUT_SCHEMA = """{
@@ -429,6 +505,20 @@ Return strict JSON only using the required schema.
 
 Input:
 {payload_json}"""
+
+
+DEFAULT_CONVERSATION_LEVEL_SYSTEM_PROMPT = _load_external_prompt_default(
+    "conversational prompt",
+    DEFAULT_CONVERSATION_LEVEL_SYSTEM_PROMPT,
+)
+DEFAULT_CONVERSATION_LEVEL_OUTPUT_SCHEMA = _load_external_prompt_default(
+    "conversational output scheme",
+    DEFAULT_CONVERSATION_LEVEL_OUTPUT_SCHEMA,
+)
+DEFAULT_CONVERSATION_LEVEL_USER_TEMPLATE = _load_external_prompt_default(
+    "conversational user input",
+    DEFAULT_CONVERSATION_LEVEL_USER_TEMPLATE,
+)
 
 
 DEFAULT_CONVERSATION_LEVEL_PROMPT = PromptTemplate(
