@@ -9,6 +9,7 @@ import os
 import time
 from dataclasses import asdict
 from pathlib import Path
+from typing import Any
 
 import pandas as pd
 import streamlit as st
@@ -20,7 +21,9 @@ from data_loader import (
     JOURNEY_ID_COLUMN,
     METADATA_COLUMNS,
     REQUIRED_COLUMNS,
+    conversation_metadata_from_group,
     estimate_call_counts,
+    get_conversation_groups,
     load_csv,
     normalize_dataframe,
     summarize_dataframe,
@@ -239,6 +242,64 @@ def _msg_dataframe_from_results() -> pd.DataFrame:
         return pd.DataFrame()
     rows = [flatten_message_row(m) for m in rr.message_level_results]
     return build_message_table(rows)
+
+
+def _ordered_selected_ids(all_ids: list[str], selected_ids: list[str] | None) -> list[str]:
+    """Return selected journey IDs in the same order they appear in the CSV."""
+    if not selected_ids:
+        return []
+    wanted = {str(x) for x in selected_ids}
+    ordered = [str(x) for x in all_ids if str(x) in wanted]
+    extra = [str(x) for x in selected_ids if str(x) not in set(ordered)]
+    return ordered + extra
+
+
+def _journey_selector_rows(df: pd.DataFrame) -> pd.DataFrame:
+    """Build one searchable row per customer journey for run scoping."""
+    rows: list[dict[str, Any]] = []
+    for journey_id, group in get_conversation_groups(df):
+        md = conversation_metadata_from_group(group)
+        customer_name = str(md.get("customer_name") or "").strip()
+        customer_phone = str(md.get("customer_phone") or journey_id or "").strip()
+        source_ids = str(md.get("source_conversation_ids") or "").strip()
+        source_count = md.get("source_conversation_count") or 0
+        message_count = int(md.get("total_visible_messages") or len(group))
+        customer_messages = int(md.get("customer_message_count") or 0)
+        agent_messages = int(md.get("agent_message_count") or 0)
+        start_date = str(md.get("conversation_start_date") or "").strip()
+        end_date = str(md.get("conversation_end_date") or "").strip()
+        display_name = customer_name or "Unknown customer"
+        label = (
+            f"{customer_phone} • {display_name} • {source_count} source convs • "
+            f"{message_count} msgs"
+        )
+        search_text = " ".join(
+            [
+                journey_id,
+                customer_name,
+                customer_phone,
+                source_ids,
+                start_date,
+                end_date,
+            ]
+        ).lower()
+        rows.append(
+            {
+                "journey_id": str(journey_id),
+                "customer_name": customer_name,
+                "customer_phone": customer_phone,
+                "source_conversation_ids": source_ids,
+                "source_conversation_count": source_count,
+                "message_count": message_count,
+                "customer_messages": customer_messages,
+                "agent_messages": agent_messages,
+                "conversation_start_date": start_date,
+                "conversation_end_date": end_date,
+                "label": label,
+                "search_text": search_text,
+            }
+        )
+    return pd.DataFrame(rows)
 
 
 def _conversation_filters_with_keys(conv_df: pd.DataFrame, key_prefix: str) -> dict:
@@ -1037,6 +1098,11 @@ def tab_upload() -> None:
             st.error(f"Could not read the CSV file: {e}")
             return
 
+        previous_csv_name = st.session_state.csv_name
+        if previous_csv_name and previous_csv_name != uploaded.name:
+            st.session_state.selected_conversation_ids = None
+            st.session_state.journey_selection_visible_labels = []
+
         st.session_state.csv_name = uploaded.name
         st.session_state.df_raw = df
 
@@ -1343,31 +1409,107 @@ def tab_run() -> None:
 
     target_role = str(st.session_state.message_target_role or "agent")
 
-    # ---- Customer journey selection (first-N vs. random sample) -------------
-    all_ids = (
-        df[JOURNEY_ID_COLUMN].astype(str).drop_duplicates().tolist()
-        if JOURNEY_ID_COLUMN in df.columns
-        else []
-    )
-    selected_ids = st.session_state.selected_conversation_ids
+    # ---- Customer journey selection (first-N, specific customers, random) ---
+    selector_df = _journey_selector_rows(df)
+    all_ids = selector_df["journey_id"].astype(str).tolist() if not selector_df.empty else []
+    selected_ids = _ordered_selected_ids(all_ids, st.session_state.selected_conversation_ids)
+    if selected_ids:
+        st.session_state.selected_conversation_ids = selected_ids
+    elif st.session_state.selected_conversation_ids:
+        st.session_state.selected_conversation_ids = None
+
     st.markdown("### Customer journey selection")
-    pick_cols = st.columns([1, 1, 1, 2])
+    st.caption(
+        "Leave selection empty to run the first N customer journeys from the sidebar. "
+        "Pin specific journeys to evaluate only those customers."
+    )
+
+    search = st.text_input(
+        "Find customer journey",
+        key="journey_selection_query",
+        placeholder="Search by customer name, phone, journey ID, source conversation ID, or date",
+    ).strip().lower()
+
+    filtered_selector_df = selector_df
+    if search and not selector_df.empty:
+        filtered_selector_df = selector_df[
+            selector_df["search_text"].fillna("").astype(str).str.contains(search, regex=False)
+        ]
+
+    max_visible_options = 250
+    visible_selector_df = filtered_selector_df.head(max_visible_options).copy()
+    visible_options = visible_selector_df["label"].tolist() if not visible_selector_df.empty else []
+    label_to_id = (
+        dict(zip(visible_selector_df["label"], visible_selector_df["journey_id"]))
+        if not visible_selector_df.empty
+        else {}
+    )
+    visible_key = "journey_selection_visible_labels"
+    if visible_key in st.session_state:
+        visible_option_set = set(visible_options)
+        st.session_state[visible_key] = [
+            label for label in st.session_state[visible_key] if label in visible_option_set
+        ]
+
+    st.caption(
+        f"Showing {len(visible_selector_df):,} of {len(filtered_selector_df):,} matching journeys "
+        f"({len(selector_df):,} total)."
+    )
+    picked_labels = st.multiselect(
+        "Select customer journeys from the current search results",
+        options=visible_options,
+        key=visible_key,
+        help="Pick one or more matching customer journeys, then add or replace the pinned run selection.",
+    )
+    picked_ids = [label_to_id[label] for label in picked_labels if label in label_to_id]
+
+    pick_cols = st.columns([1, 1, 1, 1, 1])
     with pick_cols[0]:
         if st.button(
-            "🎲 Random sample",
+            "Add selected",
+            use_container_width=True,
+            disabled=not picked_ids,
+            help="Add the selected visible journeys to the pinned run selection.",
+        ):
+            st.session_state.selected_conversation_ids = _ordered_selected_ids(all_ids, selected_ids + picked_ids)
+            st.rerun()
+    with pick_cols[1]:
+        if st.button(
+            "Replace with selected",
+            use_container_width=True,
+            disabled=not picked_ids,
+            help="Run only the selected visible journeys.",
+        ):
+            st.session_state.selected_conversation_ids = _ordered_selected_ids(all_ids, picked_ids)
+            st.rerun()
+    with pick_cols[2]:
+        if st.button(
+            "Select all matches",
+            use_container_width=True,
+            disabled=filtered_selector_df.empty,
+            help="Pin every journey matching the current search. If search is empty, this selects all journeys.",
+        ):
+            st.session_state.selected_conversation_ids = _ordered_selected_ids(
+                all_ids,
+                filtered_selector_df["journey_id"].astype(str).tolist(),
+            )
+            st.rerun()
+    with pick_cols[3]:
+        if st.button(
+            "Random sample",
             use_container_width=True,
             help=(
                 "Pick a random sample of IDs from the uploaded CSV. "
-                "Sample size = 'Max conversations to process' from the sidebar."
+                "Sample size = 'Max customer journeys to process' from the sidebar."
             ),
             disabled=not all_ids,
         ):
             import random
             n = max(1, int(st.session_state.max_conversations or 1))
             n = min(n, len(all_ids))
-            st.session_state.selected_conversation_ids = random.sample(all_ids, n)
+            st.session_state.selected_conversation_ids = _ordered_selected_ids(all_ids, random.sample(all_ids, n))
             st.rerun()
-    with pick_cols[1]:
+    with pick_cols[4]:
         if st.button(
             "Clear selection",
             use_container_width=True,
@@ -1375,18 +1517,33 @@ def tab_run() -> None:
         ):
             st.session_state.selected_conversation_ids = None
             st.rerun()
-    with pick_cols[2]:
-        st.caption(
-            f"**{len(selected_ids):,} pinned**"
-            if selected_ids
-            else "_No selection — runs use the first N customer journeys from the CSV._"
+
+    if selected_ids:
+        st.success(
+            f"{len(selected_ids):,} customer journey/journeys pinned. "
+            "The run will ignore Max customer journeys and evaluate only this pinned selection."
         )
-    with pick_cols[3]:
-        if selected_ids:
-            preview = ", ".join(str(x) for x in selected_ids[:6])
-            if len(selected_ids) > 6:
-                preview += f", … (+{len(selected_ids) - 6} more)"
-            st.caption(f"Pinned IDs: `{preview}`")
+        selected_preview_df = selector_df[selector_df["journey_id"].astype(str).isin(set(selected_ids))].copy()
+        selected_preview_df["order"] = selected_preview_df["journey_id"].astype(str).map(
+            {journey_id: idx for idx, journey_id in enumerate(selected_ids)}
+        )
+        selected_preview_df = selected_preview_df.sort_values("order")
+        preview_cols = [
+            "customer_phone",
+            "customer_name",
+            "source_conversation_count",
+            "message_count",
+            "conversation_start_date",
+            "conversation_end_date",
+        ]
+        with st.expander("Pinned customer journeys", expanded=False):
+            st.dataframe(
+                selected_preview_df[[c for c in preview_cols if c in selected_preview_df.columns]],
+                use_container_width=True,
+                hide_index=True,
+            )
+    else:
+        st.info("No pinned selection. The run will evaluate the first N customer journeys from the CSV.")
 
     # Build the estimate. When a random selection is active, count over the
     # pinned IDs; otherwise apply the max_conversations slice.
@@ -1477,6 +1634,8 @@ def tab_run() -> None:
             "stop_on_error": config.stop_on_error,
             "save_raw_responses": config.save_raw_responses,
             "message_target_role": config.message_target_role,
+            "selected_conversation_ids": config.selected_conversation_ids,
+            "selected_conversation_count": len(config.selected_conversation_ids or []),
             "run_name": (st.session_state.run_name or "").strip(),
         }
         run_name = (st.session_state.run_name or "").strip() or None
