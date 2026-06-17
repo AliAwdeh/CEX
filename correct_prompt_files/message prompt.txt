@@ -247,6 +247,96 @@ Examples:
 - The agent response is likely to make the customer abandon the process.
 - The message mishandles an already escalated situation.
 
+# 7. Frustration Level Definitions
+
+Use these labels exactly:
+
+## none
+
+Use when there is no visible frustration and the target message is unlikely to create frustration.
+
+Examples:
+
+- The agent answers clearly.
+- The agent asks a reasonable missing question.
+- The customer has not shown irritation.
+- The message moves the process forward normally.
+
+## low
+
+Use when there is mild friction, mild uncertainty, or slight avoidable effort, but no clear escalation.
+
+Examples:
+
+- The agent is slightly vague.
+- The agent asks a broad question when a more specific one would be better.
+- The agent does not fully acknowledge the customer but still moves forward.
+- The customer may need a small clarification.
+
+## medium
+
+Use when the message likely causes noticeable frustration or continues an unresolved friction.
+
+Examples:
+
+- The agent partially ignores context.
+- The agent asks for something that may already have been provided but evidence is not fully clear.
+- The agent gives unclear next steps in a process-sensitive moment.
+- The agent fails to properly acknowledge a complaint.
+- The customer has already followed up multiple times and the response is not sufficiently helpful.
+
+## high
+
+Use when the target message clearly damages trust, increases effort, or makes the customer feel ignored.
+
+Examples:
+
+- The agent asks again for information already clearly provided.
+- The agent ignores a direct question or complaint.
+- The agent contradicts previous visible information.
+- The agent creates a loop.
+- The agent gives a dead-end response.
+- The agent fails to address clear frustration.
+- The agent gives wrong or misleading information with likely operational impact.
+- The customer has repeated themselves and the target message still misses the point.
+
+## cancellation_risk
+
+Use when the message creates, continues, or fails to address serious risk of customer loss, cancellation, refund, escalation, or abandonment.
+
+Examples:
+
+- The customer asked to cancel and the agent fails to properly handle it.
+- The customer asks for a refund due to poor service and the agent ignores it.
+- The customer expresses strong distrust and the agent gives a generic response.
+- The agent response is likely to make the customer abandon the process.
+- The message mishandles an already escalated situation.
+
+## Confusion vs Frustration
+
+Do not automatically treat customer confusion, clarification requests, or financial concerns as frustration.
+
+Examples that typically indicate confusion rather than frustration:
+
+* "The message is not clear."
+* "Can you explain?"
+* "What does that mean?"
+* "I don't understand."
+* "How does this work?"
+
+Medium or high frustration should generally require evidence such as:
+
+* Complaints.
+* Negative sentiment.
+* Repeated corrections.
+* Expressions of annoyance.
+* Loss of trust.
+* Escalation requests.
+* Cancellation threats.
+* Strong dissatisfaction.
+
+A customer asking reasonable follow-up questions to understand a process should not automatically be considered highly frustrated.
+
 ---
 
 # 8. Frustration Change Definitions

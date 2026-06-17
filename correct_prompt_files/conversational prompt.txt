@@ -585,6 +585,44 @@ High frustration generally requires strong negative sentiment, repeated complain
 
 Customers who remain cooperative, continue engaging constructively, thank the agent, say "Ok", say "understood", or express relief should generally not be classified as highly frustrated.
 
+## Medium vs High Frustration
+
+Do not classify frustration as high solely because:
+
+* The customer is confused.
+* The customer asks multiple clarification questions.
+* The customer expresses concern about money, payments, fees, or costs.
+* The customer says something is unclear.
+* The customer disagrees with a process or requirement.
+* The customer must ask follow-up questions to understand a complex process.
+
+Use medium frustration when the customer:
+
+* Expresses confusion, concern, disappointment, or annoyance.
+* Questions why something is required.
+* Indicates inconvenience or financial concern.
+* Uses mild negative language such as:
+
+  * "This is confusing."
+  * "This doesn't make sense."
+  * "Why again?"
+  * "The message is not clear."
+  * "I don't understand."
+
+Use high frustration only when there is clear evidence of significant emotional impact, such as:
+
+* Repeated complaints throughout the conversation.
+* Strong negative language.
+* Explicit loss of trust.
+* Statements that the service is unacceptable.
+* Escalation requests caused by dissatisfaction.
+* Demands to speak to a manager.
+* Threats to cancel.
+* Refund requests.
+* Statements indicating they no longer wish to continue.
+* Clear emotional deterioration across the conversation.
+
+Customers who remain cooperative, continue engaging constructively, thank the agent, say "Ok", say "Understood", or continue the process should generally be classified as medium or lower unless stronger evidence exists.
 
 ---
 
