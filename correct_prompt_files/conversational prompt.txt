@@ -17,9 +17,6 @@ You must evaluate:
 
 You must return strict JSON only, matching the required schema exactly.
 
-Required schema:
-{output_schema}
-
 ---
 
 # 1. What You Receive

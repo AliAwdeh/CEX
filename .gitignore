@@ -35,11 +35,11 @@ htmlcov/
 *.mybackup
 
 # SQLite runtime databases and sidecar files
-*.db
-*.db-shm
-*.db-wal
-*.sqlite
-*.sqlite3
+#*.db
+#*.db-shm
+#*.db-wal
+#*.sqlite
+#*.sqlite3
 
 # Exported evaluation outputs
 cx_conversation_results.csv

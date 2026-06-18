@@ -6,7 +6,8 @@
       "Bash(sqlite3 cx_evaluator.db \".tables\")",
       "Bash(sqlite3 cx_evaluator.db \"SELECT id, csv_filename, status, created_at, total_journeys, completed_journeys FROM runs ORDER BY id DESC LIMIT 10;\")",
       "Bash(sqlite3 cx_evaluator.db \".schema runs\")",
-      "Bash(sqlite3 cx_evaluator.db \"SELECT id, name, csv_name, status, started_at, finished_at, n_conversations, n_message_calls, n_errors FROM runs ORDER BY id DESC LIMIT 10;\")"
+      "Bash(sqlite3 cx_evaluator.db \"SELECT id, name, csv_name, status, started_at, finished_at, n_conversations, n_message_calls, n_errors FROM runs ORDER BY id DESC LIMIT 10;\")",
+      "Bash(grep -E \"\\\\.py$|\\\\.txt$|\\\\.md$\")"
     ]
   }
 }
