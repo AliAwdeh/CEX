@@ -15,11 +15,6 @@ from openai import OpenAI
 
 DEFAULT_BASE_URL = "https://langcc.maidstech.ai/v1"
 
-# Hard upper limit on parallel in-flight requests. The evaluator clamps the
-# user's concurrency setting to this value to avoid overloading the API proxy.
-MAX_CONCURRENCY = 16
-
-
 @dataclass
 class APIConfig:
     base_url: str = DEFAULT_BASE_URL
@@ -27,10 +22,10 @@ class APIConfig:
     model: str = ""
     temperature: float = 0.1
     top_p: float = 1.0
-    max_tokens: int = 1500
+    max_tokens: int = 100000
     timeout: float = 60.0
     retries: int = 2
-    concurrency: int = 8
+    concurrency: int = 50
 
 
 def build_client(base_url: str, api_key: str) -> OpenAI:
