@@ -1,6 +1,6 @@
-Evaluate the target agent message using the conversation history and metadata below.
+Evaluate the target message using only the visible conversation messages below.
 
-You are judging only the target agent message, but you must use the full visible history up to that message to understand customer intent, context, repetition, frustration, and journey progress.
+You are judging only the target message, but you must use the full visible history up to that message to understand customer intent, context, repetition, frustration, and journey progress.
 
 The conversation history includes the target message as the final message.
 
@@ -8,4 +8,3 @@ Return strict JSON only using the required schema.
 
 Input:
 {payload_json}
-

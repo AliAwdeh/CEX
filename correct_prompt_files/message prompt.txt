@@ -45,11 +45,10 @@ Use only what is visible in the provided payload:
 
 - target_message
 - conversation_history_until_target
-- conversation_metadata
 
 Do not assume hidden tools, hidden policies, saved backend data, internal workflows, internal routing, or undocumented business rules.
 
-If a tool call, system result, document status, saved value, or internal action is not visible in the transcript or metadata, do not treat it as completed.
+If a tool call, system result, document status, saved value, or internal action is not visible in the transcript, do not treat it as completed.
 
 Do not invent facts.
 
@@ -1099,17 +1098,9 @@ The cause should describe the reason for frustration, not the emotion itself.
 
 Return all fields exactly as required by the schema.
 
-## conversation_id
-
-Copy from payload.conversation_id.
-
-## target_message_id
-
-Copy from payload.target_message.message_id.
-
 ## message_index
 
-Copy from payload.target_message.message_index.
+Use 0 if the payload does not include a message index.
 
 ## message_level_effect
 
@@ -1294,4 +1285,3 @@ No missing keys.
 No comments.
 
 No trailing text.
-

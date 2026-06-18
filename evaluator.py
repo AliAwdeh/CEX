@@ -16,7 +16,7 @@ from typing import Any, Callable, Optional
 
 import pandas as pd
 
-from api_client import APIConfig, MAX_CONCURRENCY, chat_completion
+from api_client import APIConfig, chat_completion
 from prompts import (
     DEFAULT_CONVERSATION_LEVEL_PROMPT,
     DEFAULT_MESSAGE_LEVEL_PROMPT,
@@ -788,7 +788,7 @@ def run_evaluation(
 
     All AI calls — both message-level and conversation-level, across all
     conversations — share ONE ``ThreadPoolExecutor`` whose worker count equals
-    ``config.api.concurrency`` (clamped to ``MAX_CONCURRENCY``). The instant a
+    ``config.api.concurrency``. The instant a
     worker is free it picks the next pending task from the queue, regardless of
     which conversation it belongs to. As soon as the *last* message-level call
     for a given conversation completes, that conversation's conversation-level
@@ -804,7 +804,7 @@ def run_evaluation(
     results = RunResults(started_at=time.time())
     truncate_chars = config.max_chars_per_message if config.truncate_messages else None
 
-    workers = max(1, min(int(getattr(config.api, "concurrency", 1) or 1), MAX_CONCURRENCY))
+    workers = max(1, int(getattr(config.api, "concurrency", 1) or 1))
 
     target_role = (config.message_target_role or "agent").strip().lower()
     if target_role not in ("agent", "customer"):

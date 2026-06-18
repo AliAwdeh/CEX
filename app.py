@@ -16,7 +16,7 @@ import streamlit as st
 import streamlit.components.v1 as components
 import ui_components as ui_components_module
 
-from api_client import APIConfig, DEFAULT_BASE_URL, MAX_CONCURRENCY, build_client, fetch_models
+from api_client import APIConfig, DEFAULT_BASE_URL, build_client, fetch_models
 from data_loader import (
     JOURNEY_ID_COLUMN,
     METADATA_COLUMNS,
@@ -97,11 +97,10 @@ def _init_state() -> None:
         "selected_model": "",
         "temperature": 0.1,
         "top_p": 1.0,
-        "max_tokens": 5000,
+        "max_tokens": 100000,
         "timeout": 300.0,
         "retries": 2,
-        # Always concurrent. Hard upper limit is api_client.MAX_CONCURRENCY.
-        "concurrency": 8,
+        "concurrency": 50,
         "max_conversations": 50,
         "max_agent_messages_per_conv": 500,
         "truncate_messages": False,
@@ -169,7 +168,7 @@ def _load_active_prompts() -> tuple[PromptTemplate, PromptTemplate, int | None, 
 
 
 def _build_api_config() -> APIConfig:
-    concurrency = max(1, min(int(st.session_state.concurrency), MAX_CONCURRENCY))
+    concurrency = max(1, int(st.session_state.concurrency))
     return APIConfig(
         base_url=st.session_state.api_base_url,
         api_key=st.session_state.api_key,
@@ -1014,20 +1013,18 @@ def render_sidebar() -> None:
         st.markdown("### Generation parameters")
         st.slider("Temperature", min_value=0.0, max_value=2.0, step=0.05, key="temperature")
         st.slider("Top P", min_value=0.0, max_value=1.0, step=0.05, key="top_p")
-        st.number_input("Max tokens", min_value=128, max_value=100000, step=64, key="max_tokens")
-        st.number_input("Timeout (seconds)", min_value=5.0, max_value=600.0, step=5.0, key="timeout")
-        st.number_input("Retry count", min_value=0, max_value=10, step=1, key="retries")
-        st.session_state.concurrency = max(1, min(int(st.session_state.concurrency), MAX_CONCURRENCY))
+        st.number_input("Max tokens", min_value=128, step=64, key="max_tokens")
+        st.number_input("Timeout (seconds)", min_value=5.0, step=5.0, key="timeout")
+        st.number_input("Retry count", min_value=0, step=1, key="retries")
+        st.session_state.concurrency = max(1, int(st.session_state.concurrency))
         st.number_input(
             "Concurrency",
             min_value=1,
-            max_value=MAX_CONCURRENCY,
             step=1,
             key="concurrency",
             help=(
                 "Number of message-level API calls dispatched in parallel. "
-                f"Always concurrent and capped at {MAX_CONCURRENCY}. Lower this if "
-                "the API returns 503s, rate limits, or timeouts."
+                "Lower this if the API returns 503s, rate limits, or timeouts."
             ),
         )
 
@@ -1036,14 +1033,12 @@ def render_sidebar() -> None:
         st.number_input(
             "Max customer journeys to process",
             min_value=1,
-            max_value=10000,
             step=1,
             key="max_conversations",
         )
         st.number_input(
             "Max target messages per journey",
             min_value=1,
-            max_value=2000,
             step=1,
             key="max_agent_messages_per_conv",
         )
@@ -1068,7 +1063,6 @@ def render_sidebar() -> None:
             st.number_input(
                 "Max characters per message",
                 min_value=200,
-                max_value=20000,
                 step=100,
                 key="max_chars_per_message",
             )

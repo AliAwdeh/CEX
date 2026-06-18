@@ -117,7 +117,7 @@ Two evaluation modes (driven by the target's role):
 
 Do not judge the message in isolation. Judge it relative to the surrounding visible journey.
 
-Focus only on the visible customer experience. Do not assume hidden tool calls, hidden policies, or internal execution details unless they appear in the visible transcript or provided metadata.
+Focus only on the visible customer experience. Do not assume hidden tool calls, hidden policies, or internal execution details unless they appear in the visible transcript.
 
 Return strict JSON only. Do not include markdown. Do not include explanations outside the JSON.
 
@@ -170,7 +170,7 @@ DEFAULT_MESSAGE_LEVEL_OUTPUT_SCHEMA = """{
 }"""
 
 
-DEFAULT_MESSAGE_LEVEL_USER_TEMPLATE = """Evaluate the target agent message using the conversation history and metadata below.
+DEFAULT_MESSAGE_LEVEL_USER_TEMPLATE = """Evaluate the target message using only the visible conversation messages below.
 
 Return strict JSON only using the required schema.
 
@@ -585,29 +585,18 @@ def build_message_level_payload(
             return text[:truncate_chars] + "...[truncated]"
         return text
 
+    def evaluator_role(message: dict) -> str:
+        return "customer" if str(message.get("sender_role", "")).lower() == "customer" else "agent"
+
     target = {
-        "message_index": target_message.get("message_index", 0),
-        "appended_message_index": target_message.get(
-            "appended_message_index",
-            target_message.get("message_index", 0),
-        ),
-        "source_conversation_id": target_message.get("source_conversation_id"),
-        "message_time": str(target_message.get("message_time", "")),
-        "sender_role": target_message.get("sender_role", "agent"),
+        "sender_role": evaluator_role(target_message),
         "message_text": trim(target_message.get("message_text", "")),
     }
     history_clean = []
     for m in history:
         history_clean.append(
             {
-                "message_index": m.get("message_index", 0),
-                "appended_message_index": m.get(
-                    "appended_message_index",
-                    m.get("message_index", 0),
-                ),
-                "source_conversation_id": m.get("source_conversation_id"),
-                "message_time": str(m.get("message_time", "")),
-                "sender_role": m.get("sender_role", ""),
+                "sender_role": evaluator_role(m),
                 "message_text": trim(m.get("message_text", "")),
             }
         )
@@ -615,7 +604,6 @@ def build_message_level_payload(
     return {
         "target_message": target,
         "conversation_history_until_target": history_clean,
-        "conversation_metadata": _sanitize_conversation_metadata_for_llm(conversation_metadata),
     }
 
 
