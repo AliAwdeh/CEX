@@ -590,6 +590,7 @@ def build_message_level_payload(
 
     target = {
         "sender_role": evaluator_role(target_message),
+        "message_time": str(target_message.get("message_time", "")),
         "message_text": trim(target_message.get("message_text", "")),
     }
     history_clean = []
@@ -597,6 +598,7 @@ def build_message_level_payload(
         history_clean.append(
             {
                 "sender_role": evaluator_role(m),
+                "message_time": str(m.get("message_time", "")),
                 "message_text": trim(m.get("message_text", "")),
             }
         )
