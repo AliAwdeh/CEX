@@ -164,8 +164,14 @@ def _backfill_conversation_parsed_json(pj: Any) -> None:
             if old_class_l.startswith(("unhandled", "not handled"))
             else "handled"
         )
-    if "customer_experience" not in pj or not pj["customer_experience"]:
-        pj["customer_experience"] = "bad" if old_severity == "many" or "many" in old_class_l else "good"
+    legacy_bad_experience = old_severity == "many" or any(
+        marker in old_class_l for marker in ("many", "caused", "frustration")
+    )
+    customer_experience = str(pj.get("customer_experience", "") or "").strip().lower()
+    if customer_experience not in {"good", "bad"} or (
+        customer_experience == "good" and legacy_bad_experience
+    ):
+        pj["customer_experience"] = "bad" if legacy_bad_experience else "good"
     if "unhandled_resolution_subtype" not in pj or not pj["unhandled_resolution_subtype"]:
         pj["unhandled_resolution_subtype"] = (
             "not_applicable"

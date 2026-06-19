@@ -856,6 +856,48 @@ Choose exactly one:
 - high
 - cancellation_risk
 
+## conversation_score
+
+Return a numeric score on a 0-100 perfect-scale rubric.
+
+Components:
+
+- resolution_score: 0-20
+  - 20 = objective fully handled or direct current status/answer given
+  - 10 = partial progress or clear pending state
+  - 0 = objective unresolved with no usable answer/step
+- context_understanding_score: 0-20
+  - 20 = used visible context correctly and answered the real question
+  - 10 = some context used, but missed or delayed important context
+  - 0 = ignored context, repeated requests, or missed the direct question
+- customer_effort_score: 0-20
+  - 20 = low effort, no repetition, no unnecessary collection
+  - 10 = some avoidable effort
+  - 0 = high effort, repeated asks, looping, or unnecessary collection
+- trust_frustration_risk_score: 0-40
+  - 40 = no visible trust/frustration risk
+  - 20 = moderate risk from vague updates, delay, or unclear guidance
+  - 0 = high frustration, cancellation/refund/escalation risk, or severe trust damage
+
+raw_total_score = sum of the four component scores.
+
+final_score = raw_total_score unless there is a severe customer-facing failure. Cap final_score at:
+
+- 79 if customer_experience = bad
+- 59 if handled_status = unhandled
+- 39 if the customer asked for a direct status/process answer and the chatbot only said it would check, revert, or update later
+- 29 if cancellation/refund/escalation risk remains unresolved
+
+score_rating:
+
+- Excellent: 90-100
+- Good: 75-89
+- Fair: 60-74
+- Poor: 40-59
+- Critical: 0-39
+
+score_explanation must briefly explain the main score drivers.
+
 ## main_issue
 
 If no meaningful issue exists:

@@ -388,7 +388,7 @@ def _conv_dataframe_from_results() -> pd.DataFrame:
                 cr.get("computed_metadata", {}) or {},
             )
         )
-    return build_conversation_table(rows)
+    return _normalize_conversation_dataframe_markers(build_conversation_table(rows))
 
 
 def _msg_dataframe_from_results() -> pd.DataFrame:
@@ -397,6 +397,80 @@ def _msg_dataframe_from_results() -> pd.DataFrame:
         return pd.DataFrame()
     rows = [flatten_message_row(m) for m in rr.message_level_results]
     return build_message_table(rows)
+
+
+def _normalize_conversation_dataframe_markers(df: pd.DataFrame) -> pd.DataFrame:
+    """Normalize old and new marker columns before any UI aggregation."""
+    if df.empty:
+        return df
+    out = df.copy()
+
+    def norm_series(col: str, default: str = "") -> pd.Series:
+        if col not in out.columns:
+            return pd.Series([default] * len(out), index=out.index)
+        return (
+            out[col]
+            .fillna(default)
+            .astype(str)
+            .str.strip()
+            .str.lower()
+            .str.replace(" ", "_", regex=False)
+            .str.replace("-", "_", regex=False)
+        )
+
+    final_class = (
+        out["final_classification"].fillna("").astype(str).str.strip().str.lower()
+        if "final_classification" in out.columns
+        else pd.Series([""] * len(out), index=out.index)
+    )
+
+    handled = norm_series("handled_status")
+    handled = handled.where(handled.isin(["handled", "unhandled"]), None)
+    handled = handled.mask(handled.isna() & final_class.str.startswith(("unhandled", "not handled")), "unhandled")
+    handled = handled.mask(handled.isna() & final_class.str.startswith("handled"), "handled")
+    out["handled_status"] = handled
+
+    experience = norm_series("customer_experience")
+    old_severity = norm_series("cx_issue_severity")
+    legacy_bad_experience = (old_severity == "many") | final_class.str.contains(
+        "many|caused|frustration",
+        regex=True,
+    )
+    legacy_good_experience = old_severity.isin(["zero_minimal", "minimal"]) | final_class.str.contains("minimal")
+    experience = experience.replace({"many": "bad", "zero_minimal": "good", "minimal": "good"})
+    experience = experience.mask(legacy_bad_experience, "bad")
+    valid_experience = experience.isin(["good", "bad"])
+    experience = experience.where(valid_experience, None)
+    experience = experience.mask(experience.isna() & legacy_bad_experience, "bad")
+    experience = experience.mask(experience.isna() & legacy_good_experience, "good")
+    out["customer_experience"] = experience
+
+    if "frustration_detected" in out.columns:
+        out["frustration_detected"] = (
+            out["frustration_detected"]
+            .fillna(False)
+            .map(lambda value: str(value).strip().lower() in {"true", "1", "yes", "y", "frustrated"})
+        )
+    else:
+        out["frustration_detected"] = final_class.str.contains("frustration")
+
+    origin = norm_series("frustration_origin", "none")
+    origin = origin.replace({"customer": "customer_side", "our": "our_side", "agent": "our_side"})
+    main_origin = norm_series("main_issue_origin", "none")
+    main_origin = main_origin.replace({"customer": "customer_side", "our": "our_side", "agent": "our_side"})
+    valid_origin = origin.isin(["our_side", "customer_side", "shared", "none"])
+    origin = origin.where(valid_origin, None)
+    origin = origin.mask(origin.isna() & main_origin.isin(["our_side", "customer_side", "shared", "none"]), main_origin)
+    origin = origin.mask(origin.isna() & out["frustration_detected"] & final_class.str.contains("caused"), "our_side")
+    out["frustration_origin"] = origin.fillna("none")
+
+    if "main_issue_origin" in out.columns:
+        out["main_issue_origin"] = main_origin.where(
+            main_origin.isin(["our_side", "customer_side", "shared", "none"]),
+            out["frustration_origin"],
+        )
+
+    return out
 
 
 def _ordered_selected_ids(all_ids: list[str], selected_ids: list[str] | None) -> list[str]:
@@ -2062,6 +2136,27 @@ def _safe_col(df: pd.DataFrame, col: str, default: Any = "") -> pd.Series:
     return pd.Series([default] * len(df), index=df.index)
 
 
+def _norm_marker_series(df: pd.DataFrame, col: str, default: str = "") -> pd.Series:
+    series = _safe_col(df, col, default)
+    return (
+        series.fillna(default)
+        .astype(str)
+        .str.strip()
+        .str.lower()
+        .str.replace(" ", "_", regex=False)
+        .str.replace("-", "_", regex=False)
+    )
+
+
+def _bool_marker_series(df: pd.DataFrame, col: str, default: bool = False) -> pd.Series:
+    if col not in df.columns:
+        return pd.Series([default] * len(df), index=df.index)
+    return (
+        df[col]
+        .map(lambda value: str(value if value is not None else default).strip().lower() in {"true", "1", "yes", "y", "frustrated"})
+    )
+
+
 def _kpi_card_html(label: str, value: str, sub: str, segments: list[tuple[str, int, str]]) -> str:
     """Render a KPI card with a mini stacked bar and color-coded legend."""
     total = sum(max(int(c), 0) for _, c, _ in segments) or 1
@@ -2128,19 +2223,22 @@ def _section_header(title: str, caption: str | None = None) -> None:
 
 
 def _render_kpi_strip(filtered: pd.DataFrame, msg_df: pd.DataFrame, agg: dict, total: int) -> None:
-    handled = int((_safe_col(filtered, "handled_status") == "handled").sum())
-    unhandled = int((_safe_col(filtered, "handled_status") == "unhandled").sum())
-    bad = int((_safe_col(filtered, "customer_experience") == "bad").sum())
-    good = int((_safe_col(filtered, "customer_experience") == "good").sum())
+    handled_series = _norm_marker_series(filtered, "handled_status")
+    experience_series = _norm_marker_series(filtered, "customer_experience")
+    experience_series = experience_series.replace({"many": "bad", "zero_minimal": "good", "minimal": "good"})
+    handled = int((handled_series == "handled").sum())
+    unhandled = int((handled_series == "unhandled").sum())
+    bad = int((experience_series == "bad").sum())
+    good = int((experience_series == "good").sum())
+    unknown_experience = max(total - bad - good, 0)
 
-    if "frustration_detected" in filtered.columns:
-        frustrated = int(filtered["frustration_detected"].fillna(False).astype(bool).sum())
-    else:
-        frustrated = 0
+    frustrated = int(_bool_marker_series(filtered, "frustration_detected").sum())
     calm = total - frustrated
 
     if "frustration_origin" in filtered.columns:
-        oc = filtered["frustration_origin"].fillna("none").astype(str).value_counts().to_dict()
+        origin_series = _norm_marker_series(filtered, "frustration_origin", "none")
+        origin_series = origin_series.replace({"customer": "customer_side", "our": "our_side", "agent": "our_side"})
+        oc = origin_series.value_counts().to_dict()
     else:
         oc = {}
     our_side = int(oc.get("our_side", 0))
@@ -2184,6 +2282,7 @@ def _render_kpi_strip(filtered: pd.DataFrame, msg_df: pd.DataFrame, agg: dict, t
             [
                 ("Bad", bad, _DASH_COLORS["many"]),
                 ("Good", good, _DASH_COLORS["minimal"]),
+                ("Unknown", unknown_experience, _DASH_COLORS["unclear"]),
             ],
         ),
         _kpi_card_html(
@@ -2219,18 +2318,17 @@ def _render_outcome_sunburst(filtered: pd.DataFrame) -> None:
         st.caption("Sunburst unavailable.")
         return
     work = filtered.copy()
-    work["Outcome"] = work["handled_status"].fillna("unknown").map(
+    work["Outcome"] = _norm_marker_series(work, "handled_status", "unknown").map(
         {"handled": "Handled", "unhandled": "Not handled"}
     ).fillna("Unknown")
-    work["Experience"] = _safe_col(work, "customer_experience", "unknown").fillna("unknown").map(
+    experience_series = _norm_marker_series(work, "customer_experience", "unknown")
+    experience_series = experience_series.replace({"many": "bad", "zero_minimal": "good", "minimal": "good"})
+    work["Experience"] = experience_series.map(
         {"bad": "Bad", "good": "Good"}
     ).fillna("Unknown")
-    if "frustration_detected" in work.columns:
-        work["Frustration"] = work["frustration_detected"].fillna(False).astype(bool).map(
-            {True: "Frustrated", False: "Calm"}
-        )
-    else:
-        work["Frustration"] = "Unknown"
+    work["Frustration"] = _bool_marker_series(work, "frustration_detected").map(
+        {True: "Frustrated", False: "Calm"}
+    )
 
     grp = work.groupby(["Outcome", "Experience", "Frustration"]).size().reset_index(name="Count")
     grp = grp[grp["Count"] > 0]
@@ -2268,7 +2366,7 @@ def _render_outcome_cascade(filtered: pd.DataFrame, total: int) -> None:
         ("handled", "Handled", _DASH_COLORS["handled"]),
         ("unhandled", "Not handled", _DASH_COLORS["unhandled"]),
     ):
-        outcome_df = filtered[_safe_col(filtered, "handled_status") == outcome_val]
+        outcome_df = filtered[_norm_marker_series(filtered, "handled_status") == outcome_val]
         outcome_count = int(len(outcome_df))
         if outcome_count == 0:
             continue
@@ -2277,15 +2375,14 @@ def _render_outcome_cascade(filtered: pd.DataFrame, total: int) -> None:
             ("bad", "Bad experience", _DASH_COLORS["many"]),
             ("good", "Good experience", _DASH_COLORS["minimal"]),
         ):
-            sev_df = outcome_df[_safe_col(outcome_df, "customer_experience") == sev_val]
+            experience_series = _norm_marker_series(outcome_df, "customer_experience")
+            experience_series = experience_series.replace({"many": "bad", "zero_minimal": "good", "minimal": "good"})
+            sev_df = outcome_df[experience_series == sev_val]
             sev_count = int(len(sev_df))
             if sev_count == 0:
                 continue
             chunks.append(_node_html(sev_label, sev_count, outcome_count, total, 1, sev_color))
-            if "frustration_detected" in sev_df.columns:
-                fr_yes = int(sev_df["frustration_detected"].fillna(False).astype(bool).sum())
-            else:
-                fr_yes = 0
+            fr_yes = int(_bool_marker_series(sev_df, "frustration_detected").sum())
             fr_no = sev_count - fr_yes
             if fr_yes:
                 chunks.append(_node_html("Frustrated", fr_yes, sev_count, total, 2, _DASH_COLORS["frustrated"]))
@@ -2301,7 +2398,9 @@ def _render_issue_sunburst(filtered: pd.DataFrame) -> None:
     work = filtered.copy()
     work["Origin"] = work["main_issue_origin"].fillna("none").astype(str).apply(humanize_label)
     work["Issue type"] = _safe_col(work, "main_issue_type", "none").fillna("none").astype(str).apply(humanize_label)
-    work["Experience"] = _safe_col(work, "customer_experience", "unknown").fillna("unknown").map(
+    experience_series = _norm_marker_series(work, "customer_experience", "unknown")
+    experience_series = experience_series.replace({"many": "bad", "zero_minimal": "good", "minimal": "good"})
+    work["Experience"] = experience_series.map(
         {"bad": "Bad", "good": "Good"}
     ).fillna("Unknown")
     grp = work.groupby(["Origin", "Issue type", "Experience"]).size().reset_index(name="Count")
@@ -2373,10 +2472,7 @@ def _render_frustration_funnel(filtered: pd.DataFrame, total: int) -> None:
     if not HAS_PLOTLY or filtered.empty:
         st.caption("Funnel unavailable.")
         return
-    frust_detected = (
-        int(filtered["frustration_detected"].fillna(False).astype(bool).sum())
-        if "frustration_detected" in filtered.columns else 0
-    )
+    frust_detected = int(_bool_marker_series(filtered, "frustration_detected").sum())
     if "frustration_timing" in filtered.columns:
         multi_or_during = int(
             filtered["frustration_timing"].fillna("").isin(["during", "multiple"]).sum()
@@ -2416,7 +2512,7 @@ def _render_frustration_cascade(filtered: pd.DataFrame, total: int) -> None:
         st.caption("No data.")
         return
     chunks: list[str] = []
-    frust_yes_df = filtered[filtered["frustration_detected"].fillna(False).astype(bool)]
+    frust_yes_df = filtered[_bool_marker_series(filtered, "frustration_detected")]
     frust_yes = int(len(frust_yes_df))
     frust_no = total - frust_yes
     chunks.append(
@@ -2493,13 +2589,17 @@ def _render_overall_sankey(filtered: pd.DataFrame) -> None:
         st.caption("Sankey unavailable.")
         return
     work = filtered.copy()
-    work["L1 Outcome"] = _safe_col(work, "handled_status", "unknown").fillna("unknown").map(
+    work["L1 Outcome"] = _norm_marker_series(work, "handled_status", "unknown").map(
         {"handled": "Handled", "unhandled": "Not handled"}
     ).fillna("Unknown")
-    work["L2 Experience"] = _safe_col(work, "customer_experience", "unknown").fillna("unknown").map(
+    experience_series = _norm_marker_series(work, "customer_experience", "unknown")
+    experience_series = experience_series.replace({"many": "bad", "zero_minimal": "good", "minimal": "good"})
+    work["L2 Experience"] = experience_series.map(
         {"bad": "Bad experience", "good": "Good experience"}
     ).fillna("Unknown")
-    work["L3 Frustration Origin"] = _safe_col(work, "frustration_origin", "none").fillna("none").astype(str).apply(humanize_label)
+    origin_series = _norm_marker_series(work, "frustration_origin", "none")
+    origin_series = origin_series.replace({"customer": "customer_side", "our": "our_side", "agent": "our_side"})
+    work["L3 Frustration Origin"] = origin_series.apply(humanize_label)
     work["L4 Frustration"] = _safe_col(work, "frustration_timing", "none").fillna("none").astype(str).apply(humanize_label)
 
     levels = ["L1 Outcome", "L2 Experience", "L3 Frustration Origin", "L4 Frustration"]
@@ -2635,18 +2735,20 @@ def _overview_node_df(
     if conv_df.empty or "handled_status" not in conv_df.columns:
         return conv_df.iloc[0:0]
 
-    mask = conv_df["handled_status"].astype(str).str.strip().str.lower() == handled_status
+    mask = _norm_marker_series(conv_df, "handled_status") == handled_status
 
     if subtype is not None and "unhandled_resolution_subtype" in conv_df.columns:
-        sub = conv_df["unhandled_resolution_subtype"].astype(str).str.strip().str.lower()
+        sub = _norm_marker_series(conv_df, "unhandled_resolution_subtype")
         mask &= sub == subtype
 
     if customer_experience is not None and "customer_experience" in conv_df.columns:
-        exp = conv_df["customer_experience"].astype(str).str.strip().str.lower()
+        exp = _norm_marker_series(conv_df, "customer_experience")
+        exp = exp.replace({"many": "bad", "zero_minimal": "good", "minimal": "good"})
         mask &= exp == customer_experience
 
     if frustration_origin is not None and "frustration_origin" in conv_df.columns:
-        origin = conv_df["frustration_origin"].astype(str).str.strip().str.lower()
+        origin = _norm_marker_series(conv_df, "frustration_origin")
+        origin = origin.replace({"customer": "customer_side", "our": "our_side", "agent": "our_side"})
         mask &= origin == frustration_origin
 
     return conv_df[mask]
@@ -3105,12 +3207,12 @@ def tab_review() -> None:
         ("Customer journeys shown", f"{len(filtered_df):,}", None),
         (
             "Handled",
-            f"{int((filtered_df.get('handled_status') == 'handled').sum()):,}",
+            f"{int((_norm_marker_series(filtered_df, 'handled_status') == 'handled').sum()):,}",
             None,
         ),
         (
             "Need human review",
-            f"{int(filtered_df.get('manual_review_required', pd.Series(dtype=bool)).fillna(False).astype(bool).sum()):,}",
+            f"{int(_bool_marker_series(filtered_df, 'manual_review_required').sum()):,}",
             None,
         ),
         (
@@ -3147,6 +3249,35 @@ def tab_review() -> None:
         index = max(0, min(index, len(ordered_ids) - 1))
         st.session_state.review_selected_conversation_id = ordered_ids[index]
 
+    def render_review_nav(position: str) -> None:
+        st.markdown("<div style='height: 1rem'></div>", unsafe_allow_html=True)
+        nav_cols = st.columns([2.7, 1.15, 1.15, 1.45, 2.7])
+        with nav_cols[1]:
+            if st.button(
+                "Previous",
+                key=f"review_prev_{position}",
+                use_container_width=True,
+                disabled=current_index <= 0,
+            ):
+                set_review_index(current_index - 1)
+                st.rerun()
+        with nav_cols[2]:
+            if st.button(
+                "Next",
+                key=f"review_next_{position}",
+                use_container_width=True,
+                disabled=current_index >= len(ordered_ids) - 1,
+            ):
+                set_review_index(current_index + 1)
+                st.rerun()
+        with nav_cols[3]:
+            st.markdown(
+                f"<div style='height: 2.5rem; display: flex; align-items: center; "
+                f"justify-content: center; color: #94a3b8;'>"
+                f"Journey {current_index + 1:,} of {len(ordered_ids):,}</div>",
+                unsafe_allow_html=True,
+            )
+
     selection = st.selectbox(
         "Open a customer journey",
         options,
@@ -3157,27 +3288,7 @@ def tab_review() -> None:
     st.session_state.review_selected_conversation_id = target_id
     current_index = ordered_ids.index(target_id)
 
-    nav_cols = st.columns([1.15, 1.15, 1.3, 5.4])
-    with nav_cols[0]:
-        if st.button(
-            "Previous",
-            key="review_prev_top",
-            use_container_width=True,
-            disabled=current_index <= 0,
-        ):
-            set_review_index(current_index - 1)
-            st.rerun()
-    with nav_cols[1]:
-        if st.button(
-            "Next",
-            key="review_next_top",
-            use_container_width=True,
-            disabled=current_index >= len(ordered_ids) - 1,
-        ):
-            set_review_index(current_index + 1)
-            st.rerun()
-    with nav_cols[2]:
-        st.caption(f"Journey {current_index + 1:,} of {len(ordered_ids):,}")
+    render_review_nav("top")
     target_cr = next((c for c in rr.conversation_results if c.get("conversation_id") == target_id), None)
     if not target_cr:
         st.error("Customer journey not found.")
@@ -3199,27 +3310,7 @@ def tab_review() -> None:
             message_results=msgs,
         )
 
-    bottom_nav_cols = st.columns([1.15, 1.15, 1.3, 5.4])
-    with bottom_nav_cols[0]:
-        if st.button(
-            "Previous",
-            key="review_prev_bottom",
-            use_container_width=True,
-            disabled=current_index <= 0,
-        ):
-            set_review_index(current_index - 1)
-            st.rerun()
-    with bottom_nav_cols[1]:
-        if st.button(
-            "Next",
-            key="review_next_bottom",
-            use_container_width=True,
-            disabled=current_index >= len(ordered_ids) - 1,
-        ):
-            set_review_index(current_index + 1)
-            st.rerun()
-    with bottom_nav_cols[2]:
-        st.caption(f"Journey {current_index + 1:,} of {len(ordered_ids):,}")
+    render_review_nav("bottom")
 
 
 # --------- Tab: Exports ---------

@@ -451,9 +451,15 @@ def validate_conversation_level_result(data: dict) -> dict:
     elif subtype == "not_applicable" or subtype not in _UNHANDLED_SUBTYPES:
         subtype = "totally_unresolved"
 
+    old_classification_l = old_classification.lower()
+    legacy_bad_experience = old_severity == "many" or any(
+        marker in old_classification_l for marker in ("many", "caused", "frustration")
+    )
     customer_experience = str(data.get("customer_experience", "") or "").strip().lower()
-    if customer_experience not in _CUSTOMER_EXPERIENCES:
-        customer_experience = "bad" if old_severity == "many" else "good"
+    if customer_experience not in _CUSTOMER_EXPERIENCES or (
+        customer_experience == "good" and legacy_bad_experience
+    ):
+        customer_experience = "bad" if legacy_bad_experience else "good"
 
     main = data.get("main_issue") or {}
     if not isinstance(main, dict):
@@ -542,6 +548,10 @@ def validate_conversation_level_result(data: dict) -> dict:
     if max_fl not in {"none", "low", "medium", "high", "cancellation_risk"}:
         max_fl = "none"
     out["max_frustration_level"] = max_fl
+
+    conversation_score = _normalize_conversation_score(data.get("conversation_score"))
+    if conversation_score:
+        out["conversation_score"] = conversation_score
 
     if not main_out["issue_exists"]:
         main_out["issue_origin"] = "none"

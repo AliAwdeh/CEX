@@ -158,6 +158,31 @@ def _score_color(value: Any, rating: str | None = None) -> str:
     return "#7f1d1d"
 
 
+def _has_real_conversation_score(score: dict) -> bool:
+    values = [
+        score.get("resolution_score"),
+        score.get("context_understanding_score"),
+        score.get("customer_effort_score"),
+        score.get("trust_frustration_risk_score", score.get("frustration_risk_score")),
+        score.get("raw_total_score"),
+        score.get("final_score"),
+    ]
+    if not any(v not in (None, "", "none", "None") for v in values):
+        return False
+    all_zero = True
+    for value in values:
+        if value in (None, "", "none", "None"):
+            continue
+        try:
+            if float(value) != 0.0:
+                all_zero = False
+                break
+        except (TypeError, ValueError):
+            all_zero = False
+            break
+    return not (all_zero and not str(score.get("score_explanation", "") or "").strip())
+
+
 def metric_row(metrics: list[tuple[str, Any, str | None]]) -> None:
     """Render a row of st.metric cards from (label, value, delta) tuples."""
     cols = st.columns(len(metrics))
@@ -599,6 +624,8 @@ def render_conversation_summary_card(conv_result: dict) -> None:
     score = pj.get("conversation_score") or {}
     if not isinstance(score, dict):
         score = {}
+    if score and not _has_real_conversation_score(score):
+        score = {}
 
     color = "#16a34a" if handled == "handled" and experience == "good" else "#dc2626" if handled == "unhandled" and experience == "bad" else "#d97706"
     subtype_display = humanize_label(subtype) or "n/a"
@@ -929,10 +956,15 @@ def apply_conversation_filters(conv_df: pd.DataFrame, filters: dict) -> pd.DataF
     in_filter("main_issue_origin", "main_issue_origin")
     in_filter("main_issue_type", "main_issue_type")
     mr = filters.get("manual_review")
+    manual_review_series = None
+    if "manual_review_required" in conv_df.columns:
+        manual_review_series = conv_df["manual_review_required"].map(
+            lambda value: str(value if value is not None else False).strip().lower() in {"true", "1", "yes", "y"}
+        )
     if mr == "Only manual review" and "manual_review_required" in conv_df.columns:
-        mask &= conv_df["manual_review_required"].fillna(False).astype(bool)
+        mask &= manual_review_series
     elif mr == "Only no manual review" and "manual_review_required" in conv_df.columns:
-        mask &= ~conv_df["manual_review_required"].fillna(False).astype(bool)
+        mask &= ~manual_review_series
 
     dr = filters.get("date_range")
     if dr and "conversation_start_date" in conv_df.columns:

@@ -39,6 +39,32 @@ def _flatten_conversation_score(score: Any) -> dict[str, Any]:
     if not isinstance(score, dict):
         return {}
 
+    score_values = [
+        score.get("resolution_score"),
+        score.get("context_understanding_score"),
+        score.get("customer_effort_score"),
+        score.get("trust_frustration_risk_score", score.get("frustration_risk_score")),
+        score.get("raw_total_score"),
+        score.get("final_score"),
+    ]
+    has_real_score = any(v not in (None, "", "none", "None") for v in score_values)
+    if not has_real_score:
+        return {}
+
+    all_zero = True
+    for value in score_values:
+        if value in (None, "", "none", "None"):
+            continue
+        try:
+            if float(value) != 0.0:
+                all_zero = False
+                break
+        except (TypeError, ValueError):
+            all_zero = False
+            break
+    if all_zero and not str(score.get("score_explanation", "") or "").strip():
+        return {}
+
     return {
         "score_resolution": score.get("resolution_score"),
         "score_context_understanding": score.get("context_understanding_score"),
@@ -52,6 +78,72 @@ def _flatten_conversation_score(score: Any) -> dict[str, Any]:
         "score_rating": score.get("score_rating"),
         "score_explanation": score.get("score_explanation"),
     }
+
+
+def _norm_text(value: Any) -> str:
+    return str(value or "").strip().lower().replace(" ", "_").replace("-", "_")
+
+
+def _normalize_handled_status(cl: dict) -> str | None:
+    handled = _norm_text(cl.get("handled_status"))
+    if handled in {"handled", "unhandled"}:
+        return handled
+    old_class = str(cl.get("final_classification", "") or "").strip().lower()
+    if old_class.startswith(("unhandled", "not handled")):
+        return "unhandled"
+    if old_class.startswith("handled"):
+        return "handled"
+    return None
+
+
+def _normalize_customer_experience(cl: dict) -> str | None:
+    experience = _norm_text(cl.get("customer_experience"))
+    old_severity = _norm_text(cl.get("cx_issue_severity"))
+    old_class = str(cl.get("final_classification", "") or "").strip().lower()
+    legacy_bad = old_severity == "many" or any(
+        marker in old_class for marker in ("many", "caused", "frustration")
+    )
+    if legacy_bad:
+        return "bad"
+    if experience in {"good", "bad"}:
+        return experience
+    if old_severity in {"zero_minimal", "minimal", "none"} or "minimal" in old_class:
+        return "good"
+    return None
+
+
+def _normalize_origin(value: Any) -> str | None:
+    origin = _norm_text(value)
+    if origin in {"our_side", "customer_side", "shared", "none"}:
+        return origin
+    if origin in {"our", "agent", "company", "business"}:
+        return "our_side"
+    if origin == "customer":
+        return "customer_side"
+    return None
+
+
+def _normalize_frustration_detected(cl: dict) -> bool:
+    raw = cl.get("frustration_detected")
+    if isinstance(raw, bool):
+        return raw
+    if _norm_text(raw) in {"true", "yes", "1", "frustrated"}:
+        return True
+    old_class = str(cl.get("final_classification", "") or "")
+    return "frustration" in old_class.lower()
+
+
+def _normalize_frustration_origin(cl: dict, main_issue: dict) -> str:
+    origin = _normalize_origin(cl.get("frustration_origin"))
+    if origin:
+        return origin
+    origin = _normalize_origin(cl.get("main_issue_origin") or main_issue.get("issue_origin"))
+    if origin:
+        return origin
+    old_class = str(cl.get("final_classification", "") or "").lower()
+    if _normalize_frustration_detected(cl) and "caused" in old_class:
+        return "our_side"
+    return "none"
 
 
 
@@ -143,6 +235,19 @@ def flatten_conversation_row(
     """Flatten one conversation's results into a single CSV-friendly row."""
     cl = conv_result.get("parsed_json", {}) or {}
     main_issue = cl.get("main_issue", {}) or {}
+    if not isinstance(main_issue, dict):
+        main_issue = {}
+    handled_status = _normalize_handled_status(cl)
+    customer_experience = _normalize_customer_experience(cl)
+    frustration_detected = _normalize_frustration_detected(cl)
+    frustration_origin = _normalize_frustration_origin(cl, main_issue)
+    main_issue_origin = (
+        _normalize_origin(main_issue.get("issue_origin") or cl.get("main_issue_origin"))
+        or "none"
+    )
+    main_issue_type = main_issue.get("issue_type", cl.get("main_issue_type"))
+    main_issue_summary = main_issue.get("issue_summary", cl.get("main_issue_summary"))
+    customer_impact = main_issue.get("customer_impact", cl.get("customer_impact"))
 
     def get_md(*keys: str) -> Any:
         for k in keys:
@@ -162,10 +267,12 @@ def flatten_conversation_row(
         "conversation_status": get_md("conversation_status"),
         "customer_objective_type": cl.get("customer_objective_type"),
         "customer_primary_objective": cl.get("customer_primary_objective"),
-        "handled_status": cl.get("handled_status"),
-        "customer_experience": cl.get("customer_experience"),
-        "frustration_detected": cl.get("frustration_detected"),
-        "frustration_origin": cl.get("frustration_origin"),
+        "final_classification": cl.get("final_classification"),
+        "cx_issue_severity": cl.get("cx_issue_severity"),
+        "handled_status": handled_status,
+        "customer_experience": customer_experience,
+        "frustration_detected": frustration_detected,
+        "frustration_origin": frustration_origin,
         "customer_started_frustrated": cl.get("customer_started_frustrated"),
         "customer_became_frustrated_during_chat": cl.get("customer_became_frustrated_during_chat"),
         "customer_ended_frustrated": cl.get("customer_ended_frustrated"),
@@ -174,10 +281,10 @@ def flatten_conversation_row(
         "final_customer_sentiment": cl.get("final_customer_sentiment"),
         "max_frustration_level": cl.get("max_frustration_level"),
         "main_issue_exists": main_issue.get("issue_exists"),
-        "main_issue_origin": main_issue.get("issue_origin"),
-        "main_issue_type": main_issue.get("issue_type"),
-        "main_issue_summary": main_issue.get("issue_summary"),
-        "customer_impact": main_issue.get("customer_impact"),
+        "main_issue_origin": main_issue_origin,
+        "main_issue_type": main_issue_type,
+        "main_issue_summary": main_issue_summary,
+        "customer_impact": customer_impact,
         "all_detected_issues": " | ".join(
             [
                 f"{i.get('issue_type', '')}: {i.get('issue_summary', '')}".strip(": ")
@@ -286,10 +393,35 @@ def dashboard_aggregates(conv_df: pd.DataFrame) -> dict:
 
     total = int(len(conv_df))
 
-    def safe_pct(col: str, value: Any) -> float:
+    def norm_series(col: str, default: str = "") -> pd.Series:
         if col not in conv_df.columns:
-            return 0.0
-        return float((conv_df[col] == value).sum()) / total * 100.0 if total else 0.0
+            return pd.Series([default] * len(conv_df), index=conv_df.index)
+        return (
+            conv_df[col]
+            .fillna(default)
+            .astype(str)
+            .str.strip()
+            .str.lower()
+            .str.replace(" ", "_", regex=False)
+            .str.replace("-", "_", regex=False)
+        )
+
+    def customer_experience_series() -> pd.Series:
+        series = norm_series("customer_experience")
+        series = series.replace({"many": "bad", "zero_minimal": "good", "minimal": "good"})
+        old_severity = norm_series("cx_issue_severity")
+        final_class = norm_series("final_classification")
+        legacy_bad = (old_severity == "many") | final_class.str.contains(
+            "many|caused|frustration",
+            regex=True,
+        )
+        return series.mask(legacy_bad, "bad")
+
+    def safe_pct(col: str, value: Any) -> float:
+        series = norm_series(col)
+        if col == "customer_experience":
+            series = customer_experience_series()
+        return float((series == value).sum()) / total * 100.0 if total else 0.0
 
     handled_pct = safe_pct("handled_status", "handled")
     unhandled_pct = safe_pct("handled_status", "unhandled")
@@ -303,13 +435,21 @@ def dashboard_aggregates(conv_df: pd.DataFrame) -> dict:
 
     cancellation_risk_count = 0
     if "cancellation_risk_detected" in conv_df.columns:
-        cancellation_risk_count = int(conv_df["cancellation_risk_detected"].fillna(False).astype(bool).sum())
+        cancellation_risk_count = int(
+            conv_df["cancellation_risk_detected"]
+            .map(lambda value: str(value if value is not None else False).strip().lower() in {"true", "1", "yes", "y"})
+            .sum()
+        )
     elif "max_frustration_level" in conv_df.columns:
         cancellation_risk_count = int((conv_df["max_frustration_level"] == "cancellation_risk").sum())
 
     manual_review_count = 0
     if "manual_review_required" in conv_df.columns:
-        manual_review_count = int(conv_df["manual_review_required"].fillna(False).astype(bool).sum())
+        manual_review_count = int(
+            conv_df["manual_review_required"]
+            .map(lambda value: str(value if value is not None else False).strip().lower() in {"true", "1", "yes", "y"})
+            .sum()
+        )
 
     classification_counts = {}
     if "final_classification" in conv_df.columns:
@@ -319,9 +459,7 @@ def dashboard_aggregates(conv_df: pd.DataFrame) -> dict:
 
     experience_counts = {}
     if "customer_experience" in conv_df.columns:
-        experience_counts = (
-            conv_df["customer_experience"].fillna("unknown").value_counts().to_dict()
-        )
+        experience_counts = customer_experience_series().replace({"": "unknown"}).value_counts().to_dict()
 
     unhandled_subtype_counts = {}
     if "unhandled_resolution_subtype" in conv_df.columns:
@@ -339,9 +477,9 @@ def dashboard_aggregates(conv_df: pd.DataFrame) -> dict:
 
     frustration_origin_counts = {}
     if "frustration_origin" in conv_df.columns:
-        frustration_origin_counts = (
-            conv_df["frustration_origin"].fillna("none").value_counts().to_dict()
-        )
+        origin_series = norm_series("frustration_origin", "none")
+        origin_series = origin_series.replace({"customer": "customer_side", "our": "our_side", "agent": "our_side"})
+        frustration_origin_counts = origin_series.value_counts().to_dict()
 
     issue_type_counts = {}
     if "main_issue_type" in conv_df.columns:
