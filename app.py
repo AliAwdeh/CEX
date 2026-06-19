@@ -117,6 +117,7 @@ def _init_state() -> None:
         # DB integration
         "current_run_id": None,        # id of the run we're writing to (or loaded from)
         "loaded_run_label": None,
+        "review_selected_conversation_id": None,
         "theme_mode": "Dark",
     }
     for k, v in defaults.items():
@@ -140,14 +141,74 @@ def _db_path(db: Database) -> str:
     return str(getattr(db, "path", DEFAULT_DB_PATH))
 
 
+def _read_prompt_file(filename: str) -> str:
+    root = Path(__file__).resolve().parent / "correct_prompt_files"
+    for candidate in (filename, f"{filename}.txt"):
+        path = root / candidate
+        try:
+            value = path.read_text(encoding="utf-8")
+        except OSError:
+            continue
+        if value.strip():
+            return value
+    return ""
+
+
 def _refresh_default_prompts(db: Database) -> None:
-    refresh = getattr(db, "refresh_default_prompts", None)
-    if callable(refresh):
-        refresh()
-        return
-    seed = getattr(db, "_seed_default_prompts", None)
-    if callable(seed):
-        seed()
+    """Refresh DB default prompt rows directly from prompt files.
+
+    Streamlit can keep imported modules cached across reruns. Reading the files
+    here avoids stale prompt constants rewriting the DB back to an old schema.
+    """
+    prompt_files = {
+        "message_level": ("message prompt", "Message scheme", "message user input"),
+        "conversation_level": (
+            "conversational prompt",
+            "conversational output scheme",
+            "conversational user input",
+        ),
+    }
+    now = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+    with sqlite3.connect(_db_path(db)) as con:
+        for kind, filenames in prompt_files.items():
+            system_prompt, output_schema, user_prompt = (_read_prompt_file(name) for name in filenames)
+            if not (system_prompt and output_schema and user_prompt):
+                continue
+            default = con.execute(
+                "SELECT id FROM prompt_templates WHERE kind=? AND is_default=1 LIMIT 1",
+                (kind,),
+            ).fetchone()
+            if default:
+                con.execute(
+                    "UPDATE prompt_templates SET system_prompt=?, output_schema=?, "
+                    "user_prompt_template=?, updated_at=? WHERE id=?",
+                    (system_prompt, output_schema, user_prompt, now, int(default[0])),
+                )
+                default_id = int(default[0])
+            else:
+                con.execute("UPDATE prompt_templates SET is_active=0 WHERE kind=?", (kind,))
+                cur = con.execute(
+                    "INSERT INTO prompt_templates"
+                    "(kind, name, system_prompt, output_schema, user_prompt_template, "
+                    "is_default, is_active, created_at, updated_at)"
+                    " VALUES(?, 'Default', ?, ?, ?, 1, 1, ?, ?)",
+                    (kind, system_prompt, output_schema, user_prompt, now, now),
+                )
+                default_id = int(cur.lastrowid)
+
+            if kind == "conversation_level":
+                active = con.execute(
+                    "SELECT id, output_schema FROM prompt_templates WHERE kind=? AND is_active=1 LIMIT 1",
+                    (kind,),
+                ).fetchone()
+                active_schema = str(active[1] if active else "")
+                stale_active = "customer_experience" not in active_schema and "cx_issue_severity" in active_schema
+                if stale_active:
+                    con.execute("UPDATE prompt_templates SET is_active=0 WHERE kind=?", (kind,))
+                    con.execute(
+                        "UPDATE prompt_templates SET is_active=1, updated_at=? WHERE id=?",
+                        (now, default_id),
+                    )
 
 
 def _run_result_counts(db: Database, run_id: int) -> dict[str, int]:
@@ -3062,18 +3123,61 @@ def tab_review() -> None:
 
     options = []
     label_to_id = {}
+    ordered_ids = []
     for row in filtered_df.to_dict(orient="records"):
-        cid = row.get("conversation_id", "")
+        cid = str(row.get("conversation_id", "") or "")
         cust = row.get("customer_name") or "—"
         phone = row.get("customer_phone") or cid
         source_count = row.get("source_conversation_count") or "—"
         result = f"{humanize_label(row.get('handled_status')) or 'Unknown'} / {humanize_label(row.get('customer_experience')) or 'Unknown'}"
         label = f"{phone} • {cust} • {source_count} source convs • {result}"
+        if label in label_to_id:
+            label = f"{label} - {cid[:8]}"
         options.append(label)
         label_to_id[label] = cid
+        ordered_ids.append(cid)
 
-    selection = st.selectbox("Open a customer journey", options, index=0)
+    current_id = str(st.session_state.get("review_selected_conversation_id") or "")
+    if current_id not in ordered_ids:
+        current_id = ordered_ids[0]
+        st.session_state.review_selected_conversation_id = current_id
+    current_index = ordered_ids.index(current_id)
+
+    def set_review_index(index: int) -> None:
+        index = max(0, min(index, len(ordered_ids) - 1))
+        st.session_state.review_selected_conversation_id = ordered_ids[index]
+
+    selection = st.selectbox(
+        "Open a customer journey",
+        options,
+        index=current_index,
+        key=f"review_journey_select_{current_id}",
+    )
     target_id = label_to_id[selection]
+    st.session_state.review_selected_conversation_id = target_id
+    current_index = ordered_ids.index(target_id)
+
+    nav_cols = st.columns([1.15, 1.15, 1.3, 5.4])
+    with nav_cols[0]:
+        if st.button(
+            "Previous",
+            key="review_prev_top",
+            use_container_width=True,
+            disabled=current_index <= 0,
+        ):
+            set_review_index(current_index - 1)
+            st.rerun()
+    with nav_cols[1]:
+        if st.button(
+            "Next",
+            key="review_next_top",
+            use_container_width=True,
+            disabled=current_index >= len(ordered_ids) - 1,
+        ):
+            set_review_index(current_index + 1)
+            st.rerun()
+    with nav_cols[2]:
+        st.caption(f"Journey {current_index + 1:,} of {len(ordered_ids):,}")
     target_cr = next((c for c in rr.conversation_results if c.get("conversation_id") == target_id), None)
     if not target_cr:
         st.error("Customer journey not found.")
@@ -3094,6 +3198,28 @@ def tab_review() -> None:
             transcript=transcript,
             message_results=msgs,
         )
+
+    bottom_nav_cols = st.columns([1.15, 1.15, 1.3, 5.4])
+    with bottom_nav_cols[0]:
+        if st.button(
+            "Previous",
+            key="review_prev_bottom",
+            use_container_width=True,
+            disabled=current_index <= 0,
+        ):
+            set_review_index(current_index - 1)
+            st.rerun()
+    with bottom_nav_cols[1]:
+        if st.button(
+            "Next",
+            key="review_next_bottom",
+            use_container_width=True,
+            disabled=current_index >= len(ordered_ids) - 1,
+        ):
+            set_review_index(current_index + 1)
+            st.rerun()
+    with bottom_nav_cols[2]:
+        st.caption(f"Journey {current_index + 1:,} of {len(ordered_ids):,}")
 
 
 # --------- Tab: Exports ---------

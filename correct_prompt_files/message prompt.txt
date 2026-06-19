@@ -23,6 +23,14 @@ Use only what is visible in:
 
 Do not assume hidden tools, hidden saves, hidden business rules, or backend actions.
 
+This visibility rule limits the evidence you may use, not the capability standard you apply.
+
+Judge against an ideal/perfect chatbot for this business. If the customer asks a direct question about a process, status, application, visa, payment, account, document, or next step, assume the ideal chatbot should be able to retrieve the correct information and answer directly.
+
+Do not excuse a weak answer because tool access, backend access, or internal workflow access is not visible. A response such as "I cannot check", "our team will check", "we will update you", or "please wait for an update" is still a CX issue when the customer asked for a direct answer or status.
+
+You do not need to know the correct hidden backend answer to judge the message. Judge whether the target message gave the customer the direct answer/current state they asked for, or at least a specific actionable status with a concrete dependency and timeframe.
+
 If raw tool output, JSON, or system text is visible to the customer, treat it as a customer-facing issue.
 
 ---
@@ -49,7 +57,9 @@ Judge the message based on whether it:
 
 ## A. Answer early
 
-If the customer asked a direct question and the visible context already supports an answer, the target message should answer it early.
+If the customer asked a direct question, the target message should answer it directly and early.
+
+This includes questions where the answer would normally require checking internal systems, such as visa process status, application status, payment status, document review status, or account/process updates. On the perfect scale, the chatbot is expected to retrieve that information and answer.
 
 If the message delays that answer behind generic language or unnecessary extra steps, that is a CX issue.
 
@@ -62,9 +72,9 @@ Messages like:
 - "We will get back to you"
 - "Our team will check and revert"
 
-are bad by default unless they include a concrete and useful next step or timeframe and no better direct answer was available.
+are bad by default. They are only acceptable when they give the customer a specific current state, a concrete dependency, and a specific timeframe; they are not acceptable as a substitute for a direct answer to a status/process question.
 
-If the customer asked something that could already have been answered, this is usually a bigger issue.
+If the customer asked for a status or update, the ideal response should give the actual current status. Do not treat "we will update you" as enough.
 
 ## C. Parroting is bad
 
@@ -268,7 +278,7 @@ recommended_fix must be short, actionable, and specific.
 
 Examples:
 
-- "Answer the status question directly before asking for anything else."
+- "Answer the status question directly before asking for anything else; retrieve and state the current visa/application/process status instead of deferring to a future update."
 - "Acknowledge the provided document and request only what is still missing."
 - "Replace vague waiting language with a concrete next step or timeframe."
 - "Do not repeat the customer's wording unless it adds progress."
@@ -312,6 +322,20 @@ Likely:
 
 - message_level_effect: major_issue
 - issue_type: delay or missing_next_step
+
+## Major issue: should have answered status directly
+
+Customer asks: "Can you update me on my visa process?"
+Agent says: "I cannot check that here. The team will review and update you."
+
+On the perfect scale, the chatbot should retrieve and state the current visa/process status. No direct status/current state was given.
+
+Likely:
+
+- message_level_effect: major_issue
+- frustration_level_after_message: medium or high
+- issue_origin: our_side
+- issue_type: missing_next_step or delay
 
 ## Minor or major issue: parroting
 
@@ -458,7 +482,7 @@ Do not treat parroting as helpful unless it clearly moves the conversation forwa
 
 Do not excuse asking about the purpose of an obviously relevant customer item.
 
-Do not assume hidden backend success.
+Do not assume hidden backend success. At the same time, do not excuse a missing direct answer because backend access is not visible; judge against the ideal chatbot capability.
 
 Do not include markdown.
 

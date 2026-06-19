@@ -146,6 +146,49 @@ def _json_load(s: Optional[str]) -> Any:
         return None
 
 
+def _backfill_conversation_parsed_json(pj: Any) -> None:
+    """Fill in new marker fields that are missing from old stored results.
+
+    Old runs stored final_classification/cx_issue_severity instead of the
+    separate handled_status / customer_experience markers.  When loading from
+    the DB we patch the dict in-place so the UI always has the fields it needs.
+    """
+    if not isinstance(pj, dict):
+        return
+    old_class = str(pj.get("final_classification", "") or "")
+    old_class_l = old_class.strip().lower()
+    old_severity = str(pj.get("cx_issue_severity", "") or "").strip().lower()
+    if "handled_status" not in pj or not pj["handled_status"]:
+        pj["handled_status"] = (
+            "unhandled"
+            if old_class_l.startswith(("unhandled", "not handled"))
+            else "handled"
+        )
+    if "customer_experience" not in pj or not pj["customer_experience"]:
+        pj["customer_experience"] = "bad" if old_severity == "many" or "many" in old_class_l else "good"
+    if "unhandled_resolution_subtype" not in pj or not pj["unhandled_resolution_subtype"]:
+        pj["unhandled_resolution_subtype"] = (
+            "not_applicable"
+            if pj["handled_status"] == "handled"
+            else "pending_unresolved"
+            if "pending" in old_class_l
+            else "totally_unresolved"
+        )
+    if "frustration_origin" not in pj or not pj["frustration_origin"]:
+        origin = str(pj.get("main_issue_origin", "") or "").strip().lower()
+        origin_map = {
+            "our_side": "our_side",
+            "customer": "customer_side",
+            "customer_side": "customer_side",
+            "shared": "shared",
+            "none": "none",
+        }
+        pj["frustration_origin"] = origin_map.get(
+            origin,
+            "our_side" if pj.get("frustration_detected") and "caused" in old_class_l else "none",
+        )
+
+
 class Database:
     """Thin wrapper around a SQLite file.
 
@@ -578,6 +621,8 @@ class Database:
         conversation_results: list[dict] = []
         for r in conv_rows:
             d = dict(r)
+            pj = _json_load(d.get("parsed_json"))
+            _backfill_conversation_parsed_json(pj)
             conversation_results.append(
                 {
                     "thread_id": d["conversation_id"],
@@ -586,8 +631,8 @@ class Database:
                     "parse_status": d["parse_status"],
                     "error_message": d.get("error_message"),
                     "raw_model_response": d.get("raw_response"),
-                    "parsed_json": _json_load(d.get("parsed_json")),
-                    "evaluation_output": _json_load(d.get("parsed_json")),
+                    "parsed_json": pj,
+                    "evaluation_output": pj,
                     "conversation_metadata": _json_load(d.get("conversation_metadata")) or {},
                     "computed_metadata": _json_load(d.get("computed_metadata")) or {},
                     "transcript": _json_load(d.get("transcript_json")) or [],
