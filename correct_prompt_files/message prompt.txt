@@ -48,6 +48,7 @@ Judge the message based on whether it:
 - avoided asking for already provided information
 - avoided simply repeating the customer's words
 - avoided vague waiting language
+- stayed logically consistent with the visible process/status
 - gave a clear next step when a next step was needed
 - reduced, maintained, created, or increased frustration
 
@@ -95,6 +96,45 @@ If the target message says the case is being checked or updated but does not tel
 Do not invent issues.
 
 But if the visible message plausibly created avoidable effort, delay, repetition, or ambiguity, prefer marking an issue rather than overlooking it.
+
+## G. Catch logical/process contradictions even without visible frustration
+
+Judge whether the target message is logically consistent with the visible journey state.
+
+If visible context says a process, approval, payment, document, cancellation, refund, delivery, contract step, or service step is not done, pending, under review, waiting for approval, or missing a prerequisite, the agent must not imply that a downstream result is already ready, approved, completed, or being delivered.
+
+Examples:
+
+- If the visa is not done yet, do not say an address is needed "to send the maid's EID" unless the message clearly explains this is for future delivery after visa/EID issuance.
+- If an application or document review is still pending, do not request delivery details as if the final document, approval, certificate, card, or ID is already issued.
+- If payment is pending or failed, do not imply a receipt, activation, booking, or completed order already exists.
+- If cancellation/refund approval is pending, do not imply the refund is already processed unless the visible context supports it.
+- If contract/signature/approval is still missing, do not imply the related service, delivery, onboarding, or deployment is already active.
+- If the visible status is unresolved, do not send a broadcast, template, or automated request that contradicts that status.
+
+This is an issue even if the customer stays polite, calm, or does not express frustration. The issue is the logical contradiction, confusion, and trust risk.
+
+If the target message clearly says the request is only for advance preparation or future delivery after the pending prerequisite is completed, do not mark it as a contradiction just because the downstream item is not ready yet.
+
+If the target message is a later clarification after the customer became confused, judge that target message as a possible recovery, but do not treat it as proof that the earlier confusing message was fine.
+
+Use:
+
+- wrong_info when the message contradicts the visible status or process sequence
+- ignored_context when the message misses a visible pending/not-done status
+- unclear_guidance when the request might be valid but the reason is misleading or not explained
+
+## H. Separate bad outcome from blame
+
+The customer may have a blocked or disappointing outcome because of a legitimate business necessity, policy restriction, legal/government requirement, missing eligibility, contract condition, visa rule, cancellation requirement, or customer-side constraint.
+
+Do not automatically mark issue_origin = our_side just because the customer did not get what they wanted.
+
+Only apply this rule when the necessity or constraint is visible in the conversation. Do not invent hidden policy, legal, or business reasons.
+
+If the target message clearly explains the valid constraint, gives the reason, and gives the next best step, the message can be helped or neutral even if the customer's original objective remains blocked.
+
+If there is a message-level issue but the visible cause is the valid constraint rather than our communication, use issue_origin = customer_side under the current schema. Use issue_origin = shared when both the constraint and our handling contributed. Use issue_origin = our_side only when our response created extra friction, such as unclear guidance, late explanation, contradiction, repetition, delay, or vague "we will update you" language.
 
 ---
 
@@ -228,6 +268,14 @@ Choose exactly one:
 
 Use none only when no issue exists.
 
+Do not use our_side merely because the customer is blocked by a valid policy, visa rule, legal/government requirement, missing eligibility, contract condition, cancellation requirement, or customer-side constraint.
+
+Use customer_side when the issue is primarily the visible constraint and the agent explained it clearly.
+
+Use shared when a valid constraint exists but the agent's wording, delay, repetition, contradiction, or missing next step made the experience worse.
+
+Use our_side when the bad experience was caused mainly by how we handled or communicated the constraint.
+
 ---
 
 # 11. Issue Type
@@ -253,6 +301,11 @@ Guidance:
 - Use delay when the message mainly prolongs waiting without useful progress.
 - Use missing_next_step when a next step was needed and not given.
 - Use unclear_guidance when some direction exists but is too vague to act on.
+- Use wrong_info when the message gives a reason, status, or process implication that conflicts with visible context.
+- Use wrong_info only when the visible conversation supports that the statement is false, contradictory, or impossible under the visible process state.
+- Do not use wrong_info just because the message introduces an unexpected VAT/tax/fee/payment/signature/policy/confirmation requirement or creates trust risk.
+- Use unclear_guidance when a VAT/tax/fee/payment/signature/policy/confirmation request may be valid, but the reason, urgency, current process linkage, or customer impact is not explained clearly.
+- Use ignored_context when the message fails to account for a visible pending/not-done status.
 - If "we will update you" is the main problem, use delay or missing_next_step depending on which is stronger.
 
 ---
@@ -282,6 +335,7 @@ Examples:
 - "Acknowledge the provided document and request only what is still missing."
 - "Replace vague waiting language with a concrete next step or timeframe."
 - "Do not repeat the customer's wording unless it adds progress."
+- "State the true current status and ask for the information with the correct reason, such as future delivery after approval/issuance instead of implying the downstream item is already ready."
 
 If no issue exists, use:
 
@@ -337,6 +391,63 @@ Likely:
 - issue_origin: our_side
 - issue_type: missing_next_step or delay
 
+## No message issue: valid business necessity explained clearly
+
+Customer wants to renew a contract, but the visible rule says renewal is not possible because the worker is outside the UAE and a new visa process is required.
+Agent clearly explains the reason, names the rule/constraint, and gives the next step.
+
+Likely:
+
+- message_level_effect: helped or neutral
+- issue_origin: none
+- issue_type: none
+- recommended_fix: none
+
+## Issue origin is not automatically our_side
+
+Customer's requested outcome is blocked by a visible policy, legal/government requirement, visa rule, eligibility issue, contract condition, cancellation requirement, or customer-side constraint.
+Agent communicates it badly with vague wording, no next step, contradiction, repeated requests, or delayed explanation.
+
+Likely:
+
+- message_level_effect: minor_issue or major_issue
+- issue_origin: shared or our_side depending on whether our communication created the main friction
+- issue_type: unclear_guidance, missing_next_step, delay, wrong_info, or repetition
+
+## Issue type: unclear VAT/signature request, not wrong_info
+
+Agent says a new VAT/tax/fee/payment change applies or asks for EID signature/confirmation, but does not clearly connect it to the customer's current process, why it is needed, what changes for the customer, or what happens if they do not confirm.
+
+Do not mark wrong_info unless visible context shows the VAT/signature/payment requirement is false or contradicts a known status/rule. The issue is unclear guidance or missing explanation, not wrong information.
+
+Likely:
+
+- message_level_effect: minor_issue or major_issue depending on urgency and customer impact
+- issue_origin: our_side if our wording created the confusion
+- issue_type: unclear_guidance or missing_next_step
+- business_impact: "Creates trust risk by introducing a payment/signature requirement without explaining its link to the customer's current process."
+- recommended_fix: "Explain why the VAT/signature confirmation is needed, what changed, and how it affects the current process before asking for confirmation."
+
+## Minor or major issue: logical/process contradiction
+
+Visible context says the visa is not completed yet.
+Agent or broadcast asks for the customer's address "to send the maid's EID."
+After the customer sends the address, another agent message says it was received "for the Emirates ID delivery" without clarifying that delivery is only future/after issuance.
+
+This is logically inconsistent because the EID depends on the visa/process being completed. The customer may not show frustration yet, but the message still creates confusion and trust risk.
+
+The same rule applies to similar process-sequence contradictions, such as asking for delivery details for an approval document that is still under review, implying payment completion while payment is pending, or saying a refund is processed while approval is still unresolved.
+
+Likely:
+
+- message_level_effect: minor_issue or major_issue depending on how direct the contradiction is
+- frustration_level_after_message: none or low if the customer is still calm
+- frustration_change: unchanged or created
+- context_handling: poor
+- issue_origin: our_side
+- issue_type: wrong_info or unclear_guidance
+- recommended_fix: "State the current pending status and ask for the information only with the correct purpose: future delivery/processing after the prerequisite is completed."
+
 ## Minor or major issue: parroting
 
 Customer explains a problem.
@@ -355,6 +466,21 @@ Likely:
 
 - message_level_effect: recovered_issue
 - frustration_change: decreased
+
+## Recovery after process-confusion
+
+Customer asks: "Is the ID done? Without medical?"
+Agent says: "Not yet. The Emirates ID is not issued before the medical. The earlier message was only asking for the address in advance."
+
+This target message can be recovered_issue because it corrects the confusion. It does not erase the earlier issue if the earlier broadcast implied the EID was ready.
+
+Likely:
+
+- message_level_effect: recovered_issue
+- frustration_change: decreased
+- issue_origin: none
+- issue_type: none
+- recommended_fix: "The original request should have said the address was for future delivery after issuance."
 
 ---
 
@@ -481,6 +607,14 @@ Do not ignore when the answer could have been given earlier.
 Do not treat parroting as helpful unless it clearly moves the conversation forward.
 
 Do not excuse asking about the purpose of an obviously relevant customer item.
+
+Do not ignore a contradiction just because the customer did not explicitly complain or show frustration.
+
+Do not mark a message as helpful when it requests information for an impossible or premature reason, such as collecting an address to send an EID while visible context says the visa/EID process is not completed, or any similar case where a downstream action is presented as ready while prerequisites are still pending.
+
+Do not mark issue_origin = our_side simply because the customer did not get the desired outcome. If a visible valid policy, legal/government requirement, eligibility issue, contract condition, visa rule, cancellation requirement, or customer-side constraint caused the block, blame our side only when our message created extra friction through unclear, late, repetitive, contradictory, or vague communication.
+
+Do not mark issue_type = wrong_info for an unexpected VAT, tax, fee, payment, EID signature, policy, or confirmation request unless visible context shows it is false or contradictory. If the problem is that the request is not explained or not linked to the current process, use unclear_guidance or missing_next_step.
 
 Do not assume hidden backend success. At the same time, do not excuse a missing direct answer because backend access is not visible; judge against the ideal chatbot capability.
 

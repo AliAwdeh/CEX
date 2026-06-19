@@ -3246,8 +3246,61 @@ def tab_review() -> None:
     current_index = ordered_ids.index(current_id)
 
     def set_review_index(index: int) -> None:
-        index = max(0, min(index, len(ordered_ids) - 1))
+        if not ordered_ids:
+            return
+        index = index % len(ordered_ids)
         st.session_state.review_selected_conversation_id = ordered_ids[index]
+        st.session_state.review_scroll_to_conversation_start = True
+
+    def scroll_to_conversation_start_if_requested() -> None:
+        if not st.session_state.pop("review_scroll_to_conversation_start", False):
+            return
+        components.html(
+            """
+            <script>
+            const scrollToJourneyStart = () => {
+              try {
+                const parentWindow = window.parent;
+                const parentDoc = parentWindow.document;
+                const marker = parentDoc.getElementById("review-conversation-start");
+                if (!marker) return;
+
+                marker.scrollIntoView({ block: "start", behavior: "auto" });
+
+                const top = marker.getBoundingClientRect().top + parentWindow.scrollY - 16;
+                parentWindow.scrollTo({ top, behavior: "auto" });
+
+                const scrollContainers = [
+                  parentDoc.scrollingElement,
+                  parentDoc.documentElement,
+                  parentDoc.body,
+                  parentDoc.querySelector("section.main"),
+                  parentDoc.querySelector("[data-testid='stAppViewContainer']"),
+                  parentDoc.querySelector("[data-testid='stMain']"),
+                  parentDoc.querySelector("[data-testid='stMainBlockContainer']"),
+                ].filter(Boolean);
+
+                for (const container of scrollContainers) {
+                  const rect = marker.getBoundingClientRect();
+                  const containerRect = container.getBoundingClientRect
+                    ? container.getBoundingClientRect()
+                    : { top: 0 };
+                  const nextTop = container.scrollTop + rect.top - containerRect.top - 16;
+                  if (Number.isFinite(nextTop)) container.scrollTop = Math.max(nextTop, 0);
+                }
+              } catch (error) {
+                window.parent.scrollTo(0, 0);
+              }
+            };
+            requestAnimationFrame(scrollToJourneyStart);
+            setTimeout(scrollToJourneyStart, 100);
+            setTimeout(scrollToJourneyStart, 350);
+            setTimeout(scrollToJourneyStart, 900);
+            setTimeout(scrollToJourneyStart, 1600);
+            </script>
+            """,
+            height=1,
+        )
 
     def render_review_nav(position: str) -> None:
         st.markdown("<div style='height: 1rem'></div>", unsafe_allow_html=True)
@@ -3257,7 +3310,7 @@ def tab_review() -> None:
                 "Previous",
                 key=f"review_prev_{position}",
                 use_container_width=True,
-                disabled=current_index <= 0,
+                disabled=len(ordered_ids) <= 1,
             ):
                 set_review_index(current_index - 1)
                 st.rerun()
@@ -3266,7 +3319,7 @@ def tab_review() -> None:
                 "Next",
                 key=f"review_next_{position}",
                 use_container_width=True,
-                disabled=current_index >= len(ordered_ids) - 1,
+                disabled=len(ordered_ids) <= 1,
             ):
                 set_review_index(current_index + 1)
                 st.rerun()
@@ -3285,6 +3338,8 @@ def tab_review() -> None:
         key=f"review_journey_select_{current_id}",
     )
     target_id = label_to_id[selection]
+    if target_id != current_id:
+        st.session_state.review_scroll_to_conversation_start = True
     st.session_state.review_selected_conversation_id = target_id
     current_index = ordered_ids.index(target_id)
 
@@ -3301,6 +3356,7 @@ def tab_review() -> None:
     st.caption(
         "The full appended customer journey is shown below. Where available, assistant replies also include a short quality check underneath."
     )
+    st.markdown("<div id='review-conversation-start'></div>", unsafe_allow_html=True)
     transcript = target_cr.get("transcript") or []
     msgs = target_cr.get("message_level_results") or []
     _, chat_col, _ = st.columns([0.15, 9.7, 0.15])
@@ -3311,6 +3367,7 @@ def tab_review() -> None:
         )
 
     render_review_nav("bottom")
+    scroll_to_conversation_start_if_requested()
 
 
 # --------- Tab: Exports ---------
