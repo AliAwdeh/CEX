@@ -167,12 +167,16 @@ def validate_message_level_result(data: dict) -> dict:
 _CL_CLASSIFICATION_RULES = {
     "Handled with Minimal Issues": ("handled", "zero_minimal", False, False),
     "Handled with Many Issues": ("handled", "many", False, False),
+    "Handled with Minimal Caused Issues": ("handled", "zero_minimal", False, True),
+    "Handled with Many Caused Issues": ("handled", "many", False, True),
     "Handled with Minimal Issues and Frustration": ("handled", "zero_minimal", True, False),
     "Handled with Many Issues and Frustration": ("handled", "many", True, False),
     "Handled with Minimal Caused Issues and Frustration": ("handled", "zero_minimal", True, True),
     "Handled with Many Caused Issues and Frustration": ("handled", "many", True, True),
     "Not Handled with Minimal Issues": ("unhandled", "zero_minimal", False, False),
     "Not Handled with Many Issues": ("unhandled", "many", False, False),
+    "Not Handled with Minimal Caused Issues": ("unhandled", "zero_minimal", False, True),
+    "Not Handled with Many Caused Issues": ("unhandled", "many", False, True),
     "Not Handled with Minimal Issues and Frustration": ("unhandled", "zero_minimal", True, False),
     "Not Handled with Many Issues and Frustration": ("unhandled", "many", True, False),
     "Not Handled with Minimal Caused Issues and Frustration": ("unhandled", "zero_minimal", True, True),
@@ -210,9 +214,25 @@ _UNHANDLED_SUBTYPES = {
     "pending_unresolved",
 }
 
+_CUSTOMER_EXPERIENCES = {"good", "bad"}
+_FRUSTRATION_ORIGINS = {"our_side", "customer_side", "shared", "none"}
 _MAIN_ISSUE_ORIGINS = {"our_side", "customer_side", "shared", "third_party", "unclear", "none"}
-_TOP_LEVEL_MAIN_ISSUE_ORIGINS = {"our_side", "customer_side", "shared", "unclear", "none"}
+_TOP_LEVEL_MAIN_ISSUE_ORIGINS = {"our_side", "customer_side", "shared", "third_party", "unclear", "none"}
 _FRUSTRATION_TIMINGS = {"start", "during", "end", "multiple", "none"}
+_CL_ISSUE_TYPES = {
+    "none",
+    "misunderstanding",
+    "repetition",
+    "delay",
+    "unclear_guidance",
+    "wrong_info",
+    "ignored_context",
+    "dead_end",
+    "tool_or_system_failure",
+    "poor_tone",
+    "missing_next_step",
+    "other",
+}
 
 
 def _normalize_bool_flag(value: Any, default: bool = False) -> bool:
@@ -237,6 +257,12 @@ def _normalize_issue_origin(value: Any, *, allow_third_party: bool) -> str:
     if origin == "third_party" and not allow_third_party:
         return "unclear"
     return origin
+
+
+def _normalize_sami_origin(value: Any) -> str:
+    """Normalize an origin to the simplified Sami schema."""
+    origin = str(value or "").strip().lower().replace(" ", "_")
+    return origin if origin in _FRUSTRATION_ORIGINS else "none"
 
 
 def _normalize_unhandled_subtype(value: Any) -> str:
@@ -281,59 +307,37 @@ def _classification_from_parts(
     main_issue_origin: str,
 ) -> str:
     if handled_status == "handled":
+        if main_issue_origin == "our_side":
+            if frustration_detected:
+                return (
+                    "Handled with Many Caused Issues and Frustration"
+                    if severity == "many"
+                    else "Handled with Minimal Caused Issues and Frustration"
+                )
+            return "Handled with Many Caused Issues" if severity == "many" else "Handled with Minimal Caused Issues"
         if not frustration_detected:
             return "Handled with Many Issues" if severity == "many" else "Handled with Minimal Issues"
-        if main_issue_origin == "our_side":
-            return (
-                "Handled with Many Caused Issues and Frustration"
-                if severity == "many"
-                else "Handled with Minimal Caused Issues and Frustration"
-            )
         return (
             "Handled with Many Issues and Frustration"
             if severity == "many"
             else "Handled with Minimal Issues and Frustration"
         )
+    if main_issue_origin == "our_side":
+        if frustration_detected:
+            return (
+                "Not Handled with Many Caused Issues and Frustration"
+                if severity == "many"
+                else "Not Handled with Minimal Caused Issues and Frustration"
+            )
+        return "Not Handled with Many Caused Issues" if severity == "many" else "Not Handled with Minimal Caused Issues"
     if not frustration_detected:
         return "Not Handled with Many Issues" if severity == "many" else "Not Handled with Minimal Issues"
-    if main_issue_origin == "our_side":
-        return (
-            "Not Handled with Many Caused Issues and Frustration"
-            if severity == "many"
-            else "Not Handled with Minimal Caused Issues and Frustration"
-        )
     return (
         "Not Handled with Many Issues and Frustration"
         if severity == "many"
         else "Not Handled with Minimal Issues and Frustration"
     )
 
-
-def _normalize_quantifiable_metrics(value: Any) -> list[dict]:
-    if not isinstance(value, list):
-        return []
-
-    out: list[dict[str, Any]] = []
-    for item in value:
-        if not isinstance(item, dict):
-            continue
-        category = str(item.get("category") or "").strip()
-        metrics = item.get("metrics") or {}
-        if not category or not isinstance(metrics, dict):
-            continue
-
-        clean_metrics: dict[str, float | int] = {}
-        for key, raw in metrics.items():
-            metric_name = str(key or "").strip()
-            if not metric_name:
-                continue
-            try:
-                num = float(raw)
-            except (TypeError, ValueError):
-                num = 0.0
-            clean_metrics[metric_name] = int(num) if num.is_integer() else num
-        out.append({"category": category, "metrics": clean_metrics})
-    return out
 
 
 def _score_number(value: Any, minimum: float, maximum: float) -> int | float:
@@ -397,7 +401,12 @@ def _normalize_conversation_score(value: Any) -> dict:
 
 
 def validate_conversation_level_result(data: dict) -> dict:
-    """Coerce a parsed conversation-level JSON object into the strict schema shape."""
+    """Coerce a parsed conversation-level JSON object into the Sami schema shape.
+
+    Older runs may still contain the previous final_classification/cx_issue_severity
+    fields. Those values are used only to infer the new markers when the new
+    fields are absent; extra old fields are preserved for debug/export visibility.
+    """
     if not isinstance(data, dict):
         raise ValueError("Conversation-level result is not a JSON object")
 
@@ -409,28 +418,56 @@ def validate_conversation_level_result(data: dict) -> dict:
     out["customer_objective_type"] = objective_type
     out["customer_primary_objective"] = str(data.get("customer_primary_objective", "") or "")
 
-    classification = str(data.get("final_classification", "") or "").strip()
+    # Backward-compatible inference from old classification fields.
+    old_classification = str(data.get("final_classification", "") or "").strip()
+    old_severity = str(data.get("cx_issue_severity", "") or "").strip().lower().replace(" ", "_")
     handled_status = str(data.get("handled_status", "") or "").strip().lower()
-    severity = str(data.get("cx_issue_severity", "") or "").strip().lower().replace(" ", "_")
     subtype = _normalize_unhandled_subtype(data.get("unhandled_resolution_subtype"))
+
+    if old_classification in _CL_CLASSIFICATION_RULES:
+        old_handled, old_severity_from_class, old_frustration, old_caused_by_us = _CL_CLASSIFICATION_RULES[old_classification]
+        if handled_status not in {"handled", "unhandled"}:
+            handled_status = old_handled
+        if old_severity not in {"zero_minimal", "many"}:
+            old_severity = old_severity_from_class
+    elif old_classification in _OLD_CL_CLASSIFICATION_RULES:
+        old_handled, old_severity_from_class, old_subtype = _OLD_CL_CLASSIFICATION_RULES[old_classification]
+        if handled_status not in {"handled", "unhandled"}:
+            handled_status = old_handled
+        if old_severity not in {"zero_minimal", "many"}:
+            old_severity = old_severity_from_class
+        if subtype not in _UNHANDLED_SUBTYPES:
+            subtype = old_subtype
+    elif old_classification:
+        if handled_status not in {"handled", "unhandled"}:
+            handled_status = "handled" if old_classification.startswith("Handled") else "unhandled"
+        if old_severity not in {"zero_minimal", "many"}:
+            old_severity = "many" if "Many" in old_classification else "zero_minimal"
+
+    if handled_status not in {"handled", "unhandled"}:
+        handled_status = "handled"
+    if handled_status == "handled":
+        subtype = "not_applicable"
+    elif subtype == "not_applicable" or subtype not in _UNHANDLED_SUBTYPES:
+        subtype = "totally_unresolved"
+
+    customer_experience = str(data.get("customer_experience", "") or "").strip().lower()
+    if customer_experience not in _CUSTOMER_EXPERIENCES:
+        customer_experience = "bad" if old_severity == "many" else "good"
 
     main = data.get("main_issue") or {}
     if not isinstance(main, dict):
         main = {}
+    issue_type = str(main.get("issue_type", "none") or "none").strip().lower()
+    if issue_type not in _CL_ISSUE_TYPES:
+        issue_type = "other" if issue_type else "none"
     main_out = {
         "issue_exists": _normalize_bool_flag(main.get("issue_exists", False)),
-        "issue_origin": _normalize_issue_origin(main.get("issue_origin", "none"), allow_third_party=True),
-        "issue_type": str(main.get("issue_type", "none") or "none").strip().lower(),
+        "issue_origin": _normalize_sami_origin(main.get("issue_origin", "none")),
+        "issue_type": issue_type,
         "issue_summary": str(main.get("issue_summary", "") or ""),
         "customer_impact": str(main.get("customer_impact", "") or ""),
     }
-
-    main_issue_origin = _normalize_issue_origin(
-        data.get("main_issue_origin", main_out["issue_origin"]),
-        allow_third_party=False,
-    )
-    if main_issue_origin not in _TOP_LEVEL_MAIN_ISSUE_ORIGINS:
-        main_issue_origin = "none"
 
     frustration_detected = _normalize_bool_flag(data.get("frustration_detected"), default=False)
     customer_started_frustrated = _normalize_bool_flag(data.get("customer_started_frustrated"), default=False)
@@ -441,51 +478,25 @@ def validate_conversation_level_result(data: dict) -> dict:
     customer_ended_frustrated = _normalize_bool_flag(data.get("customer_ended_frustrated"), default=False)
     frustration_timing = _normalize_frustration_timing(data.get("frustration_timing"))
 
-    if classification in _CL_CLASSIFICATION_RULES:
-        handled_status, severity, frustration_detected, caused_by_us = _CL_CLASSIFICATION_RULES[classification]
-        if caused_by_us:
-            main_issue_origin = "our_side"
-        elif frustration_detected and main_issue_origin == "our_side":
-            main_issue_origin = "shared"
-    else:
-        if classification in _OLD_CL_CLASSIFICATION_RULES:
-            handled_status, severity, subtype = _OLD_CL_CLASSIFICATION_RULES[classification]
-        else:
-            # Backward-compatible recovery for older or partial outputs.
-            if handled_status not in {"handled", "unhandled"}:
-                handled_status = "handled" if classification.startswith("Handled") else "unhandled"
-            if severity not in {"zero_minimal", "many"}:
-                severity = "many" if "Many" in classification else "zero_minimal"
-            if handled_status == "handled":
-                subtype = "not_applicable"
-            elif subtype not in {"totally_unresolved", "pending_unresolved"}:
-                subtype = "pending_unresolved" if "pending" in classification.lower() else "totally_unresolved"
-            if "Frustration" in classification and not frustration_detected:
-                frustration_detected = True
-            if "Caused Issues and Frustration" in classification:
-                main_issue_origin = "our_side"
+    if old_classification in _CL_CLASSIFICATION_RULES and not frustration_detected:
+        frustration_detected = _CL_CLASSIFICATION_RULES[old_classification][2]
+    elif old_classification and "Frustration" in old_classification and not frustration_detected:
+        frustration_detected = True
 
-        if severity not in {"zero_minimal", "many"}:
-            severity = "zero_minimal"
-        if handled_status not in {"handled", "unhandled"}:
-            handled_status = "handled"
-
-    if handled_status == "handled":
-        subtype = "not_applicable"
-    elif subtype == "not_applicable" or subtype not in _UNHANDLED_SUBTYPES:
-        subtype = "totally_unresolved"
-
-    # Promote issue origin from main_issue when the top-level field is missing or unusable.
-    if main_issue_origin == "none" and main_out["issue_origin"] in _TOP_LEVEL_MAIN_ISSUE_ORIGINS:
-        main_issue_origin = main_out["issue_origin"]
-    if main_issue_origin == "unclear" and main_out["issue_origin"] in {"our_side", "customer_side", "shared"}:
-        main_issue_origin = main_out["issue_origin"]
+    frustration_origin = _normalize_sami_origin(data.get("frustration_origin", "none"))
+    if frustration_detected and frustration_origin == "none":
+        old_origin = _normalize_sami_origin(data.get("main_issue_origin", main_out["issue_origin"]))
+        if old_origin != "none":
+            frustration_origin = old_origin
+        elif old_classification in _CL_CLASSIFICATION_RULES and _CL_CLASSIFICATION_RULES[old_classification][3]:
+            frustration_origin = "our_side"
 
     if not frustration_detected:
         customer_started_frustrated = False
         customer_became_frustrated_during_chat = False
         customer_ended_frustrated = False
         frustration_timing = "none"
+        frustration_origin = "none"
     else:
         if frustration_timing:
             if frustration_timing == "start":
@@ -512,25 +523,15 @@ def validate_conversation_level_result(data: dict) -> dict:
             customer_ended_frustrated,
         )
 
-    if severity not in {"zero_minimal", "many"}:
-        severity = "zero_minimal"
-    classification = _classification_from_parts(
-        handled_status,
-        severity,
-        frustration_detected,
-        main_issue_origin,
-    )
-
-    out["final_classification"] = classification
     out["handled_status"] = handled_status
-    out["cx_issue_severity"] = severity
+    out["customer_experience"] = customer_experience
+    out["unhandled_resolution_subtype"] = subtype
     out["frustration_detected"] = frustration_detected
+    out["frustration_origin"] = frustration_origin
     out["customer_started_frustrated"] = customer_started_frustrated
     out["customer_became_frustrated_during_chat"] = customer_became_frustrated_during_chat
     out["customer_ended_frustrated"] = customer_ended_frustrated
     out["frustration_timing"] = frustration_timing
-    out["main_issue_origin"] = main_issue_origin
-    out["unhandled_resolution_subtype"] = subtype
 
     sentiment = str(data.get("final_customer_sentiment", "") or "").strip().lower()
     if sentiment not in {"satisfied", "neutral", "frustrated", "confused", "dissatisfied", "unknown"}:
@@ -547,6 +548,8 @@ def validate_conversation_level_result(data: dict) -> dict:
         main_out["issue_type"] = "none"
         main_out["issue_summary"] = "none"
         main_out["customer_impact"] = "none"
+    elif main_out["issue_origin"] == "none":
+        main_out["issue_origin"] = _normalize_sami_origin(frustration_origin)
     out["main_issue"] = main_out
 
     detected = data.get("all_detected_issues") or []
@@ -554,8 +557,12 @@ def validate_conversation_level_result(data: dict) -> dict:
         detected = []
     out["all_detected_issues"] = [
         {
-            "issue_origin": _normalize_issue_origin(d.get("issue_origin", ""), allow_third_party=True),
-            "issue_type": str(d.get("issue_type", "") or ""),
+            "issue_origin": _normalize_sami_origin(d.get("issue_origin", "")),
+            "issue_type": (
+                str(d.get("issue_type", "") or "").strip().lower()
+                if str(d.get("issue_type", "") or "").strip().lower() in _CL_ISSUE_TYPES
+                else "other"
+            ),
             "issue_summary": str(d.get("issue_summary", "") or ""),
             "evidence": str(d.get("evidence", "") or ""),
             "impact": str(d.get("impact", "") or ""),
@@ -566,37 +573,15 @@ def validate_conversation_level_result(data: dict) -> dict:
 
     out["positive_signals"] = [str(x) for x in (data.get("positive_signals") or []) if x]
     out["negative_signals"] = [str(x) for x in (data.get("negative_signals") or []) if x]
-    out["quantifiable_metrics"] = _normalize_quantifiable_metrics(data.get("quantifiable_metrics"))
-    out["conversation_score"] = _normalize_conversation_score(data.get("conversation_score"))
     management_summary = str(data.get("management_summary", "") or "").strip()
     classification_reason = str(data.get("classification_reason", "") or "").strip()
     if classification_reason.lower() in {"", "none", "n/a", "na"}:
         classification_reason = management_summary or (
-            f"{classification} selected from handled_status={handled_status}, "
-            f"cx_issue_severity={severity}, frustration_detected={frustration_detected}, "
-            f"and main_issue_origin={main_issue_origin}."
+            f"Markers selected from handled_status={handled_status}, "
+            f"customer_experience={customer_experience}, frustration_detected={frustration_detected}, "
+            f"and frustration_origin={frustration_origin}."
         )
     out["classification_reason"] = classification_reason
-
-    quantifiable_metrics_reason = str(data.get("quantifiable_metrics_reason", "") or "").strip()
-    if quantifiable_metrics_reason.lower() in {"", "none", "n/a", "na"}:
-        nonzero_metrics: list[str] = []
-        for category in out["quantifiable_metrics"]:
-            metrics = category.get("metrics", {})
-            if not isinstance(metrics, dict):
-                continue
-            for metric_name, metric_value in metrics.items():
-                try:
-                    numeric_value = float(metric_value)
-                except (TypeError, ValueError):
-                    continue
-                if numeric_value:
-                    nonzero_metrics.append(f"{metric_name}={metric_value}")
-        if nonzero_metrics:
-            quantifiable_metrics_reason = "Key non-zero metrics: " + ", ".join(nonzero_metrics[:6]) + "."
-        else:
-            quantifiable_metrics_reason = "No major metric penalties were returned; normalized metric counts were retained for review."
-    out["quantifiable_metrics_reason"] = quantifiable_metrics_reason
     out["management_summary"] = management_summary
     out["recommended_actions"] = [str(x) for x in (data.get("recommended_actions") or []) if x]
     out["manual_review_required"] = _normalize_bool_flag(data.get("manual_review_required"), default=False)
@@ -949,16 +934,15 @@ def run_evaluation(
             cr["parsed_json"] = {
                 "customer_objective_type": "Inquiry",
                 "customer_primary_objective": "",
-                "final_classification": "Not Handled with Many Caused Issues and Frustration",
                 "handled_status": "unhandled",
-                "cx_issue_severity": "many",
+                "customer_experience": "bad",
+                "unhandled_resolution_subtype": "totally_unresolved",
                 "frustration_detected": True,
+                "frustration_origin": "our_side",
                 "customer_started_frustrated": False,
                 "customer_became_frustrated_during_chat": True,
                 "customer_ended_frustrated": False,
                 "frustration_timing": "during",
-                "main_issue_origin": "our_side",
-                "unhandled_resolution_subtype": "totally_unresolved",
                 "final_customer_sentiment": "unknown",
                 "max_frustration_level": state["computed_metadata"].get("max_frustration_level", "none"),
                 "main_issue": {
@@ -971,19 +955,7 @@ def run_evaluation(
                 "all_detected_issues": [],
                 "positive_signals": [],
                 "negative_signals": [],
-                "quantifiable_metrics": [],
-                "conversation_score": {
-                    "resolution_score": 0,
-                    "context_understanding_score": 0,
-                    "customer_effort_score": 0,
-                    "trust_frustration_risk_score": 0,
-                    "raw_total_score": 0,
-                    "final_score": 0,
-                    "score_rating": "Critical",
-                    "score_explanation": "Conversation-level evaluator did not return parseable JSON.",
-                },
                 "classification_reason": "The conversation-level evaluator failed, so the result is treated as unresolved and high risk for review.",
-                "quantifiable_metrics_reason": "No reliable metric counts were returned because parsing failed.",
                 "management_summary": "Automatic evaluation could not parse a result for this conversation. Manual review required.",
                 "recommended_actions": ["Review this conversation manually."],
                 "manual_review_required": True,

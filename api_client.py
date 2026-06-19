@@ -14,6 +14,7 @@ from openai import OpenAI
 
 
 DEFAULT_BASE_URL = "https://langcc.maidstech.ai/v1"
+MAX_CONCURRENCY = 100
 
 @dataclass
 class APIConfig:
@@ -25,7 +26,7 @@ class APIConfig:
     max_tokens: int = 100000
     timeout: float = 60.0
     retries: int = 2
-    concurrency: int = 50
+    concurrency: int = 60
 
 
 def build_client(base_url: str, api_key: str) -> OpenAI:

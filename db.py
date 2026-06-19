@@ -272,6 +272,10 @@ class Database:
                     ),
                 )
 
+    def refresh_default_prompts(self) -> None:
+        """Refresh seeded default prompt rows from the current prompt files."""
+        self._seed_default_prompts()
+
     def list_prompts(self, kind: str) -> list[dict]:
         rows = self._fetchall(
             "SELECT id, kind, name, is_default, is_active, created_at, updated_at "
@@ -440,7 +444,10 @@ class Database:
     def list_runs(self, limit: int = 200) -> list[dict]:
         rows = self._fetchall(
             "SELECT id, name, csv_name, started_at, finished_at, status, "
-            "n_conversations, n_message_calls, n_errors "
+            "n_conversations, n_message_calls, n_errors, "
+            "(SELECT COUNT(*) FROM conversation_results WHERE run_id=runs.id) AS saved_conversations, "
+            "(SELECT COUNT(*) FROM message_results WHERE run_id=runs.id) AS saved_message_results, "
+            "(SELECT COUNT(*) FROM run_errors WHERE run_id=runs.id) AS saved_errors "
             "FROM runs ORDER BY started_at DESC LIMIT ?",
             (int(limit),),
         )
@@ -526,6 +533,33 @@ class Database:
             ),
         )
         return int(cur.lastrowid)
+
+    def get_run_result_counts(self, run_id: int) -> dict[str, int]:
+        run_id = int(run_id)
+        conv = self._fetchone(
+            "SELECT COUNT(*) AS n FROM conversation_results WHERE run_id=?",
+            (run_id,),
+        )
+        msg = self._fetchone(
+            "SELECT COUNT(*) AS n FROM message_results WHERE run_id=?",
+            (run_id,),
+        )
+        err = self._fetchone(
+            "SELECT COUNT(*) AS n FROM run_errors WHERE run_id=?",
+            (run_id,),
+        )
+        return {
+            "conversation_results": int(conv["n"] if conv else 0),
+            "message_results": int(msg["n"] if msg else 0),
+            "run_errors": int(err["n"] if err else 0),
+        }
+
+    def clear_run_results(self, run_id: int) -> None:
+        run_id = int(run_id)
+        with self._tx() as c:
+            c.execute("DELETE FROM message_results WHERE run_id=?", (run_id,))
+            c.execute("DELETE FROM conversation_results WHERE run_id=?", (run_id,))
+            c.execute("DELETE FROM run_errors WHERE run_id=?", (run_id,))
 
     def load_run_results(self, run_id: int) -> dict:
         """Reconstruct the structures the rest of the app uses for a saved run.

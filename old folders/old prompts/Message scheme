@@ -1,6 +1,4 @@
 {
-  "conversation_id": "string",
-  "target_message_id": "string",
   "message_index": 0,
   "message_level_effect": "helped|neutral|minor_issue|major_issue|recovered_issue",
   "frustration_level_after_message": "none|low|medium|high|cancellation_risk",

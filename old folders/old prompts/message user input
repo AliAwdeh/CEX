@@ -1,0 +1,12 @@
+Evaluate the target message using only the visible conversation messages below.
+
+The target message may be an agent message or a customer message. Check target_message.sender_role.
+
+If the target is an agent message, evaluate how that agent message responded to the latest customer need or state.
+
+If the target is a customer message, evaluate the customer's state in that message before the next agent response: whether they are calm, confused, repeating themselves, frustrated, correcting the agent, escalating, accepting the answer, or showing recovery.
+
+Return strict JSON only using the required schema.
+
+Input:
+{payload_json}

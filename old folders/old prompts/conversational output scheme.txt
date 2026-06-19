@@ -29,16 +29,10 @@
       "impact": "string"
     }
   ],
-  "positive_signals": [
-    "short bullet"
-  ],
-  "negative_signals": [
-    "short bullet"
-  ],
+  "positive_signals": ["short bullet"],
+  "negative_signals": ["short bullet"],
   "management_summary": "concise business-friendly explanation of the outcome and customer experience",
-  "recommended_actions": [
-    "short actionable recommendation"
-  ],
+  "recommended_actions": ["short actionable recommendation"],
   "manual_review_required": true,
   "manual_review_reason": "short reason or none",
   "confidence": "low|medium|high",

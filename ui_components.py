@@ -586,11 +586,11 @@ def render_conversation_summary_card(conv_result: dict) -> None:
     md = conv_result.get("conversation_metadata") or {}
     cm = conv_result.get("computed_metadata") or {}
 
-    classification = pj.get("final_classification", "Unknown")
     handled = pj.get("handled_status", "unknown")
-    severity = pj.get("cx_issue_severity", "")
-    severity_display = humanize_label(severity)
+    experience = pj.get("customer_experience", "unknown")
+    experience_display = humanize_label(experience)
     frustration_detected = bool(pj.get("frustration_detected", False))
+    frustration_origin = pj.get("frustration_origin", "none")
     frustration_timing = pj.get("frustration_timing", "none")
     subtype = pj.get("unhandled_resolution_subtype", "")
     sentiment = pj.get("final_customer_sentiment", "unknown")
@@ -600,21 +600,7 @@ def render_conversation_summary_card(conv_result: dict) -> None:
     if not isinstance(score, dict):
         score = {}
 
-    head_colors = {
-        "Handled with Minimal Issues": "#16a34a",
-        "Handled with Many Issues": "#d97706",
-        "Handled with Minimal Issues and Frustration": "#0f766e",
-        "Handled with Many Issues and Frustration": "#b45309",
-        "Handled with Minimal Caused Issues and Frustration": "#0f766e",
-        "Handled with Many Caused Issues and Frustration": "#c2410c",
-        "Not Handled with Minimal Issues": "#0284c7",
-        "Not Handled with Many Issues": "#dc2626",
-        "Not Handled with Minimal Issues and Frustration": "#0369a1",
-        "Not Handled with Many Issues and Frustration": "#b91c1c",
-        "Not Handled with Minimal Caused Issues and Frustration": "#075985",
-        "Not Handled with Many Caused Issues and Frustration": "#991b1b",
-    }
-    color = head_colors.get(classification, "#6b7280")
+    color = "#16a34a" if handled == "handled" and experience == "good" else "#dc2626" if handled == "unhandled" and experience == "bad" else "#d97706"
     subtype_display = humanize_label(subtype) or "n/a"
     show_unresolved_header_badge = handled == "unhandled"
     subtype_color = "#0f766e" if subtype == "pending_unresolved" else "#b45309"
@@ -635,7 +621,7 @@ def render_conversation_summary_card(conv_result: dict) -> None:
         f"""
         <div style="border-left:6px solid {color}; padding:14px 18px; background:#f9fafb; border-radius:6px; margin-bottom:12px;">
           <div style="font-size:0.95rem; color:#374151;">Overall result</div>
-          <div style="font-size:1.25rem; font-weight:700; color:{color};">{html.escape(classification)}</div>
+          <div style="font-size:1.25rem; font-weight:700; color:{color};">{html.escape(humanize_label(handled))} / {html.escape(experience_display)}</div>
           {unresolved_html}
         </div>
         """,
@@ -644,12 +630,13 @@ def render_conversation_summary_card(conv_result: dict) -> None:
 
     badges = []
     badges.append(_badge("Outcome", humanize_label(handled), "#16a34a" if handled == "handled" else "#dc2626"))
-    badges.append(_badge("Journey quality", severity_display or "n/a", "#d97706" if severity == "many" else "#16a34a"))
+    badges.append(_badge("Customer experience", experience_display or "n/a", "#d97706" if experience == "bad" else "#16a34a"))
     badges.append(
         _badge("Customer frustration", "yes" if frustration_detected else "no", "#b91c1c" if frustration_detected else "#475569")
     )
     if frustration_detected:
         badges.append(_badge("When frustration appeared", humanize_label(frustration_timing) or "n/a", "#475569"))
+        badges.append(_badge("Frustration origin", humanize_label(frustration_origin) or "n/a", "#475569"))
     if not show_unresolved_header_badge:
         badges.append(_badge("Unresolved status", subtype_display, "#475569"))
     badges.append(_badge("Customer feeling at end", humanize_label(sentiment), _SENTIMENT_COLORS.get(sentiment, "#6b7280")))
@@ -747,15 +734,10 @@ def render_conversation_summary_card(conv_result: dict) -> None:
     st.write(pj.get("management_summary") or "—")
 
     classification_reason = pj.get("classification_reason")
-    metrics_reason = pj.get("quantifiable_metrics_reason")
-    if classification_reason or metrics_reason:
+    if classification_reason:
         st.markdown("### Decision Reasoning")
-        if classification_reason:
-            st.markdown("**Classification reason**")
-            st.write(classification_reason)
-        if metrics_reason:
-            st.markdown("**Metric reason**")
-            st.write(metrics_reason)
+        st.markdown("**Classification reason**")
+        st.write(classification_reason)
 
     positives = pj.get("positive_signals") or []
     negatives = pj.get("negative_signals") or []
@@ -785,28 +767,6 @@ def render_conversation_summary_card(conv_result: dict) -> None:
                     issue_df[col] = issue_df[col].apply(humanize_label)
             issue_df = issue_df.rename(columns={c: humanize_label(c) for c in issue_df.columns})
             st.dataframe(issue_df, use_container_width=True, hide_index=True)
-
-    quantifiable_metrics = pj.get("quantifiable_metrics") or []
-    if quantifiable_metrics:
-        metric_rows = []
-        for category_obj in quantifiable_metrics:
-            if not isinstance(category_obj, dict):
-                continue
-            category = category_obj.get("category") or "Metrics"
-            metrics = category_obj.get("metrics") or {}
-            if not isinstance(metrics, dict):
-                continue
-            for name, value in metrics.items():
-                metric_rows.append(
-                    {
-                        "Category": category,
-                        "Metric": humanize_label(name),
-                        "Value": value,
-                    }
-                )
-        if metric_rows:
-            with st.expander("Detailed counts", expanded=False):
-                st.dataframe(pd.DataFrame(metric_rows), use_container_width=True, hide_index=True)
 
     rec = pj.get("recommended_actions") or []
     if rec:
@@ -854,15 +814,6 @@ def conversation_filters(conv_df: pd.DataFrame, key_prefix: str = "conv_filters"
     with st.expander("Filters", expanded=True):
         c1, c2, c3 = st.columns(3)
         with c1:
-            classifications = sorted(
-                [c for c in conv_df.get("final_classification", pd.Series(dtype=str)).dropna().unique()]
-            )
-            sel_class = st.multiselect(
-                "Overall result",
-                classifications,
-                default=[],
-                key=f"{key_prefix}_classification",
-            )
             handled = sorted([h for h in conv_df.get("handled_status", pd.Series(dtype=str)).dropna().unique()])
             sel_handled = st.multiselect(
                 "Outcome",
@@ -871,13 +822,13 @@ def conversation_filters(conv_df: pd.DataFrame, key_prefix: str = "conv_filters"
                 format_func=humanize_label,
                 key=f"{key_prefix}_handled",
             )
-            severity = sorted([s for s in conv_df.get("cx_issue_severity", pd.Series(dtype=str)).dropna().unique()])
-            sel_severity = st.multiselect(
-                "Journey quality",
-                severity,
+            experiences = sorted([s for s in conv_df.get("customer_experience", pd.Series(dtype=str)).dropna().unique()])
+            sel_experience = st.multiselect(
+                "Customer experience",
+                experiences,
                 default=[],
                 format_func=humanize_label,
-                key=f"{key_prefix}_severity",
+                key=f"{key_prefix}_experience",
             )
         with c2:
             subtypes = sorted(
@@ -911,6 +862,14 @@ def conversation_filters(conv_df: pd.DataFrame, key_prefix: str = "conv_filters"
                 format_func=humanize_label,
                 key=f"{key_prefix}_origin",
             )
+            frustration_origins = sorted([o for o in conv_df.get("frustration_origin", pd.Series(dtype=str)).dropna().unique()])
+            sel_frustration_origin = st.multiselect(
+                "Frustration origin",
+                frustration_origins,
+                default=[],
+                format_func=humanize_label,
+                key=f"{key_prefix}_frustration_origin",
+            )
             issue_types = sorted([t for t in conv_df.get("main_issue_type", pd.Series(dtype=str)).dropna().unique()])
             sel_issue_type = st.multiselect(
                 "Main problem type",
@@ -938,11 +897,11 @@ def conversation_filters(conv_df: pd.DataFrame, key_prefix: str = "conv_filters"
                     )
 
     return {
-        "classification": sel_class,
         "handled_status": sel_handled,
-        "cx_issue_severity": sel_severity,
+        "customer_experience": sel_experience,
         "unhandled_resolution_subtype": sel_subtype,
         "max_frustration_level": sel_frustration,
+        "frustration_origin": sel_frustration_origin,
         "main_issue_origin": sel_origin,
         "main_issue_type": sel_issue_type,
         "manual_review": sel_mr,
@@ -962,11 +921,11 @@ def apply_conversation_filters(conv_df: pd.DataFrame, filters: dict) -> pd.DataF
         if sel and col in conv_df.columns:
             mask &= conv_df[col].isin(sel)
 
-    in_filter("final_classification", "classification")
     in_filter("handled_status", "handled_status")
-    in_filter("cx_issue_severity", "cx_issue_severity")
+    in_filter("customer_experience", "customer_experience")
     in_filter("unhandled_resolution_subtype", "unhandled_resolution_subtype")
     in_filter("max_frustration_level", "max_frustration_level")
+    in_filter("frustration_origin", "frustration_origin")
     in_filter("main_issue_origin", "main_issue_origin")
     in_filter("main_issue_type", "main_issue_type")
     mr = filters.get("manual_review")

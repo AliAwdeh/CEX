@@ -6,6 +6,7 @@ import json
 import html as html_lib
 import importlib
 import os
+import sqlite3
 import time
 from dataclasses import asdict
 from pathlib import Path
@@ -30,7 +31,7 @@ from data_loader import (
     validate_csv,
 )
 from db import DEFAULT_DB_PATH, Database
-from evaluator import RunConfig, RunResults, run_evaluation
+from evaluator import RunConfig, RunResults, run_evaluation, validate_conversation_level_result
 from prompts import (
     DEFAULT_CONVERSATION_LEVEL_PROMPT,
     DEFAULT_MESSAGE_LEVEL_PROMPT,
@@ -42,11 +43,7 @@ from aggregation import (
     dashboard_aggregates,
     flatten_conversation_row,
     flatten_message_row,
-    get_metric_definition,
     humanize_label,
-    metric_category_display_name,
-    metric_display_name,
-    quantifiable_metric_columns,
     top_frustration_causes,
 )
 from exports import (
@@ -100,7 +97,8 @@ def _init_state() -> None:
         "max_tokens": 100000,
         "timeout": 300.0,
         "retries": 2,
-        "concurrency": 50,
+        "concurrency": 60,
+        "run_all_conversations": False,
         "max_conversations": 50,
         "max_agent_messages_per_conv": 500,
         "truncate_messages": False,
@@ -136,6 +134,72 @@ _init_state()
 def get_db(path: str = str(DEFAULT_DB_PATH)) -> Database:
     """Return a process-wide :class:`Database` instance (cached by Streamlit)."""
     return Database(path)
+
+
+def _db_path(db: Database) -> str:
+    return str(getattr(db, "path", DEFAULT_DB_PATH))
+
+
+def _refresh_default_prompts(db: Database) -> None:
+    refresh = getattr(db, "refresh_default_prompts", None)
+    if callable(refresh):
+        refresh()
+        return
+    seed = getattr(db, "_seed_default_prompts", None)
+    if callable(seed):
+        seed()
+
+
+def _run_result_counts(db: Database, run_id: int) -> dict[str, int]:
+    if hasattr(db, "get_run_result_counts"):
+        return db.get_run_result_counts(run_id)
+    with sqlite3.connect(_db_path(db)) as con:
+        return {
+            "conversation_results": int(con.execute(
+                "SELECT COUNT(*) FROM conversation_results WHERE run_id=?",
+                (int(run_id),),
+            ).fetchone()[0]),
+            "message_results": int(con.execute(
+                "SELECT COUNT(*) FROM message_results WHERE run_id=?",
+                (int(run_id),),
+            ).fetchone()[0]),
+            "run_errors": int(con.execute(
+                "SELECT COUNT(*) FROM run_errors WHERE run_id=?",
+                (int(run_id),),
+            ).fetchone()[0]),
+        }
+
+
+def _fill_saved_run_counts(db: Database, df_runs: pd.DataFrame) -> pd.DataFrame:
+    df_runs = df_runs.copy()
+    for column in ("saved_conversations", "saved_message_results", "saved_errors"):
+        if column not in df_runs.columns:
+            df_runs[column] = pd.NA
+
+    needs_counts = (
+        df_runs[["saved_conversations", "saved_message_results", "saved_errors"]]
+        .isna()
+        .any(axis=1)
+    )
+    if not needs_counts.any():
+        return df_runs
+
+    for index, row in df_runs[needs_counts].iterrows():
+        counts = _run_result_counts(db, int(row["id"]))
+        df_runs.at[index, "saved_conversations"] = counts["conversation_results"]
+        df_runs.at[index, "saved_message_results"] = counts["message_results"]
+        df_runs.at[index, "saved_errors"] = counts["run_errors"]
+    return df_runs
+
+
+def _clear_run_results(db: Database, run_id: int) -> None:
+    if hasattr(db, "clear_run_results"):
+        db.clear_run_results(run_id)
+        return
+    with sqlite3.connect(_db_path(db)) as con:
+        con.execute("DELETE FROM message_results WHERE run_id=?", (int(run_id),))
+        con.execute("DELETE FROM conversation_results WHERE run_id=?", (int(run_id),))
+        con.execute("DELETE FROM run_errors WHERE run_id=?", (int(run_id),))
 
 
 def _load_active_prompts() -> tuple[PromptTemplate, PromptTemplate, int | None, int | None]:
@@ -189,9 +253,16 @@ def _build_run_config() -> tuple[RunConfig, int | None, int | None]:
     record can store the prompt versions used.
     """
     ml_tpl, cl_tpl, ml_id, cl_id = _load_active_prompts()
+    max_conversations = (
+        None
+        if st.session_state.get("run_all_conversations")
+        else int(st.session_state.max_conversations)
+        if st.session_state.max_conversations
+        else None
+    )
     cfg = RunConfig(
         api=_build_api_config(),
-        max_conversations=int(st.session_state.max_conversations) if st.session_state.max_conversations else None,
+        max_conversations=max_conversations,
         max_agent_messages_per_conv=(
             int(st.session_state.max_agent_messages_per_conv)
             if st.session_state.max_agent_messages_per_conv
@@ -220,12 +291,35 @@ def _has_results() -> bool:
     )
 
 
+def _normalize_conversation_result_for_display(cr: dict) -> dict:
+    """Apply current conversation schema defaults to older saved result JSON."""
+    parsed = cr.get("parsed_json") or cr.get("evaluation_output")
+    if not isinstance(parsed, dict):
+        return cr
+    try:
+        normalized = validate_conversation_level_result(parsed)
+    except Exception:
+        return cr
+    cr["parsed_json"] = normalized
+    cr["evaluation_output"] = normalized
+    return cr
+
+
+def _normalize_run_results_for_display(rr: RunResults) -> RunResults:
+    rr.conversation_results = [
+        _normalize_conversation_result_for_display(cr)
+        for cr in rr.conversation_results
+    ]
+    return rr
+
+
 def _conv_dataframe_from_results() -> pd.DataFrame:
     rr = st.session_state.run_results
     if not rr:
         return pd.DataFrame()
     rows = []
     for cr in rr.conversation_results:
+        cr = _normalize_conversation_result_for_display(cr)
         rows.append(
             flatten_conversation_row(
                 cr,
@@ -329,8 +423,6 @@ def _humanize_columns(df: pd.DataFrame, columns: list[str]) -> pd.DataFrame:
 
 
 def _display_column_name(column: str) -> str:
-    if column.startswith("metric__"):
-        return f"{metric_category_display_name(column)} / {metric_display_name(column)}"
     special = {
         "conversation_id": "ID",
         "customer_journey_id": "ID",
@@ -347,7 +439,9 @@ def _display_column_name(column: str) -> str:
         "final_classification": "Overall result",
         "handled_status": "Outcome",
         "cx_issue_severity": "Journey quality",
+        "customer_experience": "Customer experience",
         "frustration_detected": "Customer frustration",
+        "frustration_origin": "Frustration origin",
         "customer_started_frustrated": "Started frustrated",
         "customer_became_frustrated_during_chat": "Became frustrated during chat",
         "customer_ended_frustrated": "Ended frustrated",
@@ -368,7 +462,6 @@ def _display_column_name(column: str) -> str:
         "main_issue_summary": "Main problem summary",
         "customer_impact": "Customer impact",
         "classification_reason": "Classification reason",
-        "quantifiable_metrics_reason": "Metric reason",
         "manual_review_required": "Needs human review",
         "manual_review_reason": "Reason for human review",
         "metric_value": "Metric value",
@@ -432,36 +525,6 @@ def _render_display_table(
         unsafe_allow_html=True,
     )
 
-
-def _render_metric_definition_table(metric_df: pd.DataFrame) -> None:
-    """Render metrics with a clickable info control for each definition."""
-    if metric_df is None or metric_df.empty:
-        st.caption("No metrics.")
-        return
-
-    header_cols = st.columns([3.8, 0.7, 1.0, 1.4, 1.5])
-    headers = ["Metric", "Info", "Total", "Average when flagged", "Conversations > 0"]
-    for col, label in zip(header_cols, headers):
-        with col:
-            st.markdown(f"**{label}**")
-
-    for _, row in metric_df.iterrows():
-        metric_name = str(row.get("Metric", "") or "")
-        metric_col = row.get("Column")
-        definition = get_metric_definition(metric_col) if metric_col else ""
-        row_cols = st.columns([3.8, 0.7, 1.0, 1.4, 1.5])
-        with row_cols[0]:
-            st.write(metric_name or "—")
-        with row_cols[1]:
-            if definition:
-                with st.popover("i", use_container_width=True):
-                    st.write(definition)
-        with row_cols[2]:
-            st.write(_format_chart_value(row.get("Total", 0)))
-        with row_cols[3]:
-            st.write(_format_chart_value(row.get("Average when flagged", 0)))
-        with row_cols[4]:
-            st.write(_format_chart_value(row.get("Conversations > 0", 0)))
 
 
 def _format_chart_value(value: float, suffix: str = "") -> str:
@@ -1016,10 +1079,11 @@ def render_sidebar() -> None:
         st.number_input("Max tokens", min_value=128, step=64, key="max_tokens")
         st.number_input("Timeout (seconds)", min_value=5.0, step=5.0, key="timeout")
         st.number_input("Retry count", min_value=0, step=1, key="retries")
-        st.session_state.concurrency = max(1, int(st.session_state.concurrency))
+        st.session_state.concurrency = min(100, max(1, int(st.session_state.concurrency)))
         st.number_input(
             "Concurrency",
             min_value=1,
+            max_value=100,
             step=1,
             key="concurrency",
             help=(
@@ -1030,11 +1094,35 @@ def render_sidebar() -> None:
 
         st.markdown("---")
         st.markdown("### Evaluation safeguards")
+        summary = st.session_state.get("csv_summary") or {}
+        total_journeys = int(summary.get("journeys") or summary.get("conversations") or 0)
+        if total_journeys:
+            st.caption(f"Uploaded CSV has {total_journeys:,} customer journeys.")
+            current_limit = int(st.session_state.max_conversations or 1)
+            if st.session_state.get("run_all_conversations"):
+                st.session_state.max_conversations = total_journeys
+            elif current_limit > total_journeys:
+                st.session_state.max_conversations = total_journeys
+            elif current_limit < 1:
+                st.session_state.max_conversations = min(50, total_journeys)
+        else:
+            st.session_state.run_all_conversations = False
+        st.toggle(
+            "Run all uploaded journeys",
+            key="run_all_conversations",
+            disabled=not total_journeys,
+            help="When enabled, the run processes every customer journey in the uploaded CSV.",
+        )
+        if total_journeys and st.session_state.run_all_conversations:
+            st.session_state.max_conversations = total_journeys
         st.number_input(
-            "Max customer journeys to process",
+            "Customer journeys to process",
             min_value=1,
+            max_value=total_journeys or None,
             step=1,
             key="max_conversations",
+            disabled=bool(total_journeys and st.session_state.run_all_conversations),
+            help="When 'Run all uploaded journeys' is off, this many journeys are processed from the CSV order.",
         )
         st.number_input(
             "Max target messages per journey",
@@ -1326,21 +1414,69 @@ def tab_run() -> None:
     # --- Past runs (load from DB) ---
     db = get_db()
     with st.expander("Past runs (saved in the database)", expanded=False):
+        if st.button("Refresh saved runs", key="refresh_saved_runs", use_container_width=True):
+            st.rerun()
         runs = db.list_runs(limit=200)
         if not runs:
             st.caption("No saved runs yet.")
         else:
-            df_runs = pd.DataFrame(runs)
+            df_runs = _fill_saved_run_counts(db, pd.DataFrame(runs))
+            n_conversations = pd.to_numeric(
+                df_runs["n_conversations"] if "n_conversations" in df_runs else pd.Series(0, index=df_runs.index),
+                errors="coerce",
+            ).fillna(0)
+            saved_conversations = pd.to_numeric(
+                df_runs["saved_conversations"] if "saved_conversations" in df_runs else pd.Series(0, index=df_runs.index),
+                errors="coerce",
+            ).fillna(0)
+            df_runs["is_incomplete"] = (
+                (n_conversations > 0)
+                & (saved_conversations == 0)
+            )
             df_runs["label"] = df_runs.apply(
                 lambda r: (
                     f"#{r['id']} • {r.get('name') or 'Untitled run'} • "
-                    f"{r.get('csv_name') or '—'} • {r['status']} • {r['started_at']}"
+                    f"{r.get('csv_name') or '—'} • {r['status']}"
+                    f"{' • incomplete: no saved results' if r.get('is_incomplete') else ''} • "
+                    f"{r['started_at']}"
                 ),
                 axis=1,
             )
-            sel = st.selectbox("Select a saved run to load", df_runs["label"].tolist(), index=0)
-            sel_id = int(df_runs.iloc[df_runs.index[df_runs["label"] == sel][0]]["id"])
-            selected_run = df_runs[df_runs["id"] == sel_id].iloc[0].to_dict()
+            st.caption(f"Newest saved run in this database: #{int(df_runs.iloc[0]['id'])}")
+            st.dataframe(
+                df_runs[[
+                    "id",
+                    "csv_name",
+                    "status",
+                    "n_conversations",
+                    "saved_conversations",
+                    "n_message_calls",
+                    "saved_message_results",
+                    "started_at",
+                ]].head(8),
+                use_container_width=True,
+                hide_index=True,
+            )
+            incomplete_count = int(df_runs["is_incomplete"].sum())
+            show_incomplete = False
+            if incomplete_count:
+                show_incomplete = st.checkbox(
+                    f"Show {incomplete_count} incomplete run(s) with no saved results",
+                    value=False,
+                )
+            display_runs = df_runs if show_incomplete else df_runs[~df_runs["is_incomplete"]]
+            if display_runs.empty:
+                st.caption("No loadable saved runs. Enable incomplete runs above if you want to rename or delete them.")
+                return
+
+            sel = st.selectbox(
+                "Select a saved run to load",
+                display_runs["label"].tolist(),
+                index=0,
+                key=f"saved_run_select_{int(df_runs.iloc[0]['id'])}_{int(show_incomplete)}",
+            )
+            sel_id = int(display_runs.iloc[display_runs.index[display_runs["label"] == sel][0]]["id"])
+            selected_run = display_runs[display_runs["id"] == sel_id].iloc[0].to_dict()
             rename_key = f"rename_run_{sel_id}"
             st.text_input(
                 "Rename selected run",
@@ -1350,9 +1486,20 @@ def tab_run() -> None:
             )
             col_load, col_rename, col_del = st.columns([1, 1, 1])
             with col_load:
-                if st.button("Load this run", use_container_width=True):
+                is_incomplete_run = bool(selected_run.get("is_incomplete"))
+                if is_incomplete_run:
+                    st.caption("This run has no saved result rows, so it cannot be loaded.")
+                if st.button("Load this run", use_container_width=True, disabled=is_incomplete_run):
                     try:
                         loaded = db.load_run_results(sel_id)
+                        if (
+                            not loaded["conversation_results"]
+                            and int(selected_run.get("n_conversations") or 0) > 0
+                        ):
+                            raise ValueError(
+                                "This run has summary metadata but no saved result rows. "
+                                "It cannot be reconstructed from the database."
+                            )
                         rr = RunResults(
                             conversation_results=loaded["conversation_results"],
                             message_level_results=loaded["message_level_results"],
@@ -1360,6 +1507,7 @@ def tab_run() -> None:
                             started_at=loaded["started_at"],
                             finished_at=loaded["finished_at"],
                         )
+                        rr = _normalize_run_results_for_display(rr)
                         st.session_state.run_results = rr
                         st.session_state.current_run_id = sel_id
                         st.session_state.loaded_run_label = sel
@@ -1405,7 +1553,7 @@ def tab_run() -> None:
 
     target_role = str(st.session_state.message_target_role or "agent")
 
-    # ---- Customer journey selection (first-N, specific customers, random) ---
+    # ---- Customer journey selection (sidebar scope, specific customers, random) ---
     selector_df = _journey_selector_rows(df)
     all_ids = selector_df["journey_id"].astype(str).tolist() if not selector_df.empty else []
     selected_ids = _ordered_selected_ids(all_ids, st.session_state.selected_conversation_ids)
@@ -1416,7 +1564,7 @@ def tab_run() -> None:
 
     st.markdown("### Customer journey selection")
     st.caption(
-        "Leave selection empty to run the first N customer journeys from the sidebar. "
+        "Leave selection empty to use the sidebar journey scope. "
         "Pin specific journeys to evaluate only those customers."
     )
 
@@ -1496,12 +1644,15 @@ def tab_run() -> None:
             use_container_width=True,
             help=(
                 "Pick a random sample of IDs from the uploaded CSV. "
-                "Sample size = 'Max customer journeys to process' from the sidebar."
+                "Sample size uses the sidebar journey count, or all journeys when Run all uploaded journeys is enabled."
             ),
             disabled=not all_ids,
         ):
             import random
-            n = max(1, int(st.session_state.max_conversations or 1))
+            if st.session_state.get("run_all_conversations"):
+                n = len(all_ids)
+            else:
+                n = max(1, int(st.session_state.max_conversations or 1))
             n = min(n, len(all_ids))
             st.session_state.selected_conversation_ids = _ordered_selected_ids(all_ids, random.sample(all_ids, n))
             st.rerun()
@@ -1517,7 +1668,7 @@ def tab_run() -> None:
     if selected_ids:
         st.success(
             f"{len(selected_ids):,} customer journey/journeys pinned. "
-            "The run will ignore Max customer journeys and evaluate only this pinned selection."
+            "The run will ignore the sidebar journey count and evaluate only this pinned selection."
         )
         selected_preview_df = selector_df[selector_df["journey_id"].astype(str).isin(set(selected_ids))].copy()
         selected_preview_df["order"] = selected_preview_df["journey_id"].astype(str).map(
@@ -1539,7 +1690,13 @@ def tab_run() -> None:
                 hide_index=True,
             )
     else:
-        st.info("No pinned selection. The run will evaluate the first N customer journeys from the CSV.")
+        if st.session_state.get("run_all_conversations"):
+            st.info("No pinned selection. The run will evaluate all customer journeys from the CSV.")
+        else:
+            st.info(
+                "No pinned selection. The run will evaluate the first "
+                f"{int(st.session_state.max_conversations):,} customer journeys from the CSV."
+            )
 
     # Build the estimate. When a random selection is active, count over the
     # pinned IDs; otherwise apply the max_conversations slice.
@@ -1552,9 +1709,14 @@ def tab_run() -> None:
             target_role=target_role,
         )
     else:
+        max_conversations_for_estimate = (
+            None
+            if st.session_state.get("run_all_conversations")
+            else int(st.session_state.max_conversations)
+        )
         estimate = estimate_call_counts(
             df,
-            max_conversations=int(st.session_state.max_conversations),
+            max_conversations=max_conversations_for_estimate,
             max_agent_messages_per_conv=int(st.session_state.max_agent_messages_per_conv),
             target_role=target_role,
         )
@@ -1578,9 +1740,14 @@ def tab_run() -> None:
 
     large_job = estimate["total_calls"] > 200
     if large_job:
+        scope_hint = (
+            "Turn off Run all uploaded journeys, lower the journey count, or lower Max target messages per journey in the sidebar."
+            if st.session_state.get("run_all_conversations") and not selected_ids
+            else "Consider lowering the journey count or Max target messages per journey in the sidebar."
+        )
         st.warning(
             f"This run will make ~{estimate['total_calls']:,} AI calls. "
-            "Consider lowering Max customer journeys or Max target messages per journey in the sidebar."
+            + scope_hint
         )
 
     run_col, cancel_col, _ = st.columns([1, 1, 4])
@@ -1622,6 +1789,7 @@ def tab_run() -> None:
             "timeout": config.api.timeout,
             "retries": config.api.retries,
             "concurrency": config.api.concurrency,
+            "run_all_conversations": bool(st.session_state.get("run_all_conversations")),
             "max_conversations": config.max_conversations,
             "max_target_messages_per_journey": config.max_agent_messages_per_conv,
             "truncate_messages": config.truncate_messages,
@@ -1687,25 +1855,50 @@ def tab_run() -> None:
         def cancel_requested() -> bool:
             return bool(st.session_state.cancel_flag)
 
+        persistence_errors: list[str] = []
+
         def save_message(mr: dict) -> None:
             try:
                 mr["run_id"] = run_id
                 db.save_message_result(run_id, mr)
-            except Exception:
-                pass
+            except Exception as e:
+                persistence_errors.append(f"message result: {e}")
 
         def save_conversation(cr: dict) -> None:
             try:
                 cr["run_id"] = run_id
                 db.save_conversation_result(run_id, cr)
-            except Exception:
-                pass
+            except Exception as e:
+                persistence_errors.append(f"conversation result: {e}")
 
         def save_err(err: dict) -> None:
             try:
                 db.save_error(run_id, err)
-            except Exception:
-                pass
+            except Exception as e:
+                persistence_errors.append(f"run error: {e}")
+
+        def persist_completed_results() -> None:
+            if results is None:
+                return
+            counts = _run_result_counts(db, run_id)
+            expected_convs = len(results.conversation_results)
+            expected_msgs = len(results.message_level_results)
+            expected_errors = len(results.errors)
+            if (
+                counts["conversation_results"] == expected_convs
+                and counts["message_results"] == expected_msgs
+                and counts["run_errors"] == expected_errors
+            ):
+                return
+            _clear_run_results(db, run_id)
+            for mr in results.message_level_results:
+                mr["run_id"] = run_id
+                db.save_message_result(run_id, mr)
+            for cr in results.conversation_results:
+                cr["run_id"] = run_id
+                db.save_conversation_result(run_id, cr)
+            for err in results.errors:
+                db.save_error(run_id, err)
 
         results = None
         try:
@@ -1721,11 +1914,17 @@ def tab_run() -> None:
                 on_error=save_err,
             )
             st.session_state.run_results = results
+            persist_completed_results()
             progress_box.success(
                 f"Evaluation finished. {len(results.conversation_results)} customer journeys processed, "
                 f"{len(results.message_level_results)} message-level calls, "
                 f"{len(results.errors)} errors. Saved as run #{run_id}."
             )
+            if persistence_errors:
+                st.warning(
+                    "Some live DB saves failed during the run, but the completed results were saved again at the end. "
+                    f"First error: {persistence_errors[0]}"
+                )
         except Exception as e:
             progress_box.error(f"Evaluation failed: {e}")
         finally:
@@ -1870,8 +2069,8 @@ def _section_header(title: str, caption: str | None = None) -> None:
 def _render_kpi_strip(filtered: pd.DataFrame, msg_df: pd.DataFrame, agg: dict, total: int) -> None:
     handled = int((_safe_col(filtered, "handled_status") == "handled").sum())
     unhandled = int((_safe_col(filtered, "handled_status") == "unhandled").sum())
-    many = int((_safe_col(filtered, "cx_issue_severity") == "many").sum())
-    minimal = int((_safe_col(filtered, "cx_issue_severity") == "zero_minimal").sum())
+    bad = int((_safe_col(filtered, "customer_experience") == "bad").sum())
+    good = int((_safe_col(filtered, "customer_experience") == "good").sum())
 
     if "frustration_detected" in filtered.columns:
         frustrated = int(filtered["frustration_detected"].fillna(False).astype(bool).sum())
@@ -1879,12 +2078,12 @@ def _render_kpi_strip(filtered: pd.DataFrame, msg_df: pd.DataFrame, agg: dict, t
         frustrated = 0
     calm = total - frustrated
 
-    if "main_issue_origin" in filtered.columns:
-        oc = filtered["main_issue_origin"].fillna("none").astype(str).value_counts().to_dict()
+    if "frustration_origin" in filtered.columns:
+        oc = filtered["frustration_origin"].fillna("none").astype(str).value_counts().to_dict()
     else:
         oc = {}
     our_side = int(oc.get("our_side", 0))
-    customer = int(oc.get("customer", 0))
+    customer = int(oc.get("customer_side", 0))
     shared = int(oc.get("shared", 0))
     no_issue = int(oc.get("none", 0))
     unclear = max(total - our_side - customer - shared - no_issue, 0)
@@ -1918,12 +2117,12 @@ def _render_kpi_strip(filtered: pd.DataFrame, msg_df: pd.DataFrame, agg: dict, t
             ],
         ),
         _kpi_card_html(
-            "Issue severity",
-            f"{_pct(many, total):.1f}% many",
-            f"Many {many:,} · Minimal {minimal:,}",
+            "Customer experience",
+            f"{_pct(bad, total):.1f}% bad",
+            f"Bad {bad:,} · Good {good:,}",
             [
-                ("Many", many, _DASH_COLORS["many"]),
-                ("Minimal", minimal, _DASH_COLORS["minimal"]),
+                ("Bad", bad, _DASH_COLORS["many"]),
+                ("Good", good, _DASH_COLORS["minimal"]),
             ],
         ),
         _kpi_card_html(
@@ -1936,7 +2135,7 @@ def _render_kpi_strip(filtered: pd.DataFrame, msg_df: pd.DataFrame, agg: dict, t
             ],
         ),
         _kpi_card_html(
-            "Issue origin",
+            "Frustration origin",
             f"{_pct(our_side, total):.1f}% our side",
             f"Our {our_side:,} · Customer {customer:,} · Shared {shared:,} · None {no_issue:,}",
             [
@@ -1962,8 +2161,8 @@ def _render_outcome_sunburst(filtered: pd.DataFrame) -> None:
     work["Outcome"] = work["handled_status"].fillna("unknown").map(
         {"handled": "Handled", "unhandled": "Not handled"}
     ).fillna("Unknown")
-    work["Severity"] = _safe_col(work, "cx_issue_severity", "unknown").fillna("unknown").map(
-        {"many": "Many", "zero_minimal": "Minimal"}
+    work["Experience"] = _safe_col(work, "customer_experience", "unknown").fillna("unknown").map(
+        {"bad": "Bad", "good": "Good"}
     ).fillna("Unknown")
     if "frustration_detected" in work.columns:
         work["Frustration"] = work["frustration_detected"].fillna(False).astype(bool).map(
@@ -1972,20 +2171,22 @@ def _render_outcome_sunburst(filtered: pd.DataFrame) -> None:
     else:
         work["Frustration"] = "Unknown"
 
-    grp = work.groupby(["Outcome", "Severity", "Frustration"]).size().reset_index(name="Count")
+    grp = work.groupby(["Outcome", "Experience", "Frustration"]).size().reset_index(name="Count")
     grp = grp[grp["Count"] > 0]
     if grp.empty:
         st.caption("No data.")
         return
     fig = px.sunburst(
         grp,
-        path=["Outcome", "Severity", "Frustration"],
+        path=["Outcome", "Experience", "Frustration"],
         values="Count",
         color="Outcome",
         color_discrete_map={
             "Handled": _DASH_COLORS["handled"],
             "Not handled": _DASH_COLORS["unhandled"],
             "Unknown": _DASH_COLORS["none"],
+            "Bad": _DASH_COLORS["many"],
+            "Good": _DASH_COLORS["minimal"],
         },
         branchvalues="total",
     )
@@ -2012,10 +2213,10 @@ def _render_outcome_cascade(filtered: pd.DataFrame, total: int) -> None:
             continue
         chunks.append(_node_html(outcome_label, outcome_count, total, total, 0, outcome_color))
         for sev_val, sev_label, sev_color in (
-            ("many", "Many issues", _DASH_COLORS["many"]),
-            ("zero_minimal", "Minimal / zero issues", _DASH_COLORS["minimal"]),
+            ("bad", "Bad experience", _DASH_COLORS["many"]),
+            ("good", "Good experience", _DASH_COLORS["minimal"]),
         ):
-            sev_df = outcome_df[_safe_col(outcome_df, "cx_issue_severity") == sev_val]
+            sev_df = outcome_df[_safe_col(outcome_df, "customer_experience") == sev_val]
             sev_count = int(len(sev_df))
             if sev_count == 0:
                 continue
@@ -2039,22 +2240,22 @@ def _render_issue_sunburst(filtered: pd.DataFrame) -> None:
     work = filtered.copy()
     work["Origin"] = work["main_issue_origin"].fillna("none").astype(str).apply(humanize_label)
     work["Issue type"] = _safe_col(work, "main_issue_type", "none").fillna("none").astype(str).apply(humanize_label)
-    work["Severity"] = _safe_col(work, "cx_issue_severity", "unknown").fillna("unknown").map(
-        {"many": "Many", "zero_minimal": "Minimal"}
+    work["Experience"] = _safe_col(work, "customer_experience", "unknown").fillna("unknown").map(
+        {"bad": "Bad", "good": "Good"}
     ).fillna("Unknown")
-    grp = work.groupby(["Origin", "Issue type", "Severity"]).size().reset_index(name="Count")
+    grp = work.groupby(["Origin", "Issue type", "Experience"]).size().reset_index(name="Count")
     grp = grp[grp["Count"] > 0]
     if grp.empty:
         st.caption("No data.")
         return
     fig = px.sunburst(
         grp,
-        path=["Origin", "Issue type", "Severity"],
+        path=["Origin", "Issue type", "Experience"],
         values="Count",
         color="Origin",
         color_discrete_map={
             "Our Side": _DASH_COLORS["our_side"],
-            "Customer": _DASH_COLORS["customer"],
+            "Customer side": _DASH_COLORS["customer"],
             "Shared": _DASH_COLORS["shared"],
             "None": _DASH_COLORS["none"],
             "Unclear": _DASH_COLORS["unclear"],
@@ -2076,7 +2277,7 @@ def _render_issue_cascade(filtered: pd.DataFrame, total: int) -> None:
     ]
     origin_palette = {
         "our_side": _DASH_COLORS["our_side"],
-        "customer": _DASH_COLORS["customer"],
+        "customer_side": _DASH_COLORS["customer"],
         "shared": _DASH_COLORS["shared"],
         "none": _DASH_COLORS["none"],
         "unclear": _DASH_COLORS["unclear"],
@@ -2234,13 +2435,13 @@ def _render_overall_sankey(filtered: pd.DataFrame) -> None:
     work["L1 Outcome"] = _safe_col(work, "handled_status", "unknown").fillna("unknown").map(
         {"handled": "Handled", "unhandled": "Not handled"}
     ).fillna("Unknown")
-    work["L2 Severity"] = _safe_col(work, "cx_issue_severity", "unknown").fillna("unknown").map(
-        {"many": "Many issues", "zero_minimal": "Minimal / zero"}
+    work["L2 Experience"] = _safe_col(work, "customer_experience", "unknown").fillna("unknown").map(
+        {"bad": "Bad experience", "good": "Good experience"}
     ).fillna("Unknown")
-    work["L3 Origin"] = _safe_col(work, "main_issue_origin", "none").fillna("none").astype(str).apply(humanize_label)
+    work["L3 Frustration Origin"] = _safe_col(work, "frustration_origin", "none").fillna("none").astype(str).apply(humanize_label)
     work["L4 Frustration"] = _safe_col(work, "frustration_timing", "none").fillna("none").astype(str).apply(humanize_label)
 
-    levels = ["L1 Outcome", "L2 Severity", "L3 Origin", "L4 Frustration"]
+    levels = ["L1 Outcome", "L2 Experience", "L3 Frustration Origin", "L4 Frustration"]
     label_to_id: dict[tuple[int, str], int] = {}
     labels: list[str] = []
     node_colors: list[str] = []
@@ -2248,10 +2449,10 @@ def _render_overall_sankey(filtered: pd.DataFrame) -> None:
     color_map = {
         "Handled": _DASH_COLORS["handled"],
         "Not handled": _DASH_COLORS["unhandled"],
-        "Many issues": _DASH_COLORS["many"],
-        "Minimal / zero": _DASH_COLORS["minimal"],
+        "Bad experience": _DASH_COLORS["many"],
+        "Good experience": _DASH_COLORS["minimal"],
         "Our Side": _DASH_COLORS["our_side"],
-        "Customer": _DASH_COLORS["customer"],
+        "Customer side": _DASH_COLORS["customer"],
         "Shared": _DASH_COLORS["shared"],
         "None": _DASH_COLORS["none"],
         "Unclear": _DASH_COLORS["unclear"],
@@ -2308,43 +2509,11 @@ def _hex_to_rgba(hex_color: str, alpha: float) -> str:
     return f"rgba({r},{g},{b},{alpha})"
 
 
-# --------- Overview tab: classification family tree ---------
-#
-# The 12 final_classification labels are organized into a three-level tree for
-# management. The split between "Pending unresolved" and "Totally unresolved"
-# (both inside Not Handled) comes from unhandled_resolution_subtype, NOT from the
-# classification label itself, so the same 6 unhandled labels appear under both.
-
-# Experience bucket per leaf: good = zero_minimal issues, bad = many issues.
-_OVERVIEW_GOOD_HANDLED = [
-    "Handled with Minimal Issues",
-    "Handled with Minimal Issues and Frustration",
-    "Handled with Minimal Caused Issues and Frustration",
-]
-_OVERVIEW_BAD_HANDLED = [
-    "Handled with Many Issues",
-    "Handled with Many Issues and Frustration",
-    "Handled with Many Caused Issues and Frustration",
-]
-_OVERVIEW_GOOD_UNHANDLED = [
-    "Not Handled with Minimal Issues",
-    "Not Handled with Minimal Issues and Frustration",
-    "Not Handled with Minimal Caused Issues and Frustration",
-]
-_OVERVIEW_BAD_UNHANDLED = [
-    "Not Handled with Many Issues",
-    "Not Handled with Many Issues and Frustration",
-    "Not Handled with Many Caused Issues and Frustration",
-]
+# --------- Overview tab: marker family tree ---------
 
 
 def _overview_tree_spec() -> list[dict]:
-    """Describe the family tree: families -> subgroups -> experience -> labels.
-
-    Each node carries the filter predicate columns it matches on. Leaves are the
-    final_classification labels; subgroup membership for unhandled also depends on
-    unhandled_resolution_subtype.
-    """
+    """Describe the family tree using the Sami marker fields."""
     return [
         {
             "key": "handled",
@@ -2354,8 +2523,8 @@ def _overview_tree_spec() -> list[dict]:
             "handled_status": "handled",
             "subtype": None,
             "experiences": [
-                {"title": "Good experience", "tone": "good", "labels": _OVERVIEW_GOOD_HANDLED},
-                {"title": "Bad experience", "tone": "bad", "labels": _OVERVIEW_BAD_HANDLED},
+                {"title": "Good experience", "tone": "good", "value": "good"},
+                {"title": "Bad experience", "tone": "bad", "value": "bad"},
             ],
         },
         {
@@ -2366,8 +2535,8 @@ def _overview_tree_spec() -> list[dict]:
             "handled_status": "unhandled",
             "subtype": "pending_unresolved",
             "experiences": [
-                {"title": "Good experience", "tone": "good", "labels": _OVERVIEW_GOOD_UNHANDLED},
-                {"title": "Bad experience", "tone": "bad", "labels": _OVERVIEW_BAD_UNHANDLED},
+                {"title": "Good experience", "tone": "good", "value": "good"},
+                {"title": "Bad experience", "tone": "bad", "value": "bad"},
             ],
         },
         {
@@ -2378,8 +2547,8 @@ def _overview_tree_spec() -> list[dict]:
             "handled_status": "unhandled",
             "subtype": "totally_unresolved",
             "experiences": [
-                {"title": "Good experience", "tone": "good", "labels": _OVERVIEW_GOOD_UNHANDLED},
-                {"title": "Bad experience", "tone": "bad", "labels": _OVERVIEW_BAD_UNHANDLED},
+                {"title": "Good experience", "tone": "good", "value": "good"},
+                {"title": "Bad experience", "tone": "bad", "value": "bad"},
             ],
         },
     ]
@@ -2398,7 +2567,8 @@ def _overview_node_df(
     conv_df: pd.DataFrame,
     handled_status: str,
     subtype: str | None,
-    labels: list[str] | None = None,
+    customer_experience: str | None = None,
+    frustration_origin: str | None = None,
 ) -> pd.DataFrame:
     """Slice the conversation table for one node of the family tree."""
     if conv_df.empty or "handled_status" not in conv_df.columns:
@@ -2410,8 +2580,13 @@ def _overview_node_df(
         sub = conv_df["unhandled_resolution_subtype"].astype(str).str.strip().str.lower()
         mask &= sub == subtype
 
-    if labels is not None and "final_classification" in conv_df.columns:
-        mask &= conv_df["final_classification"].isin(labels)
+    if customer_experience is not None and "customer_experience" in conv_df.columns:
+        exp = conv_df["customer_experience"].astype(str).str.strip().str.lower()
+        mask &= exp == customer_experience
+
+    if frustration_origin is not None and "frustration_origin" in conv_df.columns:
+        origin = conv_df["frustration_origin"].astype(str).str.strip().str.lower()
+        mask &= origin == frustration_origin
 
     return conv_df[mask]
 
@@ -2437,9 +2612,10 @@ def _overview_count_bar(label: str, count: int, total: int, color: str, depth: i
 _OVERVIEW_JOURNEY_COLUMNS = {
     "conversation_id": "ID",
     "customer_name": "Customer",
-    "final_classification": "Classification",
-    "score_final": "Score",
-    "score_rating": "Rating",
+    "handled_status": "Outcome",
+    "customer_experience": "Experience",
+    "unhandled_resolution_subtype": "Unresolved status",
+    "frustration_origin": "Frustration origin",
     "main_issue_type": "Main issue",
     "main_issue_origin": "Origin",
     "max_frustration_level": "Max frustration",
@@ -2454,39 +2630,21 @@ def _overview_journey_table(node_df: pd.DataFrame) -> pd.DataFrame:
     """Build the issue-focused journey list shown when a leaf is expanded."""
     cols = [c for c in _OVERVIEW_JOURNEY_COLUMNS if c in node_df.columns]
     view = node_df[cols].copy()
-    for c in ("main_issue_type", "main_issue_origin", "max_frustration_level", "final_customer_sentiment", "score_rating"):
+    for c in (
+        "handled_status",
+        "customer_experience",
+        "unhandled_resolution_subtype",
+        "frustration_origin",
+        "main_issue_type",
+        "main_issue_origin",
+        "max_frustration_level",
+        "final_customer_sentiment",
+    ):
         if c in view.columns:
             view[c] = view[c].apply(humanize_label)
     view = view.rename(columns=_OVERVIEW_JOURNEY_COLUMNS)
     return view
 
-
-def _overview_metric_table(node_df: pd.DataFrame) -> pd.DataFrame:
-    """Aggregate quantifiable metrics across the journeys in a slice."""
-    metric_cols = quantifiable_metric_columns(node_df)
-    if not metric_cols or node_df.empty:
-        return pd.DataFrame()
-    rows = []
-    for col in metric_cols:
-        series = pd.to_numeric(node_df[col], errors="coerce").fillna(0)
-        contributing = int((series > 0).sum())
-        total = float(series.sum())
-        if total <= 0:
-            continue
-        rows.append(
-            {
-                "Category": metric_category_display_name(col),
-                "Metric": metric_display_name(col),
-                "Total": total,
-                "Journeys affected": contributing,
-                "Avg when flagged": (float(series[series > 0].mean()) if contributing else 0.0),
-            }
-        )
-    if not rows:
-        return pd.DataFrame()
-    return pd.DataFrame(rows).sort_values(
-        ["Total", "Journeys affected"], ascending=[False, False]
-    )
 
 
 def tab_overview() -> None:
@@ -2522,7 +2680,7 @@ def tab_overview() -> None:
         family_slices[family["key"]] = fdf
         count = int(len(fdf))
         good_n = sum(
-            len(_overview_node_df(filtered, family["handled_status"], family["subtype"], exp["labels"]))
+            len(_overview_node_df(filtered, family["handled_status"], family["subtype"], exp["value"]))
             for exp in family["experiences"] if exp["tone"] == "good"
         )
         bad_n = count - good_n
@@ -2538,11 +2696,11 @@ def tab_overview() -> None:
                 unsafe_allow_html=True,
             )
 
-    # --- Classification breakdown table per family ---
+    # --- Marker breakdown table per family ---
     st.markdown("---")
     _section_header(
-        "Journey classification breakdown",
-        "Each family split by experience and exact classification label. "
+        "Journey marker breakdown",
+        "Each family split by customer experience and frustration origin. "
         "Bad experience shown first.",
     )
 
@@ -2569,36 +2727,23 @@ def tab_overview() -> None:
                 st.caption("No journeys in this family.")
                 continue
 
-            # Classification table: bad experience first, then good
+            # Marker table: bad experience first, then good
             ordered_exps = sorted(family["experiences"], key=lambda e: 0 if e["tone"] == "bad" else 1)
             table_rows = []
             for exp in ordered_exps:
-                for label in exp["labels"]:
-                    ldf = _overview_node_df(filtered, family["handled_status"], family["subtype"], [label])
-                    lcount = int(len(ldf))
-                    # Derive responsibility from classification label:
-                    # "Caused" in label = our side caused it; else external/no issue
-                    if "Caused" in label:
-                        responsibility = "Our side"
-                    elif "with Many Issues" in label or "with Minimal Issues" in label:
-                        responsibility = "External"
-                    else:
-                        responsibility = "—"
-                    # Shorten the display label — Responsibility column already
-                    # covers "Caused/Our side", so strip the redundant parts.
-                    if "Frustration" in label:
-                        if "Many" in label:
-                            display_label = "Many Issues + Frustration"
-                        else:
-                            display_label = "Minimal Issues + Frustration"
-                    elif "Many" in label:
-                        display_label = "Many Issues"
-                    else:
-                        display_label = "Minimal Issues"
+                edf = _overview_node_df(filtered, family["handled_status"], family["subtype"], exp["value"])
+                if edf.empty:
+                    continue
+                origins = (
+                    edf["frustration_origin"].fillna("none").astype(str).value_counts()
+                    if "frustration_origin" in edf.columns
+                    else pd.Series({"none": len(edf)})
+                )
+                for origin, lcount in origins.items():
                     table_rows.append({
-                        "Classification": display_label,
-                        "Responsibility": responsibility,
-                        "Journeys": lcount,
+                        "Experience": humanize_label(exp["value"]),
+                        "Frustration origin": humanize_label(origin),
+                        "Journeys": int(lcount),
                         f"% of {family['short_name']}": f"{_pct(lcount, fcount):.1f}%",
                         "% of total": f"{_pct(lcount, total):.1f}%",
                     })
@@ -2617,7 +2762,7 @@ def tab_overview() -> None:
         "Shows every journey where a main issue was identified.",
     )
 
-    issue_cols_needed = ["main_issue_type", "main_issue_origin", "main_issue_summary", "customer_impact", "final_classification"]
+    issue_cols_needed = ["main_issue_type", "main_issue_origin", "main_issue_summary", "customer_impact", "customer_experience"]
     available = [c for c in issue_cols_needed if c in filtered.columns]
     if not available:
         st.caption("No issue data available.")
@@ -2639,7 +2784,7 @@ def tab_overview() -> None:
         if "main_issue_origin" in issues_df.columns:
             origin_opts = sorted(issues_df["main_issue_origin"].dropna().unique().tolist())
             sel_origins = st.multiselect(
-                "Issue origin", [humanize_label(o) for o in origin_opts], default=[], key="overview_issue_origin",
+                "Frustration origin", [humanize_label(o) for o in origin_opts], default=[], key="overview_issue_origin",
             )
         else:
             sel_origins = []
@@ -2672,53 +2817,6 @@ def tab_overview() -> None:
     st.caption(f"{len(view):,} journeys with detected issues — {len(grouped):,} distinct issue types")
     st.dataframe(grouped, use_container_width=True, hide_index=True)
 
-    # --- Quantifiable metrics table ---
-    st.markdown("---")
-    _section_header(
-        "Quantifiable metrics breakdown",
-        "Numeric impact metrics totalled across all journeys. "
-        "Filter by category or metric to focus on specific areas.",
-    )
-
-    metric_table = _overview_metric_table(filtered)
-    if metric_table.empty:
-        st.caption("No quantifiable issues recorded.")
-        return
-
-    mf1, mf2, mf3 = st.columns([1.4, 1.4, 1])
-    with mf1:
-        cat_opts = sorted(metric_table["Category"].unique().tolist())
-        sel_cats = st.multiselect(
-            "Metric categories", cat_opts, default=[],
-            help="Leave empty to include all categories.", key="overview_metric_cats",
-        )
-    with mf2:
-        metric_pool = metric_table
-        if sel_cats:
-            metric_pool = metric_pool[metric_pool["Category"].isin(sel_cats)]
-        metric_opts = sorted(metric_pool["Metric"].unique().tolist())
-        sel_metrics = st.multiselect(
-            "Metrics", metric_opts, default=[],
-            help="Leave empty to include all metrics.", key="overview_metric_names",
-        )
-    with mf3:
-        min_total = st.number_input(
-            "Minimum total", min_value=0.0, value=0.0, step=1.0, key="overview_metric_min",
-        )
-
-    view = metric_table.copy()
-    if sel_cats:
-        view = view[view["Category"].isin(sel_cats)]
-    if sel_metrics:
-        view = view[view["Metric"].isin(sel_metrics)]
-    if min_total > 0:
-        view = view[view["Total"] >= float(min_total)]
-
-    if view.empty:
-        st.caption("No metrics match the selected filters.")
-        return
-
-    st.dataframe(view, use_container_width=True, hide_index=True)
 
 
 def tab_dashboard() -> None:
@@ -2856,217 +2954,6 @@ def tab_dashboard() -> None:
 
     st.markdown("---")
     _section_header(
-        "Quantifiable metrics tree",
-        "Category → metric, sized by total volume. Expand any category to see its metrics and the journeys that contributed.",
-    )
-    metric_totals = agg.get("metric_totals", pd.DataFrame())
-    if not metric_totals.empty:
-        metric_view = metric_totals.copy()
-        metric_view["Total"] = pd.to_numeric(metric_view["Total"], errors="coerce").fillna(0)
-        metric_view["Average when flagged"] = pd.to_numeric(
-            metric_view["Average"], errors="coerce"
-        ).fillna(0)
-        metric_view = metric_view.drop(columns=["Average"])
-        metric_view["Conversations > 0"] = pd.to_numeric(
-            metric_view["Conversations > 0"], errors="coerce"
-        ).fillna(0).astype(int)
-
-        tree_view = metric_view[metric_view["Total"] > 0].copy()
-        if HAS_PLOTLY and not tree_view.empty:
-            fig = px.treemap(
-                tree_view,
-                path=["Category", "Metric"],
-                values="Total",
-                color="Category",
-                hover_data={"Total": True, "Conversations > 0": True, "Average when flagged": ":.2f"},
-            )
-            fig.update_traces(
-                textinfo="label+value",
-                marker=dict(line=dict(width=0.6, color=_DASH_COLORS["panel_border"])),
-            )
-            _plotly_layout(fig, height=420, margin=dict(t=10, b=10, l=10, r=10))
-            _render_plotly(fig)
-        elif tree_view.empty:
-            st.caption("All quantifiable metrics are zero across the filtered journeys.")
-
-        with st.expander("Filter and sort metrics", expanded=False):
-            f1, f2, f3, f4 = st.columns([1.3, 1.3, 1, 1])
-            with f1:
-                category_options = sorted(metric_view["Category"].dropna().unique().tolist())
-                selected_categories = st.multiselect(
-                    "Metric categories",
-                    category_options,
-                    default=[],
-                    help="Leave empty to include all categories.",
-                )
-            with f2:
-                metric_search = st.text_input("Search metrics", value="")
-            with f3:
-                only_nonzero = st.toggle("Only nonzero", value=True)
-            with f4:
-                min_total = st.number_input("Minimum total", min_value=0.0, value=0.0, step=1.0)
-
-            sort_mode = st.selectbox(
-                "Sort metrics by",
-                [
-                    "Total descending",
-                    "Contributing journeys descending",
-                    "Category then metric",
-                    "Average when flagged descending",
-                ],
-                index=0,
-            )
-
-        if selected_categories:
-            metric_view = metric_view[metric_view["Category"].isin(selected_categories)]
-        if metric_search.strip():
-            needle = metric_search.strip().lower()
-            metric_view = metric_view[
-                metric_view["Metric"].astype(str).str.lower().str.contains(needle, na=False)
-                | metric_view["Category"].astype(str).str.lower().str.contains(needle, na=False)
-            ]
-        if only_nonzero:
-            metric_view = metric_view[metric_view["Conversations > 0"] > 0]
-        if min_total > 0:
-            metric_view = metric_view[metric_view["Total"] >= float(min_total)]
-
-        sort_map = {
-            "Total descending": (["Total", "Conversations > 0", "Category", "Metric"], [False, False, True, True]),
-            "Contributing conversations descending": (
-                ["Conversations > 0", "Total", "Category", "Metric"],
-                [False, False, True, True],
-            ),
-            "Category then metric": (["Category", "Metric"], [True, True]),
-            "Average when flagged descending": (
-                ["Average when flagged", "Total", "Category", "Metric"],
-                [False, False, True, True],
-            ),
-        }
-        sort_cols, sort_asc = sort_map[sort_mode]
-        metric_view = metric_view.sort_values(sort_cols, ascending=sort_asc)
-
-        if metric_view.empty:
-            st.caption("No metrics match the selected filters.")
-        else:
-            top_metrics = metric_view[metric_view["Total"] > 0].head(15)
-            if HAS_PLOTLY:
-                fig = px.bar(
-                    top_metrics,
-                    x="Total",
-                    y="Metric",
-                    color="Category",
-                    orientation="h",
-                    text="Total",
-                    hover_data=["Average when flagged", "Conversations > 0"],
-                )
-                _plotly_layout(fig, height=520, yaxis=dict(autorange="reversed"))
-                _render_plotly(fig)
-            else:
-                _render_simple_bar_chart(top_metrics, "Metric", "Total", height=460)
-
-            contributor_base_cols = [
-                "conversation_id",
-                "customer_name",
-                "customer_phone",
-                "source_conversation_ids",
-                "conversation_start_date",
-                "final_classification",
-                "handled_status",
-                "cx_issue_severity",
-                "unhandled_resolution_subtype",
-                "main_issue_type",
-                "main_issue_summary",
-                "management_summary",
-            ]
-            metric_column_lookup = {
-                (metric_category_display_name(c), metric_display_name(c)): c
-                for c in quantifiable_metric_columns(filtered)
-            }
-            if "Column" not in metric_view.columns:
-                metric_view["Column"] = metric_view.apply(
-                    lambda r: metric_column_lookup.get((r.get("Category"), r.get("Metric"))),
-                    axis=1,
-                )
-            else:
-                metric_view["Column"] = metric_view.apply(
-                    lambda r: (
-                        r.get("Column")
-                        if r.get("Column") in filtered.columns
-                        else metric_column_lookup.get((r.get("Category"), r.get("Metric")))
-                    ),
-                    axis=1,
-                )
-
-            for category, category_metrics in metric_view.groupby("Category", sort=False):
-                category_total = category_metrics["Total"].sum()
-                category_cols = [
-                    c for c in category_metrics.get("Column", pd.Series(dtype=str)).tolist()
-                    if c in filtered.columns
-                ]
-                if category_cols:
-                    category_values = filtered[category_cols].apply(
-                        lambda s: pd.to_numeric(s, errors="coerce")
-                    ).fillna(0)
-                    category_conversations = int((category_values.sum(axis=1) > 0).sum())
-                else:
-                    category_conversations = 0
-                with st.expander(
-                    f"{category} - {len(category_metrics)} metrics, {category_conversations} contributing journeys",
-                    expanded=len(metric_view["Category"].unique()) == 1,
-                ):
-                    category_table = category_metrics[
-                        ["Metric", "Column", "Total", "Average when flagged", "Conversations > 0"]
-                    ].copy()
-                    _render_metric_definition_table(category_table)
-                    st.caption(f"Category total across displayed metrics: {category_total:g}")
-
-                    metric_options = category_metrics["Metric"].tolist()
-                    selected_metric = st.selectbox(
-                        "Metric contributors",
-                        metric_options,
-                        key=f"metric_contributors_{category}",
-                    )
-                    selected_row = category_metrics[category_metrics["Metric"] == selected_metric].iloc[0]
-                    metric_col = selected_row.get("Column") or metric_column_lookup.get(
-                        (category, selected_metric)
-                    )
-                    
-                    # Show metric definition
-                    if metric_col:
-                        definition = get_metric_definition(metric_col)
-                        if definition:
-                            st.info(definition)
-                    if metric_col in filtered.columns:
-                        values = pd.to_numeric(filtered[metric_col], errors="coerce").fillna(0)
-                        contributors = filtered.loc[values > 0].copy()
-                        contributor_cols = [c for c in contributor_base_cols if c in contributors.columns]
-                        contributor_table = contributors[contributor_cols].copy()
-                        contributor_table.insert(1, "metric_value", values.loc[contributors.index].values)
-                        contributor_table = contributor_table.sort_values(
-                            ["metric_value", "conversation_id"],
-                            ascending=[False, True],
-                        )
-                        contributor_table = _prepare_display_table(
-                            contributor_table,
-                            [
-                                "handled_status",
-                                "cx_issue_severity",
-                                "unhandled_resolution_subtype",
-                                "main_issue_type",
-                            ],
-                        )
-                        st.caption(
-                            f"{len(contributor_table):,} customer journeys contributed to "
-                            f"{selected_metric}."
-                        )
-                        _render_display_table(contributor_table, height=360)
-                    else:
-                        st.caption("This metric column is not available in the filtered conversation table.")
-    else:
-        st.caption("No quantifiable metrics returned by the conversation-level evaluator yet.")
-
-    st.markdown("---")
-    _section_header(
         "Activity over time",
         "Journeys per day across the filtered set.",
     )
@@ -3138,7 +3025,9 @@ def tab_review() -> None:
             "customer_name",
             "customer_phone",
             "source_conversation_ids",
-            "final_classification",
+            "handled_status",
+            "customer_experience",
+            "frustration_origin",
             "main_issue_summary",
         ]
         mask = pd.Series(False, index=filtered_df.index)
@@ -3169,10 +3058,6 @@ def tab_review() -> None:
             None,
         ),
     ]
-    if "score_final" in filtered_df.columns:
-        avg_score = pd.to_numeric(filtered_df["score_final"], errors="coerce").dropna()
-        if not avg_score.empty:
-            review_metrics.append(("Avg score", f"{avg_score.mean():.1f}", None))
     metric_row(review_metrics)
 
     options = []
@@ -3182,10 +3067,8 @@ def tab_review() -> None:
         cust = row.get("customer_name") or "—"
         phone = row.get("customer_phone") or cid
         source_count = row.get("source_conversation_count") or "—"
-        result = row.get("final_classification") or "Unknown"
-        score = row.get("score_final")
-        score_part = f" • score {score}" if pd.notna(score) and str(score).strip() else ""
-        label = f"{phone} • {cust} • {source_count} source convs • {result}{score_part}"
+        result = f"{humanize_label(row.get('handled_status')) or 'Unknown'} / {humanize_label(row.get('customer_experience')) or 'Unknown'}"
+        label = f"{phone} • {cust} • {source_count} source convs • {result}"
         options.append(label)
         label_to_id[label] = cid
 
@@ -3196,6 +3079,7 @@ def tab_review() -> None:
         st.error("Customer journey not found.")
         return
 
+    target_cr = _normalize_conversation_result_for_display(target_cr)
     _render_conversation_summary_card_fresh(target_cr)
 
     st.markdown("### Full Customer Journey")
@@ -3230,7 +3114,12 @@ def tab_exports() -> None:
         "max_tokens": st.session_state.max_tokens,
         "timeout": st.session_state.timeout,
         "retries": st.session_state.retries,
-        "max_conversations": st.session_state.max_conversations,
+        "run_all_conversations": bool(st.session_state.get("run_all_conversations")),
+        "max_conversations": (
+            None
+            if st.session_state.get("run_all_conversations")
+            else st.session_state.max_conversations
+        ),
         "max_target_messages_per_journey": st.session_state.max_agent_messages_per_conv,
         "truncate_messages": st.session_state.truncate_messages,
         "max_chars_per_message": st.session_state.max_chars_per_message,
@@ -3388,7 +3277,12 @@ def tab_debug() -> None:
         "max_tokens": st.session_state.max_tokens,
         "timeout": st.session_state.timeout,
         "retries": st.session_state.retries,
-        "max_conversations": st.session_state.max_conversations,
+        "run_all_conversations": bool(st.session_state.get("run_all_conversations")),
+        "max_conversations": (
+            None
+            if st.session_state.get("run_all_conversations")
+            else st.session_state.max_conversations
+        ),
         "max_target_messages_per_journey": st.session_state.max_agent_messages_per_conv,
         "truncate_messages": st.session_state.truncate_messages,
         "max_chars_per_message": st.session_state.max_chars_per_message,
@@ -3415,7 +3309,7 @@ def main() -> None:
 
     # Force DB initialization at app start so the seeded defaults exist before
     # any tab tries to read them.
-    get_db()
+    _refresh_default_prompts(get_db())
 
     tabs = st.tabs(
         [
@@ -3449,3 +3343,4 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+

@@ -33,6 +33,9 @@ htmlcov/
 
 # Local DB backup
 *.mybackup
+db_backups/
+
+__pycache__
 
 # SQLite runtime databases and sidecar files
 #*.db
