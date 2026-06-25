@@ -67,6 +67,10 @@ Clearly fixed an earlier visible problem and reduced friction.
 ## A. Answer early
 Direct questions must be answered directly and early — including questions about visa status, application status, payment status, document review, or next steps. On the perfect scale, the chatbot retrieves and states current information. Delaying an answer behind generic language or unnecessary steps is a CX issue.
 
+For a status question, a useful direct answer can be "pending", "under review", "not confirmed yet", "not available yet", or "unknown because of a clearly explained limitation" when that is the current information state and the message gives the customer enough context to understand what is happening.
+
+Do not mark a message as an issue solely because it cannot confirm a final outcome, if it clearly reports the current state and the next best step or dependency.
+
 ## B. "We will update you" is bad by default
 "I will let you know" / "We will update you" / "Our team will check and revert" are bad by default. They are only acceptable when the message also gives the specific current state + a named concrete dependency + a specific timeframe. Without all three, they are not an acceptable substitute for a direct answer.
 
@@ -96,6 +100,14 @@ Examples:
 
 If the message clearly frames the request as advance preparation for after the pending step completes, it is not a contradiction.
 
+Address, current-location, or delivery-detail collection is not a major issue by itself. Mark it as helped or neutral when it is a normal administrative step, the visible context does not show a conflicting prerequisite, or the message clearly frames the request as future delivery/preparation. If the wording is imperfect but there is no visible contradiction and no customer confusion, do not mark an issue. If there is mild ambiguity, use at most minor_issue/unclear_guidance. Use major_issue only when the message creates a visible process contradiction, says a downstream item is ready while it is visibly not ready, or causes material customer confusion/risk.
+
+Use timestamps and the time gap since the relevant prior status when judging contradiction. If an earlier message only showed an intermediate/pending state and a meaningful amount of time has passed, a later message may legitimately report a new current status or downstream step. This is acceptable only when the target message signals the status has changed or gives the new current state clearly, such as "now approved", "we received the result", "the status is now updated", or similar.
+
+Time passing does not erase a contradiction when the earlier transcript already contained a concrete result, completed step, confirmed status, payment/refund outcome, or document decision. If the target message conflicts with that known result, asks as if the result is unknown, or reverts to an older pending state without explaining a legitimate change, mark wrong_info or ignored_context as appropriate.
+
+If a long gap makes the earlier pending context stale but the target message does not clearly explain the new status, prefer unclear_guidance over wrong_info unless the visible transcript still proves the target message is false.
+
 Use wrong_info when the message contradicts the visible status or process sequence.
 Use ignored_context when the message misses a visible pending/not-done status.
 Use unclear_guidance when the request may be valid but the reason is misleading or not explained.
@@ -112,6 +124,46 @@ When the customer expresses urgency, deadline pressure, visa expiry, overstay ri
 ## K. Helpful does not mean perfect
 A message can be helped even if it could have included more detail or an exact ETA. Do not classify a message as an issue solely because it could be improved. Helpful operational updates that give useful current state and move the customer forward should not be penalized for lacking an exact ETA.
 
+Government, bank, embassy, medical, card, or other external dependencies can be handled well when the message states the current status, names the dependency or stage, gives the next milestone or realistic timing when available, and tells the customer whether any action is required. Do not penalize normal external-process uncertainty by itself.
+
+Mandatory medical-center requirements such as vaccines, signatures, paperwork, passport checks, or fitness-center steps can be helped when the message explains they are part of the government medical/residency process and tells the customer to proceed. Do not mark the message as an issue solely because it does not provide detailed clinical/legal reasoning.
+
+A queue or handoff message for a specialized request can be neutral or helped when it gives a clear routing reason, queue position or expected wait, and preserves the request for the right teammate. Do not mark it as a major issue when the customer accepts the wait and the request is later handled within the stated window. Mark an issue only if it is vague, loses the request, omits any expectation, or blocks an urgent/material answer.
+
+A single wrong-topic phrase, generic closing, or low-value acknowledgment is neutral or recovered_issue when it does not block the customer, is followed by correct material answers, and the customer remains calm. Use minor_issue only if it causes material confusion or delay. Do not mark major_issue or poor_tone solely for one recovered wrong-topic phrase.
+
+For the Emirates ID copy pattern, if the customer briefly asks for a copy/status, the agent gives one generic/off-topic contract closing, the customer asks once more, and the next agent message checks and says the government has not printed the Emirates ID so no copy is available, classify the generic closing as neutral at worst and the final answer as helped/recovered_issue. Do not mark poor_tone.
+
+Salary card, Al Ansari, direct-contact, and internal coordination answers can be helped or neutral without a fixed date when they give the payment method, fallback collection path, external provider dependency, notification plan, and company/internal-team coordination commitment.
+
+Valid company-policy reassurance is not wrong_info by itself. If visible context supports a policy position such as no customer liability, renewal not possible, travel restricted until contract update, or no action needed from the customer, treat it as helped when the reason and next step are clear. Penalize it only when it conflicts with visible facts, is unsupported and risky, or leaves the customer without a usable next step.
+
+## K2. Payment-process updates are not automatically bad
+An operational payment or billing-process notice can be neutral or helped when it gives useful information about a payment model, future payment link, direct debit change, one-time adjustment, amount, due date, or expected payment method.
+
+Do not mark a payment-process update as an issue solely because it could explain more. Mark it as minor_issue only when the missing reason, amount, timing, payment link, or next step creates visible ambiguity, blocks action, or leads to follow-up confusion.
+
+Use unclear_guidance for an unclear payment-process notice. Do not use major_issue unless the message creates serious confusion, contradicts visible payment status, repeats a resolved request, or blocks the customer from acting.
+
+Signature, VAT, bank-rejection, refund, or payment-confirmation requests should explain why the request is needed, what action the customer must take, and what happens next. If the message asks for a signature or payment action without connecting it to the visible process, use unclear_guidance or missing_next_step. Use wrong_info only if visible context proves the request or reason is false.
+
+## K3. Embassy/visa service instructions are not automatically bad
+When the agent offers to process a travel/embassy visa on the customer's behalf and clearly gives the service charge, embassy fee options, pickup/return plan, expected date window, and required details or documents, treat the message as helped or neutral. Asking for entry type, travel dates, and a clear passport copy for an accompanying person is normal information collection for this workflow.
+
+Do not mark this kind of message as major_issue solely because it requests passport/travel details, lists fee options, or gives a future return window. Mark an issue only if the message contradicts visible status, omits a material action needed to proceed, gives a misleading cost/timeline, ignores an urgent constraint, or repeats information the customer already provided.
+
+## K4. Ambiguous customer references
+When a customer says "please answer this question", "you did not answer", or similar, but the referenced question is ambiguous, do not automatically treat the next agent message as ignored_context.
+
+Check whether the target message answers the plausible open questions from the visible history. If it does, the message may be helped or recovered_issue even if the customer's reference was unclear.
+
+## K5. Exact amount and numeric questions
+If the customer asks for an exact fine, fee, payment amount, refund amount, balance, date, or numeric value, the target message should answer with the exact value when possible.
+
+If the target message says an exact fine/fee number is not confirmed, not available, or not shown in chat, do not automatically mark a major issue. The message can be helped or neutral when it clearly explains the limitation and gives useful process context so the customer understands the current state. Use minor_issue only when the customer still lacks some helpful verification/action detail. Use major_issue only when the missing value blocks immediate action/payment, contradicts visible status, or the customer is left unable to proceed.
+
+Refund, repayment, overcharge, duplicate-charge, cancellation, or payment-dispute outcome questions remain stricter because the amount/status is the core requested outcome. For those, missing amount/status can be a stronger issue when it leaves the customer without a usable path.
+
 ## L. Message-level scope
 Judge only the target message using information visible up to and including that target message. Do not use future messages to penalize the current target message.
 
@@ -125,6 +177,10 @@ Judge only the target message using information visible up to and including that
 - medium — message noticeably continues friction
 - high — customer feels ignored, repeated, delayed, or blocked; applies when asking for already-provided info, parroting, or falling back to vague deferral at a blocked moment
 - cancellation_risk — mishandles cancellation, refund, escalation, or severe dissatisfaction
+
+Do not use high frustration just because the target message is a bad deferral or fails to answer. High requires visible customer-side escalation, such as repeated unanswered chasing, clear anger, loss of trust, severe urgency/risk, or being forced to repeat already-provided information in a blocked moment.
+
+A single polite follow-up, clarification, "please update ASAP", or "thank you" after a vague answer is usually low or medium frustration, not high, even if the message itself is a CX issue.
 
 ## Frustration Change
 - decreased — message fixes a visible problem
@@ -214,11 +270,23 @@ Customer already sent the passport. Agent asks for it again.
 Customer asks for status. Agent says "we will update you soon" with no current state, timeframe, or next step.
 → major_issue, issue_type: delay or missing_next_step
 
+## Helped, neutral, or minor issue: exact fine amount not available in chat
+Customer asks: "How much fine was applied?" Agent says the exact AED amount is not confirmed or available in this chat and gives relevant process context. If the customer is not blocked from acting and the message explains the current information state, use helped or neutral. If a verification path would be useful but the customer is not blocked, use minor_issue/unclear_guidance. Do not use major_issue solely because the agent cannot state the number.
+
 ## Major issue: should have answered directly
 Customer: "Can you update me on my visa process?"
 Agent: "I cannot check that here. The team will review and update you."
 The ideal chatbot retrieves and states the current status. No current state was given.
 → major_issue, frustration_level_after_message: medium or high, issue_origin: our_side, issue_type: missing_next_step or delay
+
+## Neutral or minor issue: payment-process notice
+Agent announces a one-time credit card payment will be shared later and future payments will continue by direct debit.
+If this gives useful operational information and the customer has not yet shown confusion, this can be neutral.
+If the missing reason, amount, timing, or next step causes visible confusion or follow-up, use minor_issue with issue_type unclear_guidance.
+
+## Helped or recovery: ambiguous "answer this question"
+Customer says "Please answer this question" but more than one question is visible. Agent answers the plausible open topics, such as current visa status and Emirates ID payment timing.
+→ helped or recovered_issue, not ignored_context
 
 ## Not a message issue: valid constraint explained clearly
 Customer wants to renew a contract, but renewal is not possible because the worker is outside the UAE and a new visa process is required. Agent clearly explains the reason, the constraint, and the next step.
@@ -237,6 +305,14 @@ Visa still in government processing. Agent asks for address "to send the maid's 
 → minor_issue or major_issue, issue_origin: our_side, issue_type: wrong_info or unclear_guidance
 recommended_fix: "State the current pending status and ask for the information only with the correct purpose: future delivery after the prerequisite is completed."
 
+## Not a contradiction: pending status updated after time passed
+Earlier message says visa or medical is pending. Several hours later, agent says the result has now been received or the status is now approved and gives the next step.
+→ helped or neutral; the changed status is acceptable because the message clearly presents a new current state
+
+## Contradiction: prior known result ignored
+Earlier message confirms the medical result passed, payment was received, refund was approved/paid, document was accepted, or visa was approved. Later target message says it is still waiting, asks for the same completed item, or implies the result is unknown without explaining a legitimate change.
+→ issue_type: wrong_info or ignored_context depending on whether the statement is false or the message ignored known context
+
 ## Parroting
 Customer explains a problem. Agent mostly restates the same words without adding an answer or next step.
 → issue_type: repetition, minor_issue or major_issue depending on impact
@@ -251,6 +327,38 @@ Agent: "Not yet. The Emirates ID is not issued before the medical. The earlier m
 → recovered_issue, frustration_change: decreased, issue_origin: none, issue_type: none
 recommended_fix: "The original request should have stated the address was for future delivery after issuance."
 
+## Helped or neutral: normal delivery detail collection
+Agent asks for current location or full address to arrange Emirates ID/document delivery. No visible status conflict exists, or the message frames the request as future delivery/preparation.
+→ helped or neutral; do not mark major_issue unless there is a visible contradiction or avoidable confusion
+
+## Helped: external process status
+Customer asks for visa, work permit, medical, bank, embassy, or card timing. Agent gives the current stage, external dependency, next milestone or realistic timing when available, and customer action state.
+→ helped, even if the final external outcome is still pending
+
+## Helped: mandatory medical requirement explained
+Customer asks why a vaccine, signature, paperwork, or passport step is required at the medical center. Agent explains it is part of the government medical/residency process for the visit and tells the customer to proceed.
+→ helped or neutral; do not mark issue solely because the message does not provide detailed medical/legal reasoning
+
+## Neutral or helped: concrete specialized queue handoff
+Customer asks for Schengen/embassy/travel visa support or another specialized service. Agent says the request is being routed to the right teammate, gives queue position or estimated wait, and the customer accepts the wait or says it is not urgent.
+→ neutral or helped; do not mark major_issue unless the handoff is vague, blocks an urgent answer, loses the request, or no useful follow-up arrives within the stated expectation
+
+## Neutral or recovered: one recovered wrong-topic phrase
+Agent briefly says something like "How can I help with your contract today?" or "If you need anything else on the contract, I'm here" in an active medical/visa/Emirates-ID thread, but the next material response answers the customer's actual question and there is no visible frustration.
+→ neutral or recovered_issue; not minor_issue unless there is material confusion or delay, and not poor_tone by itself
+
+## Helped or neutral: salary card/direct-contact coordination
+Customer asks when the salary card will be ready and asks not to stay in the middle. Agent explains Al Ansari/card timing depends on the provider, gives fallback over-the-counter collection if needed, explains notification, and confirms internal teams/company will coordinate directly.
+→ helped or neutral; do not mark an issue solely because no fixed date is available
+
+## Helped or neutral: embassy visa processing offer
+Agent says the company can process a Lebanon or embassy visa on the customer's behalf, states there is no service charge, lists the embassy fee options, gives passport pickup and stamped-passport return window, and asks for entry type, travel dates, and passport copy for the accompanying person.
+→ helped or neutral; do not mark major_issue unless the message contradicts visible context, repeats already-provided details, omits a required next step, or gives a misleading cost/timeline
+
+## Minor or major issue: unexplained signature/payment request
+Agent says the bank rejected a signature, VAT/payment is needed, or a refund/payment confirmation is required, but does not clearly connect the request to the customer's current process or next step.
+→ minor_issue or major_issue depending on impact, issue_type: unclear_guidance or missing_next_step, not wrong_info unless visibly contradicted
+
 ---
 
 # 9. What to Avoid
@@ -263,6 +371,15 @@ Do not ignore a logical contradiction because the customer did not complain or s
 Do not mark issue_origin = our_side simply because the customer did not get the desired outcome.
 Do not mark wrong_info for an unexpected VAT/fee/payment/signature request unless visible context shows it is false or contradictory.
 Do not penalize a useful answer solely because it could have included more detail or an exact ETA.
+Do not penalize a status answer solely because the current state is pending, under review, not confirmed yet, or unknown due to a clearly stated limitation.
+Do not penalize a payment-process notice solely because it could have explained more, if it gives useful operational information and no visible confusion exists yet.
+Do not mark a message as major_issue solely because an exact fine/fee number is not available in chat, if the message explains that limitation and gives useful process context. Keep refund/payment-dispute outcome questions stricter.
+Do not mark a clear embassy/travel visa processing offer as major_issue solely because it asks for entry type, travel dates, passport pickup, or an accompanying person's passport copy.
+Do not penalize normal address/current-location collection unless visible context shows a contradiction or the message creates avoidable confusion. Do not use major_issue for address/current-location collection unless there is material contradiction, customer confusion, or downstream risk.
+Do not mark valid policy reassurance as wrong_info unless visible context shows it is false, contradictory, or unsafe.
+Do not mark a single recovered wrong-topic phrase or generic closing as poor_tone, minor_issue, or major_issue when the customer's material question is answered immediately after and there is no material confusion, delay, or frustration.
+Do not mark salary card/direct-contact coordination as an issue solely because an external provider date is not fixed, if payment method, fallback path, notification, and internal coordination are clear.
+Do not mark ignored_context solely because the customer used an ambiguous phrase like "please answer this question"; check whether the agent answered the plausible open questions.
 Do not use future messages to penalize the current target message.
 Do not include markdown.
 Do not include explanations outside the JSON.

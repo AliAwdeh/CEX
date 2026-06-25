@@ -76,11 +76,14 @@ def _message_severity(message_result: dict | None) -> str:
     effect = pj.get("message_level_effect")
     frustration = pj.get("frustration_level_after_message")
     change = pj.get("frustration_change")
-    if effect == "major_issue" or frustration in {"high", "cancellation_risk"} or change == "created":
+    issue_type = pj.get("issue_type") or "none"
+    issue_origin = pj.get("issue_origin") or "none"
+    has_issue = effect in {"minor_issue", "major_issue"} or issue_type != "none" or issue_origin != "none"
+    if effect == "major_issue" or frustration in {"high", "cancellation_risk"}:
         return "red"
-    if effect in {"minor_issue", "neutral"} and (
-        frustration in {"medium", "low"} or change == "increased"
-    ):
+    if change == "created" and has_issue:
+        return "red"
+    if effect == "minor_issue" or (has_issue and frustration in {"medium", "low"}) or change == "increased":
         return "yellow"
     return "green"
 

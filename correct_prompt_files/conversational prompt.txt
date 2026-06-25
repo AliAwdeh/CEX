@@ -31,11 +31,17 @@ A calm, polite, or patient customer can still have received bad customer experie
 Do NOT let a calm or non-frustrated customer push you toward good customer experience.
 Ask: "Did the chatbot do its job well?" — not "Did the customer get upset?"
 
+**CRITICAL FRUSTRATION SOURCE RULE:** Conversation-level frustration must be inferred from the conversation transcript itself. Message-level frustration is only expected or potential frustration from one target message; it is not actual observed customer frustration. Never calculate, copy, average, inherit, or infer conversation-level frustration from message-level frustration fields.
+
 ---
 
 # 1. Evidence Rule
 
 Use only what is visible in the transcript, metadata, and message-level evaluations.
+
+Message-level evaluations may be used only as supporting signals for chatbot behavior, issue patterns, and examples of friction. They are not evidence of the customer's emotional state.
+
+For all frustration fields, use only the visible conversation transcript and customer language/behavior. Do not rely on, copy, aggregate, average, inherit, or infer from message-level frustration scores, message-level frustration_change values, or message-level issue severity. The message-level prompt estimates expected impact; the conversational prompt judges actual observed frustration.
 
 Do not assume hidden tools, workflows, backend saves, or undocumented business rules.
 
@@ -66,6 +72,14 @@ Avoid: "Customer needs help", "General inquiry"
 - (b) For a status/update inquiry: the chatbot gave the actual current state of the process, application, visa, payment, or document, OR
 - (c) The customer received a clear, specific, and actionable next step — not a vague promise to check or update later
 
+For a status/update inquiry, the current state can be: confirmed, not confirmed yet, pending, under review, waiting on a named dependency, not available yet, or unknown due to a clearly explained limitation. If the customer asked "what is the current status?" and the chatbot accurately reports that the status is not yet confirmed, pending, under review, or unknown, that inquiry may still be handled when the answer is specific enough for the customer to understand the situation.
+
+Direct amount/value questions are stricter than general status questions, but do not force unhandled solely because the chatbot cannot state a number that is genuinely not confirmed or not available in the chat. If the customer asks for an exact fine, fee, payment amount, refund amount, balance, date, or numeric value, handled_status can be handled when the chatbot gives either the exact value, a complete path to obtain it, or a clear current information state explaining that the exact value is not confirmed/available here plus useful process context about what that means for the customer. Mark unhandled only when the missing value leaves the customer unable to act, pay, verify, or understand the current state.
+
+This leniency does not apply to refund, repayment, overcharge, duplicate charge, cancellation, or payment-dispute objectives where the customer is asking for the money outcome itself. Those still require the complete usable path described below.
+
+For refund, repayment, overcharge, duplicate charge, cancellation, or payment-dispute objectives, do not count the objective as handled merely because the case was understood, acknowledged, opened, escalated, prioritized, or sent to a team. If the customer asked for the refund/payment outcome itself, handled_status = handled only when the refund/payment issue was completed or the chatbot gave a complete usable path: exact current refund/payment status, amount or amount-confirmation source, owner/team, dependency, timeframe/trigger, and whether the customer must do anything. If any of those material pieces are missing, use handled_status = unhandled and choose pending_unresolved when there is a real waiting state, otherwise totally_unresolved.
+
 **handled_status = unhandled** when ALL of the following are true:
 - The primary objective was not achieved, AND
 - For status questions: no direct current state was given, AND
@@ -73,9 +87,13 @@ Avoid: "Customer needs help", "General inquiry"
 
 Additional rules:
 - A polite closing message does not make a conversation handled.
-- "We cannot check / the team will check / wait for an update" is unhandled unless the chatbot also gives the direct current status.
+- "We cannot check / the team will check / wait for an update" is unhandled unless the chatbot also gives a direct current status or a clearly explained current information state such as "not confirmed yet", "pending X", "under review by Y", or "unknown because Z".
+- If the customer asked for an exact amount/value and the exact value was not given, do not automatically treat the inquiry as unresolved. If the chatbot clearly states the value is not confirmed/not available in chat and gives enough process context for the customer to understand the current state, handled_status can be handled. Use unhandled only when the customer still lacks a usable way to act, pay, verify, or understand the current state.
+- For refund/payment disputes, "case open", "priority", "we will message you once processed", "senior team will review", or "has the refund reached your card?" are not handled outcomes by themselves. They are unhandled unless paired with a concrete current state, owner, dependency, timeframe/trigger, and customer action state.
 - A blocked outcome from a valid business necessity may still be unhandled because the customer's objective was not achieved — but this alone does not make customer_experience = bad.
-- If the customer raised **multiple distinct inquiries** during the conversation, **ALL of them must be fully addressed** for handled_status = handled. Answering only the primary inquiry while leaving any secondary inquiry unanswered results in handled_status = unhandled.
+- If the customer raised **multiple material distinct inquiries** during the conversation, they must be addressed for handled_status = handled. Do not make the whole conversation unhandled because of a minor side comment, ambiguous reference, or low-impact follow-up that was reasonably addressed by a later response.
+- Marketing, promotional, survey, birthday, re-engagement, or general informational messages sent after the customer's objective has already been addressed must not change handled_status from handled to unhandled. At most, they may affect customer_experience as minor or major CX issues if they are irrelevant, disruptive, or poorly timed.
+- If the customer says "please answer this question", "you did not answer", or similar, but the referenced question is ambiguous, evaluate whether the next agent response addressed the plausible open questions from the visible history. If it did, do not classify the conversation as unhandled for that ambiguous reference.
 - The handled_status determination applies **regardless of who ended the conversation** — whether the customer closed the chat, said goodbye, or the agent ended the session. A conversation is equally "ended" either way; do not infer satisfaction or resolution from the customer having ended the conversation.
 
 ---
@@ -85,13 +103,29 @@ Additional rules:
 ## customer_experience = good
 
 Use good only when ALL of the following are true:
-- Every agent message made real forward progress (answered, informed, requested genuinely missing info, or gave a clear next step)
+- Every material pre-resolution agent message made real forward progress (answered, informed, requested genuinely missing info, or gave a clear next step)
 - Direct questions were answered before unnecessary collection or acknowledgment steps
 - Direct status/process questions were answered with the current state — not deferred to a future update
 - The chatbot used visible context correctly and did not ask for already-provided information
 - Process reasons and next steps were logically consistent with visible prerequisites and current status
 - No message relied solely on vague waiting language
 - Any valid business constraint was explained clearly and promptly with the next best step available
+
+Low-impact operational notices, address/current-location collection, payment-process notices, or post-resolution promotional messages do not automatically prevent customer_experience = good when they do not disrupt resolution, do not require meaningful customer effort, do not contradict visible status, and the customer's objective was promptly clarified and accepted. A single isolated promotional or general message after the customer accepted the current answer does not make the whole journey bad by itself, even if the broader journey later continues, unless the customer reacts negatively, the promo delays a needed answer, or it causes confusion.
+
+Natural follow-up questions from the customer do not automatically make the experience bad. If the agent answers the plausible open questions directly, handles external/government dependencies realistically, and the customer accepts the answer, customer_experience can remain good.
+
+A single low-impact missed or generic response after an ambiguous, fragmented, or very brief document-copy request does not automatically make the whole journey bad when the next customer follow-up is answered directly, the final status is clear, no material delay occurs, and the customer shows no frustration. Treat this as handled + good with no meaningful main issue unless the customer had to chase repeatedly, the document was actually available but withheld, or the final answer still lacked a usable status/reason.
+
+If the exact pattern is: residency visa issued, Emirates ID under processing, customer briefly asks for an Emirates ID copy/status, agent gives one generic/off-topic closing such as "if you need anything else on the contract," customer asks once more, then agent checks and says the government has not printed the Emirates ID so no copy is available, classify as handled + good. Do not classify this as poor_tone, ignored_context, bad customer_experience, or a meaningful main_issue when there is no customer frustration and no unresolved follow-up.
+
+A single brief context miss, generic closing, wrong-topic phrase, or low-value acknowledgment does not automatically make customer_experience bad when the next material answer corrects course, all customer questions are answered, no material delay/risk occurs, and the customer remains calm or accepts the answer. Treat this as minor recovered friction inside a good journey, not a bad journey.
+
+Travel-eligibility questions may require a clarifying destination, home-country, accompaniment, NOC, or paperwork detail. Do not call the first answer vague when it gives the known rule/current status and asks for the necessary missing travel context, then the next answer resolves the travel question directly.
+
+Medical/biometrics timing questions often require expectation-setting rather than a guaranteed finish time. Do not mark the experience bad when the agent clearly explains the full visit may include waiting, registration, biometrics, government steps, or center flow, gives the best arrival/appointment option, offers an alternative when available, and the customer accepts the plan.
+
+Salary card, Al Ansari, direct-contact, and internal coordination questions can be handled well without a fixed date when the agent explains the payment method, fallback collection method, external provider dependency, and that the company/internal teams will coordinate directly so the customer does not need to stay in the middle.
 
 ## customer_experience = bad
 
@@ -100,6 +134,7 @@ Use bad when ANY ONE of the following is true:
 - The chatbot asked for information the customer already provided
 - The chatbot asked what an obviously relevant item was for
 - The chatbot failed to answer a direct status/process question and instead promised to check, revert, or update later
+- The chatbot failed to answer a direct amount/value question with the exact value and did not provide a clear source, owner, next step, timeframe, or place to check/pay
 - The chatbot answered a direct question only after unnecessary collection steps
 - The chatbot repeated or mirrored the customer's words without moving forward
 - The chatbot's response was logically inconsistent with visible process state — implied a downstream result was ready while prerequisites were still pending
@@ -108,7 +143,9 @@ Use bad when ANY ONE of the following is true:
 - A valid business constraint existed but was explained vaguely, late, contradictorily, or without a usable next step
 - The final outcome was reached only after avoidable friction, repeated effort, or zero-progress messages
 
-One strong chatbot failure is enough to make customer_experience = bad.
+One strong chatbot failure is enough to make customer_experience = bad. Strong means material, trust-damaging, repeated, unrecovered, or blocking the customer's objective. Do not treat a harmless post-resolution notice, a smooth address collection request, or one promptly resolved clarification as a strong failure by itself.
+
+Do not mark customer_experience = bad solely because the customer asked one clarification question, if the agent promptly clarified the likely open questions and the customer accepted the answer. Treat this as good or at most a low-severity unclear_guidance issue depending on the effort created.
 
 Do NOT mark good because:
 - The customer was polite, calm, or did not complain
@@ -123,15 +160,26 @@ Do NOT mark good because:
 
 Apply only when handled_status = unhandled. Otherwise: not_applicable.
 
+Before choosing the subtype, separate two cases:
+- If the customer only asked for the **current status** and the chatbot gave a specific current state, the conversation can be handled even if the state is pending, under review, not confirmed yet, or waiting on a dependency. In that case use handled_status = handled and unhandled_resolution_subtype = not_applicable.
+- If the customer asked for a **final outcome** (approval, completion, renewal, refund processed, delivery completed, cancellation completed), and the final outcome was not completed but the chatbot gave a clear current waiting state, use handled_status = unhandled and consider pending_unresolved.
+- If the customer asked for an **exact amount or numeric value** (fine amount, fee amount, payment amount, refund amount, due balance, exact date), and the exact value was not provided, first decide whether the chatbot gave a usable current information state. For fines/fees where the exact number is not confirmed or not available in chat, handled_status can be handled if the response explains that limitation and gives useful process context so the customer understands whether action is needed. Use handled_status = unhandled only when the missing value leaves the customer unable to act, pay, verify, or understand the current state. Refund/payment-dispute outcome questions remain stricter.
+
 **pending_unresolved** — Use when the chatbot gave a real, substantive answer that leaves the customer in a clearly defined waiting state. Actively look for this before defaulting to totally_unresolved. Apply when ALL of the following are true:
 - The chatbot gave the direct current status (even if the final outcome is still pending)
 - The customer knows exactly what is being waited on (a named dependency or process stage)
 - The customer knows what they must do next, if anything
 - A specific timeframe, trigger, or next milestone is indicated (exact date or rough estimate both qualify)
 
+Pending_unresolved language can include: pending, under review, not confirmed yet, not issued yet, waiting for government review, waiting for medical results, waiting for document attestation, waiting for refund approval, waiting for payment clearance, escalated to a named team, or no action required until a named event happens.
+
+Use pending_unresolved even if the customer is still waiting at the end, as long as the customer was left with a usable information state: what is pending, who/what it depends on, what happens next, and whether the customer must do anything.
+
+For direct amount/value inquiries, pending_unresolved can still apply when the missing value blocks the customer's ability to act, pay, verify, or understand the current state. Do not use pending_unresolved merely because an exact fine/fee number is not shown, if the chatbot explains that the number is not confirmed/available in chat and gives enough process context for the customer to understand the situation.
+
 The ending of the conversation — whether the customer ended it or the agent did — does not affect this assessment. Judge the information state the customer was left with, not who closed the chat.
 
-Do not use pending_unresolved when the chatbot only says it cannot check, will check later, or will update the customer without providing the actual current status. The ideal chatbot directly retrieves and states the current status.
+Do not use pending_unresolved when the chatbot only says it cannot check, will check later, or will update the customer without providing the actual current status or named pending state. The ideal chatbot directly retrieves and states the current status.
 
 **totally_unresolved** — Use when:
 - The customer remained blocked, confused, ignored, or without a usable path forward, OR
@@ -139,7 +187,7 @@ Do not use pending_unresolved when the chatbot only says it cannot check, will c
 - The customer asked for a direct status/process update and the chatbot did not provide the current status, OR
 - Any of the customer's distinct inquiries went unanswered
 
-**Important:** Carefully assess which subtype applies — do not default to totally_unresolved without first checking whether all pending_unresolved criteria are met. If the chatbot gave a direct current status with a named dependency and a timeframe, that is pending_unresolved even if the conversation ended without full resolution. When in doubt, use totally_unresolved.
+**Important:** Carefully assess which subtype applies — do not default to totally_unresolved just because the final outcome is not complete. If the chatbot gave a direct current status with a named dependency and a timeframe, trigger, or next milestone, that is pending_unresolved even if the conversation ended without full resolution. Use totally_unresolved only when the customer was left without a specific current state or usable waiting path.
 
 ---
 
@@ -175,7 +223,15 @@ Examples:
 - Refund approval pending → do not imply refund is processed
 - Contract unsigned → do not imply service is active
 
-A later clarification after customer confusion is a recovery of the immediate confusion — it is not proof that the journey was good. The avoidable contradiction and trust risk still make customer_experience = bad.
+Address, location, or delivery-detail collection is not a major issue by itself. Treat it as acceptable when it is a normal administrative step, the visible context does not show a conflicting prerequisite, or the message clearly frames the request as future delivery/preparation. If the wording is imperfect but there is no visible contradiction and no customer confusion, do not mark an issue. If there is mild ambiguity, use at most a minor unclear_guidance issue. Treat it as bad only when it creates a real status contradiction, suggests a downstream item is already ready while it is visibly not ready, or causes customer confusion that the agent had to repair.
+
+Use timestamps and the time gap between relevant messages when judging whether a later status contradicts earlier context. If the earlier context showed only an intermediate/pending state and a meaningful amount of time passed, the process may have progressed. Do not mark that as a contradiction when the later agent message clearly gives the new current state or signals a status update, such as "now approved", "we received the result", or "the status is now updated".
+
+Time passing does not excuse contradiction when the earlier transcript already contained a concrete result, completed step, confirmed status, payment/refund outcome, or document decision. If a later message conflicts with that known result, asks as if it is unknown, or reverts to an older pending state without explaining a legitimate change, the journey still has a process-consistency issue.
+
+If a long gap makes an earlier pending status stale but the agent does not explain the new status clearly, prefer unclear_guidance over wrong_info unless the transcript still proves the later message is false.
+
+A later clarification after customer confusion is a recovery of the immediate confusion — it is not proof that the journey was good when the original message created a material contradiction. The avoidable contradiction and trust risk still make customer_experience = bad.
 
 Use wrong_info when the chatbot contradicts the visible status or process sequence.
 Use ignored_context when the chatbot misses a visible pending/not-done status.
@@ -191,6 +247,15 @@ Do not invent issues. But if visible transcript gives reasonable evidence of bad
 ## J. Status requests
 When a customer asks for a visa, application, document, payment, approval, or process status, the chatbot must provide the current known state immediately. A response that only promises a future update is a significant CX issue.
 
+Do not treat "pending", "under review", "not yet confirmed", or "unknown because of a stated limitation" as a vague deferral by itself. These can be valid current-state answers when they are specific, relevant to the customer's question, and paired with the next best step or dependency when one exists.
+
+## J2. Exact amount and numeric questions
+When a customer asks for an exact amount, fine, fee, payment amount, refund amount, balance, date, or numeric value, the chatbot should answer with the value directly.
+
+If the value is not confirmed yet, the inquiry is not fully handled. The chatbot should state the current information state and give a clear path: who/source will confirm it, when or after what trigger it will be known, where the customer can check or pay it, and whether the customer must do anything now.
+
+If the chatbot says "the exact amount is not confirmed/not available in this chat" and gives relevant process context, do not automatically classify the amount inquiry as unhandled or bad. Treat it as handled when the customer can reasonably understand the current information state and whether any action is needed. Mark unhandled/bad only when the missing value leaves the customer unable to act, pay, verify, or understand the current state.
+
 ## K. Repeated deferral pattern
 Multiple consecutive deferrals ("We'll update you" / "We're checking" / "Please wait") for the same question should be penalized more heavily than a single deferral. Treat as a conversation-level delay and repetition issue.
 
@@ -205,6 +270,27 @@ If a customer enters already frustrated, evaluate whether the chatbot reduced, m
 
 ## O. Helpful does not mean perfect
 Do not classify a conversation as bad solely because a useful answer could have included more detail. A helpful operational update that gives useful current state and moves the customer forward can support customer_experience = good even without an exact ETA.
+
+Government, bank, embassy, medical, or other external dependencies can still be handled well when the agent states the current status, names the dependency or stage, gives the next milestone or realistic timing when available, and tells the customer whether any action is required. Do not penalize normal external-process uncertainty as bad CX by itself.
+
+Mandatory medical-center requirements such as vaccines, signatures, paperwork, passport checks, or fitness-center steps can be handled well when the agent explains they are part of the government medical/residency process and tells the customer what to do next. Do not require a detailed medical/legal rationale when the customer mainly needs to know whether to proceed with the requirement.
+
+A handoff or queue message for a specialized request is not automatically vague deferral when it gives a clear reason for routing, queue position or expected wait, and the request is later answered by the right teammate within that window. If the customer says it is not urgent or accepts the wait, do not treat the handoff as bad CX unless it causes delay beyond the expectation, loses the request, or leaves the material question unanswered.
+
+Valid company-policy reassurance is not wrong_info by itself. If the visible context supports a policy position such as no customer liability, renewal not possible, travel restricted until a contract update, or no action needed from the customer, treat it as good when the reason and next step are clear. Penalize it only when it conflicts with visible facts, is unsupported and risky, or leaves the customer without a usable next step.
+
+## O2. Payment clarification can recover mild ambiguity
+Payment-process updates about a one-time card payment, direct debit change, salary-cycle adjustment, payment link, amount, due date, or future payment method are not automatically bad CX.
+
+If the first payment notice is mildly unclear but the agent promptly explains the reason, amount or link, timing, and next step, and the customer accepts the answer, treat the payment portion as handled and recovered. Do not escalate to bad customer_experience unless the confusion caused meaningful effort, repeated follow-up, payment risk, contradiction, or unresolved uncertainty.
+
+## O3. Ambiguous "answer this question" follow-ups
+When the customer says "please answer this question" or "you did not answer" without clearly naming the question, identify the plausible open questions from the visible transcript.
+
+If the next agent response answers those plausible open questions, do not treat the ambiguous follow-up as ignored_context or unresolved. It may be a recovery from mild ambiguity.
+
+## O4. Repeated document or payment requests
+Repeated requests for the same document, signature, payment, refund evidence, or process confirmation are bad when the customer already provided the item, already paid for a related service, or the visible context shows the company should already know the status. A later recovery can make handled_status = handled, but it does not automatically erase the bad customer experience when the repetition created meaningful effort or trust risk.
 
 ## Q. Emoji usage
 If the customer uses emojis in the conversation, the chatbot responding with emojis is acceptable and mirrors the customer's communication style. Do not treat emoji usage as a poor_tone issue in that context.
@@ -248,7 +334,21 @@ Do not use wrong_info for an unexpected VAT/fee/payment/signature/policy request
 
 # 8. Frustration Assessment
 
-This frustration assessment reflects the **actual frustration observed throughout the entire conversation holistically**. It is fully independent of individual message-level frustration scores — evaluate the customer's real emotional state across the whole interaction, not what individual messages potentially suggested. Judge what was actually visible in the customer's language, tone, and behavior over the full conversation.
+This frustration assessment reflects the **actual frustration observed throughout the entire conversation holistically**. It is fully independent of individual message-level frustration scores — evaluate the customer's real emotional state across the whole interaction, not what individual messages potentially suggested.
+
+Message-level frustration is an expectation/risk rating for one target message. It is not customer emotion evidence. Ignore message-level frustration_level_after_message, frustration_change, and any derived message-level frustration fields when deciding frustration_detected, frustration_timing, final_customer_sentiment, customer_started_frustrated, customer_became_frustrated_during_chat, customer_ended_frustrated, and max_frustration_level.
+
+Judge frustration only from what is actually visible in the customer's language, tone, repeated behavior, escalation requests, anger, worry, dissatisfaction, or acceptance in the transcript.
+
+Do not treat issue severity as frustration intensity. A conversation can have bad CX, repeated deferrals, or unclear guidance while the customer's visible frustration remains low or medium.
+
+Do not treat urgency or a deadline as frustration by itself. "Urgent", "ASAP", "we are traveling on July 8", "please send as soon as possible", or similar language can create business/time risk, but frustration_detected should remain false unless the customer also shows emotional dissatisfaction, worry, repeated pressure, anger, or loss of trust.
+
+Use medium frustration only when the customer's own messages show visible concern, repeated chasing, repeated pressure, or mild dissatisfaction. Do not use medium only because the chatbot had medium message-level issues, the process was time-sensitive, or the customer asked for something urgently in a polite way.
+
+Use high frustration only when the customer's own messages show clear escalation: anger, repeated unanswered chasing, strong dissatisfaction, loss of trust, threats to cancel/escalate, severe urgency/risk, or being forced to repeat already-provided information in a blocked moment.
+
+Do not set max_frustration_level = high solely because the customer asked for an update ASAP, clarified a question, expressed mild concern, or remained polite and thankful after a vague response. In those cases, use low or medium depending on the effort and urgency.
 
 ## frustration_origin
 - our_side — frustration caused mainly by our responses, repetition, delay, vague updates, ignored context, or wrong guidance
@@ -275,25 +375,75 @@ If frustration_detected = false, frustration_origin = none and frustration_timin
 
 conversation_score components (0-100 total):
 
+Scores must be holistic, not a mechanical count of message-level issues. Group repeated patterns and judge the final customer journey quality.
+
+Do not automatically give full resolution just because handled_status = handled. Handled means the objective was addressed enough to classify the outcome; resolution_score measures how completely and cleanly it was addressed.
+
+Do not automatically give a low score just because customer_experience = bad. A handled conversation with mild recovered friction, clear final answers, customer acceptance, and no high visible frustration should usually stay in the Fair range or above unless there was severe trust damage, cancellation/refund risk, wrong information, or an unresolved material issue.
+
+Do not tie the final score mechanically to handled_status. Handled conversations generally have higher resolution_score, but an unhandled conversation can still score near a handled one when the chatbot clearly explains a valid pending state or constraint, gives ownership, timeline, and next steps, and creates low customer effort. Conversely, a handled conversation can score low if the path involved severe friction, trust damage, or high effort.
+
 **resolution_score** (0-20)
-- 20 = objective fully handled or direct current status/answer given
-- 10 = partial progress or clear pending state
-- 0 = unresolved with no usable answer/step
+- 20 = full objective achieved, or a narrow status-only question was directly answered with a clear current state, dependency, next milestone, and customer action state
+- 16-19 = objective mostly handled with only minor missing detail that would not materially affect the customer's next step
+- 12-15 = useful current state or partial answer given, but material parts of the customer's objective remained incomplete, such as missing timeline, missing explanation of what a stage means, unresolved contradiction, or unanswered named-agent/escalation request
+- 8-11 = partial progress only; customer received some relevant information but still lacked a usable answer for a material part of the objective
+- 1-7 = minimal progress; mostly vague updates or generic reassurance with little usable information
+- 0 = unresolved with no usable answer, current state, or next step
 
 **context_understanding_score** (0-20)
-- 20 = used visible context correctly, answered the real question
-- 10 = some context used but missed or delayed important context
-- 0 = ignored context, repeated requests, or missed the direct question
+- 20 = used visible context correctly throughout and answered the real questions directly
+- 16-19 = mostly good context handling with one small miss or harmless clarification
+- 11-15 = some context used, but the chatbot delayed, misunderstood, or incompletely answered an important point before recovering
+- 6-10 = repeated context misses, contradictory guidance, ignored direct questions, or confusing handoff/identity handling
+- 1-5 = severe context failure, repeated requests for already-visible information, or major contradiction
+- 0 = the chatbot essentially missed the customer's actual objective
 
 **customer_effort_score** (0-20)
-- 20 = low effort, no repetition, no unnecessary collection
-- 10 = some avoidable effort
-- 0 = high effort, repeated asks, looping, or unnecessary collection
+- 20 = low effort; no repetition, no unnecessary collection, no avoidable follow-up needed
+- 16-19 = one minor clarification or low-impact follow-up, promptly resolved
+- 11-15 = some avoidable effort, but the customer did not have to repeatedly chase the same answer
+- 6-10 = customer had to repeat, reframe, chase, or request escalation more than once
+- 1-5 = high effort with looping, repeated unanswered asks, unnecessary collection, or failed handoff
+- 0 = severe loop/dead end where the customer had to do most of the work and still lacked a path forward
 
 **trust_frustration_risk_score** (0-40)
-- 40 = no visible trust/frustration risk
-- 20 = moderate risk from vague updates, delay, or unclear guidance
-- 0 = high frustration, cancellation/refund/escalation risk, or severe trust damage
+- 40 = no visible trust risk and no observed customer frustration
+- 32-39 = minor risk only; issue was promptly clarified, customer stayed calm, and final response was accepted
+- 24-31 = moderate risk from delay, unclear guidance, or vague updates, with no severe trust damage and no high observed frustration
+- 12-23 = high risk from repeated deferrals plus visible customer concern/escalation, confusing handoff, visible anger, strong emotional urgency, trust concern, or unresolved anxiety
+- 1-11 = severe trust damage, explicit accusation, cancellation/refund/escalation risk, legal/visa overstay risk mishandled, or severe dissatisfaction
+- 0 = extreme breakdown: cancellation/refund/escalation risk plus no credible recovery, or severe unresolved trust/safety/legal risk
+
+For this score, use actual transcript evidence of customer frustration and trust damage. Do not import message-level frustration ratings.
+
+## Score Calibration Guardrails
+
+- Score the four components first. Use handled_status and customer_experience as context, not as hard caps.
+- Handled + good usually scores 75-100.
+- Handled + good with one low-impact missed or generic response that is immediately corrected after one follow-up, no visible frustration, and a clear final answer usually scores 80-90.
+- Handled + good with several process questions, a concrete accepted queue handoff, complete later answer, and satisfied ending usually scores 82-90 unless there is visible frustration, repeated chasing, wrong information, or unresolved material detail.
+- If the journey is handled, the likely score is 80 or above, and the only negatives are minor recovered friction, natural follow-ups, accepted handoff, harmless promo, normal address collection, or external-process uncertainty, customer_experience should usually be good. Mark bad only when there is a material unresolved issue, repeated chasing, visible frustration, trust damage, wrong information, or serious process contradiction.
+- Handled + bad with mild friction that is promptly clarified and accepted usually scores 65-80.
+- Handled + bad with several avoidable issues but no actual visible frustration, and a neutral/polite customer tone, usually scores 60-72.
+- Handled + bad with several avoidable issues and low/medium visible frustration usually scores 55-70.
+- Handled + bad with repeated vague deferrals, confusing handoff, explicit customer frustration, or trust damage usually scores 30-55.
+- Unhandled + good with a clear pending state, valid constraint, owner, timeline/trigger, and next step can score 60-80 even though the final outcome is not complete.
+- Unhandled + good with only a partial pending explanation usually scores 50-65.
+- Unhandled + bad can still score in the 45-65 range when the objective is pending but there is a usable current state and some helpful progress; score below 45 only when there is high effort, severe trust damage, cancellation/refund/escalation risk, or no credible path forward.
+- Unhandled + bad with no usable current state or next step usually scores below 50.
+
+If the customer ended satisfied or thankful, the objective was handled, and there is no high visible frustration, do not score below 65 unless there was a severe hidden-cost issue, wrong information, cancellation/refund risk, legal/visa risk, or an unresolved material question.
+
+If the objective was handled and the customer remained neutral, polite, or thankful with no actual observed frustration, do not score below 60 unless there was a material unresolved question, severe trust damage, wrong information, cancellation/refund risk, legal/visa risk, or a serious process contradiction.
+
+If the customer explicitly expresses strong frustration, loss of trust, accusation of stalling, or repeated unanswered chasing, do not score above 55 unless the chatbot clearly recovers with a complete answer, credible ownership, and a concrete next step.
+
+If the chatbot gives only the current stage but does not answer the customer's material follow-up questions about what that stage means, how long it will take, or who owns the next step, resolution_score should usually be 12-15, not 20.
+
+If a direct fine/fee/value question is answered with a clear limitation that the exact number is not confirmed or not available in chat, but the customer receives useful current-state/process context and is not left unable to act, resolution_score can be 15-18. Do not give resolution_score = 20 unless the exact value or a complete verification/payment path is provided. Use 8-12 only when the missing value materially blocks the customer's next step.
+
+If a final outcome such as refund, approval, delivery, or cancellation is still pending but the chatbot gives a clear owner, dependency, timeframe/trigger, and customer action state, resolution_score can be 12-16 even though handled_status = unhandled.
 
 raw_total_score = sum of four components.
 
@@ -310,6 +460,8 @@ score_explanation: brief explanation of main score drivers.
 ## main_issue
 If no meaningful issue exists:
 - issue_exists: false, issue_origin: none, issue_type: none, issue_summary: "none", customer_impact: "none"
+
+Minor recovered friction inside a handled + good journey is not a meaningful main_issue. If the only weakness is one quickly corrected generic reply, one harmless wrong-topic phrase, one accepted queue/handoff, one natural follow-up, one unavailable exact fine/fee number with useful context, or one normal address/current-location collection, set main_issue.issue_exists = false and do not list it in all_detected_issues. Do not invent poor_tone as the main_issue for a single off-topic but polite closing when the next material response resolves the customer's request.
 
 Priority order for selecting the highest-impact issue:
 1. Objective not handled
@@ -392,12 +544,90 @@ Later clarification recovers the immediate confusion. But the avoidable contradi
 → handled + bad, issue_origin: our_side, issue_type: unclear_guidance or wrong_info, frustration_detected: false
 
 ## Unhandled + Good
-Customer asks for status. Agent gives the current status directly: "The application is currently pending compliance review. The compliance team completes reviews within 3 business days. You will receive an email when it is approved." Customer's objective is not yet resolved, but they have the current state and a clear next step.
-→ unhandled + good, unhandled_resolution_subtype: pending_unresolved
+Customer asks for the application to be approved today. Agent gives the current status directly: "The application is currently pending compliance review. The compliance team completes reviews within 3 business days. You will receive an email when it is approved." The requested final approval is not completed yet, but the chatbot clearly explains the current state and next milestone.
+→ unhandled + good, unhandled_resolution_subtype: pending_unresolved, likely score 60-75
+
+## Handled + Good (status inquiry answered with pending state)
+Customer asks: "What is the current visa status?" Agent says: "The visa is not confirmed yet. It is currently pending government review, and the next update is expected within 3 business days. Nothing is required from your side."
+The customer asked for status, not final completion. The chatbot answered the status inquiry with a clear current state, dependency, timeframe, and customer action state.
+→ handled + good, unhandled_resolution_subtype: not_applicable
+
+## Handled + Good (mild payment confusion recovered)
+Agent sends a payment-process notice about a one-time card payment and future direct debit. Customer asks what to do and says the message is unclear. Agent promptly explains this is a one-time salary-cycle adjustment, clarifies what the payment covers, confirms it is not an extra salary payment, gives the payment link or amount, and later answers the related visa/EID payment questions. Customer says "Got it thank you."
+The initial notice could have been clearer, but the clarification addressed the plausible open questions and the customer accepted it.
+→ handled + good, or handled + bad only if the clarification required repeated effort or left uncertainty
+
+## Handled + Good (objective addressed, harmless later message)
+Customer asks how to pay renewal fees. Agent explains the amount, payment method, due date, and confirms no separate Emirates ID payment is required. Customer acknowledges. A later promotional, birthday, survey, or general informational message is sent in the same thread after the objective is complete.
+The later message does not require meaningful effort, does not reopen or confuse the issue, and does not interrupt an unresolved sensitive matter.
+→ handled + good, unhandled_resolution_subtype: not_applicable
+
+## Handled + Good (urgent visa/travel guidance with one harmless promo)
+Customer asks whether a nanny visa and Emirates ID can be expedited before travel. Agent explains government dependency without overpromising, gives a rough final-stage timing, and customer accepts. A single promotional message appears after the customer says thanks. Later the visa is issued, the customer asks if Emirates ID processing blocks travel, and agent explains it depends on destination/accompaniment, then clarifies that travel to the maid's home country does not require a NOC. Customer ends positively.
+The isolated promo is not enough to make the journey bad when it did not delay the support answer, did not confuse the customer, and the travel question was resolved after necessary missing destination context was provided.
+→ handled + good, frustration_detected: false or low only if visible customer language supports it
+
+## Handled + Bad (objective addressed, disruptive later message)
+Customer asks how to pay renewal fees. Agent explains the amount, payment method, due date, and confirms no separate Emirates ID payment is required. Customer acknowledges. A later promotional or unrelated message arrives while the customer still has an unresolved sensitive issue, asks the customer to act on an irrelevant offer, or causes confusion that has to be repaired.
+The later message can make customer_experience = bad if it is disruptive, repeated, poorly timed, delays or derails an open issue, or the customer reacts negatively, but it must not turn the already addressed objective into unhandled. Do not use this example for a single ignored promo after the customer had accepted the current answer and later support questions were answered normally.
+→ handled + bad, unhandled_resolution_subtype: not_applicable
+
+## Handled + Good (external process uncertainty explained)
+Customer asks for visa, work permit, medical, bank, embassy, or card status. Agent gives the current stage, names the external dependency, gives the next milestone or realistic expected window when available, and says whether the customer needs to do anything. The final external outcome may still be pending, but the customer's status inquiry is answered.
+→ handled + good, unhandled_resolution_subtype: not_applicable
+
+## Handled + Good (valid policy reassurance)
+Customer worries they may be liable for a maid absconding, cancellation, renewal restriction, travel restriction, or similar policy/process issue. Agent gives a clear policy-consistent answer, explains what the company will handle, and tells the customer whether any action is required.
+→ handled + good unless visible facts contradict the reassurance or the customer is left without a usable next step
+
+## Handled + Good (normal address or location collection)
+Agent asks for the customer's current location or full address so the maid's Emirates ID or another document can be delivered. No visible prerequisite conflict exists, or the request is clearly framed as future delivery/preparation. The customer provides the address and the process continues without confusion.
+→ handled + good or neutral issue impact; do not make this a major issue by itself
+
+## Handled + Good (document copy not available yet, one repeat)
+Broadcast says the residency visa is issued and Emirates ID is under processing with courier delivery expected later. Customer briefly asks for a copy of the Emirates ID in fragmented wording. Agent gives one generic/off-topic closing such as "If you need anything else on the contract, I'm here." Customer asks once more. Agent then checks and clearly explains the government has not printed the Emirates ID yet, so no copy is available right now. Customer shows no frustration.
+This is handled + good when the final answer gives the current document status and reason the copy is unavailable. The one repeat is minor recovered friction, not enough by itself to make customer_experience = bad, not a poor_tone main issue, and not a meaningful all_detected_issue.
+Required output for this pattern: handled_status = handled, customer_experience = good, main_issue.issue_exists = false, issue_origin = none, issue_type = none, all_detected_issues = [].
+Likely score: 82-90 when there is no actual observed frustration and no unresolved material follow-up.
+
+## Handled + Good (medical, contract, visa, and Schengen support)
+Customer asks why a vaccine is mandatory at the medical center, asks for contract status and position, asks next steps after the medical, and asks whether Schengen visa support is available. Agent explains the vaccine is part of the government medical/residency step, says the contract is under processing until R-visa issuance, gives the correct position, says the next step is medical result then residency visa within about 2 days, confirms Schengen support, routes the specialized Schengen request with queue position/ETA, and a teammate provides the full document/application requirements within the estimate. Customer says the wait is not urgent and later says all good.
+This is handled + good when all material questions were answered, the queue handoff was concrete and accepted, there was no repeated chasing, and the customer ended satisfied. Do not mark bad solely because the customer asked natural follow-up questions or because a specialized request was routed before the full Schengen details were provided.
+Likely score: 82-90 when there is no actual observed frustration and the final state is accepted.
+
+## Handled + Good (minor context miss recovered in medical visit thread)
+Customer asks medical visit timing, biometrics, return transportation, taxi reimbursement, and later receives final visa/Emirates ID status. Agent briefly sends one wrong-topic phrase such as "How can I help with your contract today?" but then answers the actual medical/biometrics/transport questions directly and the customer remains calm.
+The one wrong-topic phrase is a minor recovered miss, not enough to make the full journey bad when every material question was answered and no trust damage or repeated chasing occurred.
+→ handled + good, main_issue.issue_exists: false unless the context miss caused material delay or confusion
+
+## Handled + Good (salary card and direct-contact follow-ups)
+Customer asks whether the worker can travel, then asks how salary will be received, when the salary card will be ready, how the worker will be informed, and asks the company to contact the worker directly. Agent explains home-country travel/no NOC, Al Ansari Visa Card payment, fallback over-the-counter collection if the card is not ready, external Al Ansari timing dependency, and confirms internal teams will coordinate so the customer does not stay in the middle.
+Natural follow-ups about card timing and direct contact do not make the journey bad when the available information and coordination path are clear.
+→ handled + good unless the worker/customer is left without any payment path or direct-contact commitment
+
+## Handled + Good (liability or absconding reassurance)
+Customer asks whether the company can tell if a worker left the country and says they have no contact. Agent explains the company cannot track real-time location from chat, says no action is needed from the customer, accepts the customer's extra context, and reassures that the customer will not be held liable and the company will handle the process.
+This is handled + good when the policy reassurance is clear and no action is required from the customer. Do not mark bad solely because the first answer could not confirm the worker's location.
+→ handled + good, issue_origin: none unless visible policy/context contradicts the reassurance
+
+## Handled + Good (medical timing expectation-setting)
+Customer needs the medical visit to finish by noon and challenges the 6-hour visit estimate. Agent explains the medical test itself can be quick but the full visit may include check-in, waiting, biometrics/government steps, and center flow; agent gives the best early-arrival plan, offers an evening option when available, and customer accepts the plan. Later the visit and visa/ID updates complete.
+This is handled + good when the agent sets realistic expectations without overpromising and the customer receives a usable plan, even if the customer asks several clarifying timing questions.
+→ handled + good unless the agent ignores the deadline, refuses to answer, or leaves no workable plan
+
+## Handled + Good (urgent visa status with harmless promo)
+Customer asks urgent work permit/change-of-status questions and worries about overstay/absconding risk. Agent gives current work-permit/change-of-status status, government dependency, fine-risk context, company payment responsibility, and later confirms work permit approval/next step. A single promotional message appears after the customer says thanks.
+The promo is a minor negative at most and should not make the journey bad when the urgent status/risk questions were answered and the customer did not react negatively.
+→ handled + good, frustration_detected based only on customer language
 
 ## Unhandled + Good (valid business necessity)
 Customer wants to renew a contract. Agent clearly explains that renewal is not possible because the worker is outside the UAE and a new visa/application process is required. Agent gives the next available step. No delay, contradiction, repetition, or vague deferral language.
-→ unhandled + good, unhandled_resolution_subtype: pending_unresolved (if next step is clear), issue_origin: customer_side
+→ unhandled + good, unhandled_resolution_subtype: pending_unresolved (if next step is clear), issue_origin: customer_side, likely score 60-75
+
+## Unhandled + Good can be close to handled
+Customer asks for a refund to be completed today. Agent quickly confirms the refund is approved but not yet posted, gives the exact amount, payment method, owner/team, expected posting window, and says no action is required from the customer unless the refund is not visible after that date.
+The final outcome is not complete yet, so handled_status can be unhandled with pending_unresolved. But the chatbot performed well, so customer_experience = good and the score can be close to a handled case.
+→ unhandled + good, unhandled_resolution_subtype: pending_unresolved, likely score 65-80
 
 ## Unhandled + Bad (business necessity communicated badly)
 Customer's request is blocked by a valid constraint. Agent gives only a vague reason, delays the explanation, or gives no usable next step.
@@ -415,6 +645,15 @@ Customer asks why a document is requested again. Agent ignores the question, rep
 Customer asks for status. Agent: "We will get back to you as soon as possible." No specific action, dependency, or timeframe.
 → unhandled + bad, unhandled_resolution_subtype: totally_unresolved
 
+## Handled + Good (fine amount cannot be stated in chat)
+Customer asks: "How much fine was applied?" Agent says the exact AED amount is not confirmed or not available in this chat, then gives relevant process context about fines and whether the process can move forward. The visible context does not show that the customer must pay or act immediately, and the customer is not left chasing a payment step.
+The exact number was not provided, but the inquiry can still be handled because the chatbot explained the current information limitation and gave enough context for the customer to understand the situation. Score below a perfect amount answer, but do not mark unhandled or bad solely because the agent cannot state the number.
+→ handled + good, unhandled_resolution_subtype: not_applicable, likely score 75-85 if there is no visible frustration
+
+## Unhandled + Bad (missing amount blocks action)
+Customer asks for an exact fine, fee, balance, or amount they need in order to pay, decide, verify, or proceed. Agent only says the amount is not confirmed/not available and gives no usable source, action state, or next step. The customer still cannot act or understand what happens next.
+→ unhandled + bad, unhandled_resolution_subtype: pending_unresolved, issue_type: missing_next_step or unclear_guidance, frustration_detected: false if the customer remains calm
+
 ## Unhandled + Bad (should have answered status directly)
 Customer: "Can you update me on my visa process?"
 Agent: "I cannot check that here. The concerned team will review and update you."
@@ -429,6 +668,21 @@ The chatbot performed poorly by asking about an obviously relevant item. The cus
 ## Handled + Bad (repetitive chatbot, calm customer)
 Chatbot sends the same acknowledgment message three times before making any progress. Customer replies politely each time and does not complain. Customer showed no frustration. But chatbot was objectively repetitive and made no progress.
 → handled + bad, frustration_detected: false
+
+## Score Calibration: Handled + Bad but recovered and accepted
+Customer asks about a missed call, then asks salary/card/visa process questions. Early replies add some avoidable effort and one timing question is deferred, but later the agent clarifies the salary process, confirms the visa outcome, answers the remaining process question, and the customer ends very thankful.
+This is handled + bad because of avoidable friction, but visible frustration is low or medium and the final state is accepted.
+Likely score: 65-75. Do not push this below 65 unless a material question remains unresolved, wrong information caused harm, or the customer shows high frustration.
+
+## Score Calibration: Handled + Bad, urgent but polite
+Customer asks for documents or process steps urgently because of a travel date. The chatbot initially misses the exact question and uses queue/teammate deferrals, so the experience is bad. Later the customer receives the needed process steps, payment link, pickup details, and next steps. The customer stays polite and does not express anger, worry, loss of trust, or repeated frustration.
+This is handled + bad with no actual observed frustration. Urgency is business risk, not frustration by itself.
+Likely score: 60-68. frustration_detected should usually be false, max_frustration_level none or low.
+
+## Score Calibration: Handled + Bad with trust damage
+Customer repeatedly asks where a visa/application process stands, says the case is urgent, receives vague updates and confusing handoff messages, then explicitly says the experience is frustrating or accuses the company of stalling. The agent eventually gives a current state, but does not fully explain what the stage means or when the blocker will clear.
+This is handled + bad if the current state was eventually given, but resolution is incomplete and trust risk is high.
+Likely score: 30-45. Resolution should usually be 12-15, not 20, because the answer did not fully address the customer's broader objective.
 
 ---
 
@@ -447,14 +701,34 @@ Do not mark wrong_info for an unexpected VAT/fee/payment/signature/policy reques
 Do not ignore a logical/process contradiction because the customer did not explicitly complain.
 Do not mark customer_experience = good when a message implies a downstream item is ready while visible prerequisites are still pending.
 Do not let a later clarification erase the original avoidable confusion — the bad-CX issue still counts.
-Do not mark pending_unresolved unless there is a specific, named pending state or next step visible in the transcript.
+Do not mark pending_unresolved unless there is a specific pending state, named dependency, next step, or an exact amount/value that is explicitly not confirmed or not available yet.
+Do not mark totally_unresolved just because the final outcome is unfinished. If the transcript gives a specific pending state, dependency, and next milestone, classify it as pending_unresolved.
+Do not mark handled_status = unhandled when the customer only asked for current status and the chatbot answered with a clear pending/current state. That is handled, not pending_unresolved.
+Do not mark handled_status = unhandled solely because the customer asked for an exact fine/fee amount and the number was not available in chat, if the chatbot clearly explained that limitation and gave enough process context for the customer to understand the current state. Keep refund/payment-dispute outcome questions stricter.
 Do not let a polite or friendly closing override evidence of zero-progress messages, repetition, or ignored context.
-Do not classify customer_experience as good if any agent message made zero forward progress when progress was possible.
+Do not classify customer_experience as good if any material pre-resolution agent message made zero forward progress when progress was possible.
 Do not classify customer_experience as bad solely because a helpful operational update did not provide an exact ETA.
 Do not let pre-existing customer frustration automatically determine the current conversation rating.
 Do not mark poor_tone solely because the chatbot used emojis — emoji usage is acceptable when the customer used emojis in the conversation.
 Do not infer that the customer was satisfied or that the conversation was handled simply because the customer ended or closed the conversation.
-Do not mark handled_status = handled if any of the customer's distinct inquiries were left unanswered, even if the primary inquiry was resolved.
+Do not mark handled_status = handled if any of the customer's material distinct inquiries were left unanswered, even if the primary inquiry was resolved.
+Do not classify a status inquiry as unhandled simply because the reported current state is pending, under review, not confirmed yet, or unknown due to a clearly stated limitation.
+Do not let marketing, promotional, survey, birthday, re-engagement, or general informational messages sent after the customer's objective was addressed change handled_status from handled to unhandled.
+Do not mark customer_experience = bad solely because of a post-resolution promotional/general message when the objective was already complete and the message did not create meaningful effort, confusion, or disruption.
+Do not mark customer_experience = bad solely because of one isolated promotional/general message after the customer accepted the current support answer, if the customer did not react negatively and later material support questions were answered normally.
+Do not mark a travel answer as vague solely because it asks for destination, accompaniment, NOC, or paperwork context needed to answer correctly; judge whether the agent resolved the travel question once that missing context was provided.
+Do not mark customer_experience = bad solely because the customer asked natural follow-up questions about medical, contract, visa, or travel/embassy requirements when the agent answered them directly and the customer accepted the answers.
+Do not mark customer_experience = bad solely because the customer repeated a brief or fragmented document-copy request once, if the next agent response gives the clear current document status and reason the copy is unavailable.
+Do not mark a concrete queue/routing message as bad by itself when it gives queue position or ETA, the customer accepts the wait, and the right teammate answers the specialized request within the expected window.
+Do not mark a mandatory vaccine/medical-center requirement explanation as bad solely because it does not include detailed clinical or legal reasoning, if it clearly ties the requirement to the government medical/residency process and the customer knows to proceed.
+Do not mark address, location, or delivery-detail collection as a major issue unless the visible context shows a real process contradiction, customer confusion, or downstream risk. Normal address/current-location collection should be good, neutral, or at most minor unclear_guidance.
+Do not mark valid policy reassurance as wrong_info unless visible context shows it is false, contradictory, or unsafe.
+Do not mark customer_experience = bad solely because of one recovered wrong-topic phrase, generic closing, or low-value acknowledgment when the next material answers are correct and the customer remains calm.
+Do not mark customer_experience = bad solely because a customer challenges a medical/biometrics timing estimate, if the agent explains the full-visit uncertainty, gives a realistic plan or alternative, and the customer accepts.
+Do not mark customer_experience = bad solely because salary card timing depends on Al Ansari or another external provider, if the agent gives the payment method, fallback collection path, notification plan, and internal coordination commitment.
+Do not create main_issue or all_detected_issues for minor recovered friction in an otherwise handled + good journey.
+Do not mark customer_experience = bad solely because a customer asked for clarification once and the agent promptly clarified the plausible open questions.
+Do not treat an ambiguous "please answer this question" message as proof of ignored context when the agent's next response answers the plausible open questions.
 Do not include markdown. Do not include explanations outside the JSON. Do not add extra fields. Do not omit required fields.
 
 ---
@@ -465,18 +739,30 @@ Do not include markdown. Do not include explanations outside the JSON. Do not ad
 - If handled_status = unhandled → unhandled_resolution_subtype must be pending_unresolved or totally_unresolved
 - customer_experience is independent from handled_status — do not assume handled = good or unhandled = bad
 - customer_experience is independent from frustration_detected — absence of frustration never justifies good customer experience on its own
-- If customer_experience = good → every agent message must have made real progress with no significant avoidable friction
-- If visible prerequisites are pending → implying the downstream outcome is already ready is bad customer_experience unless clearly framed as advance preparation
+- If the customer only asked for current status and the chatbot gave a specific current information state such as pending, under review, not confirmed yet, or unknown because of a stated limitation → handled_status can be handled
+- If the customer asked for final completion but the chatbot gave a specific current pending state, named dependency, and next milestone → handled_status can be unhandled with unhandled_resolution_subtype = pending_unresolved, not totally_unresolved
+- Irrelevant marketing, promotional, survey, birthday, re-engagement, or general informational messages after the objective was addressed can affect customer_experience but must not change handled_status to unhandled
+- If customer_experience = good → every material pre-resolution agent message must have made real progress with no significant avoidable friction; harmless post-resolution or administrative messages may be low-impact when they do not disrupt the journey
+- If visible prerequisites are pending → implying the downstream outcome is already ready is bad customer_experience unless clearly framed as advance preparation; address/location collection alone is not enough unless it creates that contradiction
 - Repeated deferrals for the same status question count as a stronger delay/repetition issue than one isolated deferral
 - Pre-existing customer frustration does not automatically make customer_experience = bad when the chatbot clearly reduces uncertainty and de-escalates
 - If main_issue.issue_exists = false → main_issue.issue_origin must be none and main_issue.issue_type must be none
 - If frustration_detected = false → frustration_origin should be none and frustration_timing should usually be none
 - If max_frustration_level = cancellation_risk → manual_review_required should usually be true
 - If confidence = low → manual_review_required must be true
-- If unhandled_resolution_subtype = pending_unresolved → there must be a specific, named pending state or next step visible in the transcript, not a vague future update
+- If handled_status = unhandled and customer_experience = bad → manual_review_required must be true
+- If unhandled_resolution_subtype = pending_unresolved → there must be a specific, named pending state, next step, or exact amount/value that is explicitly not confirmed or not available yet; it cannot be only a vague future update
+- If totally_unresolved is selected → the transcript must lack a usable current state, named dependency, or clear waiting path for the customer's material objective
+- If an exact amount/value question is answered only with "not confirmed/not available yet" and the missing value blocks action, payment, verification, or understanding of the current state → handled_status = unhandled, unhandled_resolution_subtype = pending_unresolved, customer_experience = bad
 - Who ended the conversation (customer or agent) is irrelevant to handled_status and unhandled_resolution_subtype — judge the information state the customer was left with
-- If the customer raised multiple inquiries → all must be addressed for handled_status = handled
+- If the customer raised multiple material inquiries → all material inquiries must be addressed for handled_status = handled; minor side comments or ambiguous references do not decide handled_status by themselves
+- If a customer asks one clarification question and the agent promptly resolves it with an accepted answer → customer_experience can still be good
+- If the customer says "please answer this question" ambiguously and the agent answers the plausible open questions → do not use ignored_context or unhandled for that reference alone
 - frustration_detected and all frustration fields reflect actual observed frustration across the whole conversation, independent of message-level scores
+- If message-level frustration scores conflict with the customer's visible tone or behavior in the transcript → follow the transcript, not the message-level scores
+- Message-level frustration is expected/potential impact, not actual conversation frustration; never use it as evidence for conversation-level frustration fields
+- Urgency, a travel date, deadline, or "ASAP" language is not actual frustration unless the customer also shows worry, anger, repeated pressure, dissatisfaction, or loss of trust
+- If frustration_detected = true → cite actual customer language or behavior from the transcript, not message-level issue severity
 
 ---
 
