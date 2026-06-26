@@ -19,10 +19,13 @@ import pandas as pd
 from api_client import APIConfig, chat_completion
 from prompts import (
     DEFAULT_CONVERSATION_LEVEL_PROMPT,
+    DEFAULT_ISSUE_ANALYSIS_PROMPT,
     DEFAULT_MESSAGE_LEVEL_PROMPT,
     PromptTemplate,
     build_conversation_level_payload,
+    build_issue_analysis_payload,
     build_message_level_payload,
+    _issue_journey_evidence,
 )
 from aggregation import compute_metadata
 from data_loader import (
@@ -609,6 +612,318 @@ def validate_conversation_level_result(data: dict) -> dict:
             out[k] = v
 
     return out
+
+
+# ---------- Issue-analysis (Layer 3) validation ----------
+
+_TRIGGER_TYPES = {"message", "broadcast", "action", "missing_action"}
+_PREFERRED_ROOT_CAUSES = {
+    "wrong_format",
+    "bad_timing",
+    "missing_context_check",
+    "vague_deferral",
+    "premature_collection",
+    "wrong_or_inconsistent_info",
+    "tone_mismatch",
+    "no_next_step",
+    "process_or_tool_gap",
+}
+
+
+def validate_issue_analysis_result(data: dict, valid_ids: set[str] | None = None) -> dict:
+    """Coerce a parsed Layer 3 JSON object into the strict Issue-Analyst shape.
+
+    The schema is pattern-centric: each pattern carries its own trigger, the
+    journey_ids it covers, and an occurrence_count equal to that list's length.
+
+    ``valid_ids`` (when provided) is the set of conversation_ids that were sent
+    in the batch; journey_ids referencing anything outside it are dropped so the
+    analyst cannot invent journeys. ``occurrence_count`` is always recomputed
+    from the cleaned journey_ids so it stays consistent.
+    """
+    if not isinstance(data, dict):
+        raise ValueError("Issue-analysis result is not a JSON object")
+
+    out: dict[str, Any] = {}
+
+    patterns = data.get("patterns") or []
+    if not isinstance(patterns, list):
+        patterns = []
+    clean_patterns: list[dict] = []
+    for pat in patterns:
+        if not isinstance(pat, dict):
+            continue
+        journey_ids = pat.get("journey_ids")
+        # Tolerate the older occurrence_ids field name from prior schema versions.
+        if journey_ids is None:
+            journey_ids = pat.get("occurrence_ids")
+        if not isinstance(journey_ids, list):
+            journey_ids = []
+        journey_ids = [
+            str(x).strip()
+            for x in journey_ids
+            if str(x).strip() and (valid_ids is None or str(x).strip() in valid_ids)
+        ]
+        # De-duplicate while preserving order.
+        seen: set[str] = set()
+        journey_ids = [j for j in journey_ids if not (j in seen or seen.add(j))]
+
+        trigger_type = str(pat.get("trigger_type", "") or "").strip().lower().replace(" ", "_")
+        if trigger_type not in _TRIGGER_TYPES:
+            trigger_type = "action"
+        root_cause = str(pat.get("root_cause_category", "") or "").strip().lower().replace(" ", "_")
+        if not root_cause:
+            root_cause = "process_or_tool_gap"
+        clean_patterns.append(
+            {
+                "pattern_description": str(pat.get("pattern_description", "") or ""),
+                "trigger_type": trigger_type,
+                "trigger": str(pat.get("trigger", "") or ""),
+                "customer_context": str(pat.get("customer_context", "") or ""),
+                "where_it_happens": str(pat.get("where_it_happens", "") or ""),
+                "journey_ids": journey_ids,
+                "occurrence_count": len(journey_ids),
+                "root_cause_category": root_cause,
+                "root_cause_explanation": str(pat.get("root_cause_explanation", "") or ""),
+                "recommended_solution": str(pat.get("recommended_solution", "") or ""),
+            }
+        )
+    out["patterns"] = clean_patterns
+
+    out["summary"] = str(data.get("summary", "") or "")
+    confidence = str(data.get("confidence", "") or "").strip().lower()
+    if confidence not in {"low", "medium", "high"}:
+        confidence = "low"
+    out["confidence"] = confidence
+
+    return out
+
+
+def issue_type_of_conversation(parsed: dict | None) -> str:
+    """Return the single Layer 2 issue type committed for a journey, or 'none'.
+
+    Layer 3 groups journeys by the main issue type Layer 2 assigned. Journeys
+    with no issue (issue_type 'none' / missing) are not analyzed.
+    """
+    if not isinstance(parsed, dict):
+        return "none"
+    main_issue = parsed.get("main_issue") or {}
+    if not isinstance(main_issue, dict):
+        return "none"
+    if not main_issue.get("issue_exists", False):
+        return "none"
+    issue_type = str(main_issue.get("issue_type", "none") or "none").strip().lower()
+    return issue_type or "none"
+
+
+def group_journeys_by_issue_type(conversation_results: list[dict]) -> dict[str, list[dict]]:
+    """Build per-issue-type batches from finished conversation-level results.
+
+    Each batch entry is the journey dict shape consumed by
+    ``build_issue_analysis_payload``: conversation_id, layer2_evidence,
+    layer2_issue_evidence, transcript.
+    """
+    batches: dict[str, list[dict]] = {}
+    for cr in conversation_results:
+        if not isinstance(cr, dict):
+            continue
+        parsed = cr.get("parsed_json") or cr.get("evaluation_output")
+        issue_type = issue_type_of_conversation(parsed)
+        if issue_type in ("none", ""):
+            continue
+        transcript = cr.get("transcript") or []
+        transcript_clean = [
+            {
+                "message_index": m.get("message_index"),
+                "sender_role": m.get("sender_role", ""),
+                "message_text": m.get("message_text", ""),
+            }
+            for m in transcript
+            if isinstance(m, dict)
+        ]
+        main_issue = (parsed or {}).get("main_issue") or {}
+        layer2_issue_evidence = ""
+        if isinstance(main_issue, dict):
+            layer2_issue_evidence = str(main_issue.get("issue_summary", "") or "")
+        # Collect Layer 1 per-message evaluations for this conversation.
+        ml_results = cr.get("message_level_results") or []
+        message_evaluations = [
+            r.get("parsed_json") or r.get("evaluation_output")
+            for r in ml_results
+            if isinstance(r, dict) and (r.get("parsed_json") or r.get("evaluation_output"))
+        ]
+        batches.setdefault(issue_type, []).append(
+            {
+                "conversation_id": cr.get("conversation_id", ""),
+                "layer2_evidence": _issue_journey_evidence(parsed),
+                "layer2_issue_evidence": layer2_issue_evidence,
+                "transcript": transcript_clean,
+                "message_evaluations": message_evaluations,
+            }
+        )
+    return batches
+
+
+def _eval_issue_analysis(
+    client,
+    api: APIConfig,
+    issue_type: str,
+    journeys: list[dict],
+    save_raw: bool,
+    truncate_chars: Optional[int],
+    prompt: PromptTemplate,
+) -> dict:
+    """Run one Layer 3 call for a single issue type. Always returns a record."""
+    payload = build_issue_analysis_payload(
+        issue_type=issue_type,
+        journeys=journeys,
+        truncate_chars=truncate_chars,
+    )
+    system_prompt = prompt.build_system()
+    user_prompt = prompt.build_user(payload)
+    journey_ids = [str(j.get("conversation_id", "")) for j in journeys]
+    valid_ids = {jid for jid in journey_ids if jid}
+
+    record: dict[str, Any] = {
+        "issue_type": issue_type,
+        "journey_count": len(journeys),
+        "journey_ids": journey_ids,
+        "raw_model_response": None,
+        "parsed_json": None,
+        "evaluation_output": None,
+        "parse_status": "ok",
+        "error_message": None,
+        "debug": None,
+    }
+
+    try:
+        raw, debug = chat_completion(client, api, system_prompt, user_prompt)
+        if save_raw:
+            record["raw_model_response"] = raw
+            record["debug"] = debug
+        try:
+            obj = extract_json_object(raw)
+            validated = validate_issue_analysis_result(obj, valid_ids=valid_ids)
+            record["parsed_json"] = validated
+            record["evaluation_output"] = validated
+        except Exception as je:
+            record["parse_status"] = "failed"
+            record["error_message"] = f"JSON parse failed: {je}"
+    except Exception as e:
+        record["parse_status"] = "api_error"
+        record["error_message"] = f"API call failed: {e}"
+
+    return record
+
+
+def run_issue_analysis(
+    conversation_results: list[dict],
+    client,
+    api: APIConfig,
+    prompt: Optional[PromptTemplate] = None,
+    *,
+    issue_types: Optional[list[str]] = None,
+    save_raw: bool = True,
+    truncate_chars: Optional[int] = None,
+    on_progress: Optional[Callable[[dict], None]] = None,
+    cancel_requested: Optional[Callable[[], bool]] = None,
+    on_issue_result: Optional[Callable[[dict], None]] = None,
+) -> list[dict]:
+    """Run Layer 3 over finished conversation results, one call per issue type.
+
+    Journeys are grouped by the issue type Layer 2 committed to. Each issue type
+    becomes one concurrent AI call. Returns a list of issue-analysis records,
+    sorted by issue type. Persistence is delegated to ``on_issue_result``.
+
+    ``issue_types`` (when provided) restricts the run to that subset of issue
+    types; anything not present in the grouped batches is ignored. When None,
+    every issue type found in the results is analyzed.
+    """
+    prompt = prompt or DEFAULT_ISSUE_ANALYSIS_PROMPT
+    batches = group_journeys_by_issue_type(conversation_results)
+    if issue_types is not None:
+        wanted = {str(it).strip().lower() for it in issue_types}
+        batches = {it: js for it, js in batches.items() if it in wanted}
+    issue_types = sorted(batches.keys())
+
+    if on_progress:
+        on_progress(
+            {
+                "phase": "issue_start",
+                "total_issue_types": len(issue_types),
+                "issue_types": issue_types,
+            }
+        )
+
+    results: list[dict] = []
+    if not issue_types:
+        if on_progress:
+            on_progress({"phase": "issue_done", "total_issue_types": 0})
+        return results
+
+    workers = max(1, min(len(issue_types), int(getattr(api, "concurrency", 1) or 1)))
+    fut_info: dict[cf.Future, str] = {}
+
+    with cf.ThreadPoolExecutor(max_workers=workers) as ex:
+        for issue_type in issue_types:
+            fut = ex.submit(
+                _eval_issue_analysis,
+                client=client,
+                api=api,
+                issue_type=issue_type,
+                journeys=batches[issue_type],
+                save_raw=save_raw,
+                truncate_chars=truncate_chars,
+                prompt=prompt,
+            )
+            fut_info[fut] = issue_type
+
+        pending = set(fut_info.keys())
+        while pending:
+            done, _ = cf.wait(pending, return_when=cf.FIRST_COMPLETED)
+            for fut in done:
+                pending.discard(fut)
+                issue_type = fut_info.pop(fut)
+                try:
+                    ir = fut.result()
+                except Exception as e:  # noqa: BLE001
+                    ir = {
+                        "issue_type": issue_type,
+                        "journey_count": len(batches.get(issue_type, [])),
+                        "journey_ids": [str(j.get("conversation_id", "")) for j in batches.get(issue_type, [])],
+                        "raw_model_response": None,
+                        "parsed_json": None,
+                        "evaluation_output": None,
+                        "parse_status": "api_error",
+                        "error_message": f"Worker raised: {e}",
+                        "debug": None,
+                    }
+                results.append(ir)
+                if on_issue_result:
+                    try:
+                        on_issue_result(ir)
+                    except Exception:
+                        pass
+                if on_progress:
+                    on_progress(
+                        {
+                            "phase": "issue_type_done",
+                            "issue_type": issue_type,
+                            "status": ir.get("parse_status"),
+                            "total_issue_types": len(issue_types),
+                        }
+                    )
+            if cancel_requested and cancel_requested():
+                for f in list(pending):
+                    if not f.done():
+                        f.cancel()
+                    pending.discard(f)
+                break
+
+    results.sort(key=lambda r: str(r.get("issue_type", "")))
+    if on_progress:
+        on_progress({"phase": "issue_done", "total_issue_types": len(issue_types)})
+    return results
 
 
 # ---------- Run orchestration ----------

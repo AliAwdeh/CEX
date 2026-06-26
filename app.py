@@ -31,9 +31,17 @@ from data_loader import (
     validate_csv,
 )
 from db import DEFAULT_DB_PATH, Database
-from evaluator import RunConfig, RunResults, run_evaluation, validate_conversation_level_result
+from evaluator import (
+    RunConfig,
+    RunResults,
+    run_evaluation,
+    run_issue_analysis,
+    group_journeys_by_issue_type,
+    validate_conversation_level_result,
+)
 from prompts import (
     DEFAULT_CONVERSATION_LEVEL_PROMPT,
+    DEFAULT_ISSUE_ANALYSIS_PROMPT,
     DEFAULT_MESSAGE_LEVEL_PROMPT,
     PromptTemplate,
 )
@@ -49,6 +57,7 @@ from aggregation import (
 from exports import (
     build_conversation_csv_bytes,
     build_full_json_bytes,
+    build_issue_analysis_csv_bytes,
     build_message_csv_bytes,
 )
 from ui_components import (
@@ -111,6 +120,8 @@ def _init_state() -> None:
         # When set, the run evaluates ONLY these IDs (random sampler).
         "selected_conversation_ids": None,
         "run_results": None,
+        "issue_analysis_results": None,
+        "issue_analysis_in_progress": False,
         "run_in_progress": False,
         "progress_log": [],
         "cancel_flag": False,
@@ -166,6 +177,11 @@ def _refresh_default_prompts(db: Database) -> None:
             "conversational prompt",
             "conversational output scheme",
             "conversational user input",
+        ),
+        "issue_analysis": (
+            "issue analysis prompt",
+            "issue analysis output scheme",
+            "issue analysis user input",
         ),
     }
     now = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
@@ -1533,11 +1549,15 @@ def tab_prompts() -> None:
         "one used on the next run."
     )
 
-    sub_ml, sub_cl = st.tabs(["Message-Level Prompt", "Conversation-Level Prompt"])
+    sub_ml, sub_cl, sub_ia = st.tabs(
+        ["Message-Level Prompt", "Conversation-Level Prompt", "Issue-Analysis Prompt"]
+    )
     with sub_ml:
         _render_prompt_editor("message_level", "Message-Level Prompt")
     with sub_cl:
         _render_prompt_editor("conversation_level", "Conversation-Level Prompt")
+    with sub_ia:
+        _render_prompt_editor("issue_analysis", "Issue-Analysis Prompt (Layer 3)")
 
 
 # --------- Tab: Run Evaluation ---------
@@ -1644,6 +1664,9 @@ def tab_run() -> None:
                         )
                         rr = _normalize_run_results_for_display(rr)
                         st.session_state.run_results = rr
+                        st.session_state.issue_analysis_results = (
+                            loaded.get("issue_analysis_results") or None
+                        )
                         st.session_state.current_run_id = sel_id
                         st.session_state.loaded_run_label = sel
                         st.success(f"Loaded run #{sel_id}.")
@@ -1664,6 +1687,7 @@ def tab_run() -> None:
                         if st.session_state.current_run_id == sel_id:
                             st.session_state.current_run_id = None
                             st.session_state.run_results = None
+                            st.session_state.issue_analysis_results = None
                         st.success(f"Deleted run #{sel_id}.")
                     except Exception as e:
                         st.error(f"Could not delete run: {e}")
@@ -2049,6 +2073,13 @@ def tab_run() -> None:
                 on_error=save_err,
             )
             st.session_state.run_results = results
+            # A fresh Layer 2 run invalidates any previously computed Layer 3.
+            st.session_state.issue_analysis_results = None
+            if st.session_state.current_run_id is not None:
+                try:
+                    db.clear_issue_analysis_results(st.session_state.current_run_id)
+                except Exception:
+                    pass
             persist_completed_results()
             progress_box.success(
                 f"Evaluation finished. {len(results.conversation_results)} customer journeys processed, "
@@ -3373,6 +3404,259 @@ def tab_review() -> None:
 # --------- Tab: Exports ---------
 
 
+def _has_issue_results() -> bool:
+    return bool(st.session_state.get("issue_analysis_results"))
+
+
+def _root_cause_badge_html(root_cause: str) -> str:
+    label = html_lib.escape(str(root_cause or "—"))
+    return (
+        '<span style="background:#1e3a8a;color:#bfdbfe;padding:2px 10px;border-radius:999px;'
+        f'font-weight:700;font-size:0.78rem;letter-spacing:0.02em;">{label}</span>'
+    )
+
+
+def tab_issue_analysis() -> None:
+    st.subheader("Issue Analysis — Layer 3 (Issue Analyst)")
+    st.caption(
+        "Groups the evaluated journeys by the issue type Layer 2 assigned, then runs "
+        "one AI pass per issue type to flag the trigger in each journey, find the recurring "
+        "pattern and root cause, and recommend a pattern-level fix."
+    )
+
+    if not _has_results():
+        st.info(
+            "Run (or load) an evaluation first. Layer 3 reads the conversation-level results "
+            "of the current run."
+        )
+        return
+
+    rr = st.session_state.run_results
+    batches = group_journeys_by_issue_type(rr.conversation_results)
+    issue_types = sorted(batches.keys())
+
+    if not issue_types:
+        st.warning(
+            "No journeys in the current run carry an issue type from Layer 2 "
+            "(all `main_issue.issue_type` are `none`). There is nothing for Layer 3 to analyze."
+        )
+        return
+
+    st.markdown("### Batches to analyze")
+    st.caption("One AI call per issue type. Each journey is sent in exactly one batch.")
+    overview_df = pd.DataFrame(
+        [
+            {"Issue type": humanize_label(it), "Journeys in batch": len(batches[it])}
+            for it in issue_types
+        ]
+    )
+    _render_display_table(overview_df, empty_message="No batches.")
+
+    # --- Filter: choose which issue types to send to Layer 3 ---
+    st.markdown("#### Issue types to analyze")
+    select_key = "issue_analysis_selected_types"
+    # Keep any previously chosen types that still exist; default to nothing selected.
+    prior = [it for it in (st.session_state.get(select_key) or []) if it in issue_types]
+    btn_clear, _ = st.columns([1, 5])
+    with btn_clear:
+        if st.button("Clear", use_container_width=True, key="ia_clear"):
+            st.session_state[select_key] = []
+            st.rerun()
+    selected_types = st.multiselect(
+        "Send these issue types (each is one AI call)",
+        options=issue_types,
+        default=prior,
+        format_func=lambda it: f"{humanize_label(it)} ({len(batches[it])} journeys)",
+        key=select_key,
+        label_visibility="collapsed",
+    )
+
+    db = get_db()
+    run_id = st.session_state.current_run_id
+
+    col_run, col_info = st.columns([1, 2])
+    with col_run:
+        run_clicked = st.button(
+            "Run Issue Analysis",
+            type="primary",
+            use_container_width=True,
+            disabled=(
+                bool(st.session_state.get("issue_analysis_in_progress"))
+                or not selected_types
+            ),
+        )
+    with col_info:
+        if selected_types:
+            st.caption(
+                f"{len(selected_types)} of {len(issue_types)} issue type(s) selected • "
+                f"{sum(len(batches[it]) for it in selected_types)} journeys will be sent. "
+                "Uses the active Issue-Analysis prompt and the API settings in the sidebar."
+            )
+        else:
+            st.caption("Select at least one issue type to run.")
+
+    if run_clicked:
+        if not st.session_state.selected_model:
+            st.error("Select a model in the sidebar first.")
+        else:
+            api = _build_api_config()
+            try:
+                client = build_client(api.base_url, api.api_key)
+            except Exception as e:
+                st.error(f"Could not build API client: {e}")
+                client = None
+            if client is not None:
+                prompt_row = db.get_active_prompt("issue_analysis")
+                prompt_tpl = (
+                    PromptTemplate(
+                        system_prompt=prompt_row["system_prompt"],
+                        output_schema=prompt_row["output_schema"],
+                        user_prompt_template=prompt_row["user_prompt_template"],
+                    )
+                    if prompt_row
+                    else DEFAULT_ISSUE_ANALYSIS_PROMPT
+                )
+                prompt_id = prompt_row["id"] if prompt_row else None
+                truncate_chars = (
+                    int(st.session_state.max_chars_per_message)
+                    if st.session_state.truncate_messages
+                    else None
+                )
+
+                progress = st.progress(0.0)
+                status = st.empty()
+                done_count = {"n": 0}
+                total = len(selected_types)
+
+                def on_progress(ev: dict) -> None:
+                    if ev.get("phase") == "issue_type_done":
+                        done_count["n"] += 1
+                        progress.progress(min(1.0, done_count["n"] / max(total, 1)))
+                        status.info(
+                            f"Analyzed {done_count['n']}/{total}: "
+                            f"{humanize_label(ev.get('issue_type', ''))} ({ev.get('status')})"
+                        )
+
+                def on_issue_result(ir: dict) -> None:
+                    if run_id is not None:
+                        try:
+                            ir["prompt_id"] = prompt_id
+                            db.save_issue_analysis_result(run_id, ir)
+                        except Exception:
+                            pass
+
+                # Re-running a type replaces its prior result; types not selected
+                # this time keep whatever was stored before.
+                if run_id is not None:
+                    try:
+                        for it in selected_types:
+                            db.delete_issue_analysis_result(run_id, it)
+                    except Exception:
+                        pass
+
+                st.session_state.issue_analysis_in_progress = True
+                try:
+                    with st.spinner("Running Layer 3 issue analysis..."):
+                        results = run_issue_analysis(
+                            conversation_results=rr.conversation_results,
+                            client=client,
+                            api=api,
+                            prompt=prompt_tpl,
+                            issue_types=selected_types,
+                            save_raw=bool(st.session_state.save_raw_responses),
+                            truncate_chars=truncate_chars,
+                            on_progress=on_progress,
+                            on_issue_result=on_issue_result,
+                        )
+                    # Merge: keep prior results for types we did NOT just run,
+                    # replace the ones we did.
+                    just_run = {r.get("issue_type") for r in results}
+                    prior_results = [
+                        r
+                        for r in (st.session_state.issue_analysis_results or [])
+                        if r.get("issue_type") not in just_run
+                    ]
+                    st.session_state.issue_analysis_results = prior_results + results
+                    progress.progress(1.0)
+                    ok = sum(1 for r in results if r.get("parse_status") == "ok")
+                    status.success(f"Done. {ok}/{len(results)} issue types analyzed successfully.")
+                except Exception as e:
+                    status.error(f"Issue analysis failed: {e}")
+                finally:
+                    st.session_state.issue_analysis_in_progress = False
+
+    if not _has_issue_results():
+        return
+
+    st.markdown("---")
+    st.markdown("### Results")
+
+    results = st.session_state.issue_analysis_results or []
+
+    def _max_occurrences(ir: dict) -> int:
+        parsed = ir.get("parsed_json") or {}
+        return max(
+            (int(p.get("occurrence_count") or 0) for p in (parsed.get("patterns") or [])),
+            default=0,
+        )
+
+    # Show the issue types with the highest-occurrence patterns first.
+    for ir in sorted(results, key=_max_occurrences, reverse=True):
+        issue_type = ir.get("issue_type", "")
+        parsed = ir.get("parsed_json") or {}
+        patterns = parsed.get("patterns") or []
+        status_label = ir.get("parse_status", "")
+        header = (
+            f"**{humanize_label(issue_type)}** — {ir.get('journey_count', 0)} journeys"
+            f" • {len(patterns)} pattern(s)"
+        )
+        if status_label != "ok":
+            header += f" • ⚠️ {status_label}"
+
+        with st.expander(header, expanded=True):
+            if status_label != "ok":
+                st.error(ir.get("error_message") or "This issue type failed to analyze.")
+                if ir.get("raw_model_response"):
+                    with st.expander("Raw model response"):
+                        st.code(ir.get("raw_model_response"))
+                continue
+
+            if parsed.get("summary"):
+                st.markdown(f"**Summary:** {parsed.get('summary')}")
+                st.caption(f"Confidence: {humanize_label(parsed.get('confidence', '—'))}")
+
+            st.markdown("#### Recurring patterns")
+            if not patterns:
+                st.caption("No patterns returned.")
+            # Highest-occurrence patterns first within an issue type.
+            for pat in sorted(patterns, key=lambda p: int(p.get("occurrence_count") or 0), reverse=True):
+                badge = _root_cause_badge_html(pat.get("root_cause_category", ""))
+                occ_count = int(pat.get("occurrence_count") or 0)
+                st.markdown(
+                    f"{badge} &nbsp; **{occ_count} occurrence(s)** &nbsp;·&nbsp; "
+                    f"trigger: {humanize_label(pat.get('trigger_type', '—'))}",
+                    unsafe_allow_html=True,
+                )
+                if pat.get("pattern_description"):
+                    st.markdown(pat["pattern_description"])
+                if pat.get("trigger"):
+                    st.markdown(f"**Trigger (our side):** {pat['trigger']}")
+                if pat.get("customer_context"):
+                    st.caption(f"**Customer context:** {pat['customer_context']}")
+                if pat.get("where_it_happens"):
+                    st.caption(f"**Where it happens:** {pat['where_it_happens']}")
+                if pat.get("root_cause_explanation"):
+                    st.markdown(f"**Root cause:** {pat['root_cause_explanation']}")
+                if pat.get("recommended_solution"):
+                    st.success(f"**Recommended fix:** {pat['recommended_solution']}")
+                journey_ids = pat.get("journey_ids") or []
+                if journey_ids:
+                    st.caption(
+                        f"Journeys ({len(journey_ids)}): {', '.join(str(x) for x in journey_ids)}"
+                    )
+                st.markdown("")
+
+
 def tab_exports() -> None:
     st.subheader("Exports")
     if not _has_results():
@@ -3405,6 +3689,7 @@ def tab_exports() -> None:
         "finished_at": rr.finished_at,
     }
 
+    issue_results = st.session_state.get("issue_analysis_results") or []
     conv_bytes = build_conversation_csv_bytes(rr.conversation_results)
     msg_bytes = build_message_csv_bytes(rr.message_level_results)
     json_bytes = build_full_json_bytes(
@@ -3412,6 +3697,7 @@ def tab_exports() -> None:
         conversation_results=rr.conversation_results,
         message_level_results=rr.message_level_results,
         errors=rr.errors,
+        issue_analysis_results=issue_results,
     )
 
     c1, c2, c3 = st.columns(3)
@@ -3443,6 +3729,17 @@ def tab_exports() -> None:
             data=json_bytes,
             file_name="cx_full_results.json",
             mime="application/json",
+            use_container_width=True,
+        )
+
+    if issue_results:
+        st.markdown("#### Issue-Analysis CSV (Layer 3)")
+        st.caption("One row per recurring pattern, with root cause, criticality, and fix.")
+        st.download_button(
+            "Download issue_analysis_results.csv",
+            data=build_issue_analysis_csv_bytes(issue_results),
+            file_name="cx_issue_analysis_results.csv",
+            mime="text/csv",
             use_container_width=True,
         )
 
@@ -3583,7 +3880,9 @@ def main() -> None:
 
     # Force DB initialization at app start so the seeded defaults exist before
     # any tab tries to read them.
-    _refresh_default_prompts(get_db())
+    db = get_db()
+    db.refresh_default_prompts()  # always sync code constants -> DB
+    _refresh_default_prompts(db)  # then overlay with external files if present
 
     tabs = st.tabs(
         [
@@ -3593,6 +3892,7 @@ def main() -> None:
             "Overview",
             "Dashboard",
             "Journey Review",
+            "Issue Analysis",
             "Exports",
             "Debug",
         ]
@@ -3610,8 +3910,10 @@ def main() -> None:
     with tabs[5]:
         tab_review()
     with tabs[6]:
-        tab_exports()
+        tab_issue_analysis()
     with tabs[7]:
+        tab_exports()
+    with tabs[8]:
         tab_debug()
 
 

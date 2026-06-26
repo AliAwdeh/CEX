@@ -25,6 +25,7 @@ from typing import Any, Iterable, Optional
 
 from prompts import (
     DEFAULT_CONVERSATION_LEVEL_PROMPT,
+    DEFAULT_ISSUE_ANALYSIS_PROMPT,
     DEFAULT_MESSAGE_LEVEL_PROMPT,
     PromptTemplate,
 )
@@ -126,6 +127,24 @@ CREATE TABLE IF NOT EXISTS run_errors (
     created_at TEXT NOT NULL,
     FOREIGN KEY (run_id) REFERENCES runs(id) ON DELETE CASCADE
 );
+
+CREATE TABLE IF NOT EXISTS issue_analysis_results (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    run_id INTEGER NOT NULL,
+    issue_type TEXT NOT NULL,
+    journey_count INTEGER NOT NULL DEFAULT 0,
+    parse_status TEXT NOT NULL,
+    error_message TEXT,
+    raw_response TEXT,
+    parsed_json TEXT,
+    journey_ids_json TEXT,
+    prompt_id INTEGER,
+    debug_json TEXT,
+    created_at TEXT NOT NULL,
+    FOREIGN KEY (run_id) REFERENCES runs(id) ON DELETE CASCADE
+);
+
+CREATE INDEX IF NOT EXISTS idx_issue_results_run ON issue_analysis_results(run_id);
 """
 
 
@@ -280,6 +299,7 @@ class Database:
         for kind, tpl in (
             ("message_level", DEFAULT_MESSAGE_LEVEL_PROMPT),
             ("conversation_level", DEFAULT_CONVERSATION_LEVEL_PROMPT),
+            ("issue_analysis", DEFAULT_ISSUE_ANALYSIS_PROMPT),
         ):
             existing = self._fetchone(
                 "SELECT id FROM prompt_templates WHERE kind=? AND is_default=1",
@@ -357,11 +377,11 @@ class Database:
         row = self.get_active_prompt(kind)
         if not row:
             # Fall back to in-memory defaults.
-            return (
-                DEFAULT_MESSAGE_LEVEL_PROMPT
-                if kind == "message_level"
-                else DEFAULT_CONVERSATION_LEVEL_PROMPT
-            )
+            return {
+                "message_level": DEFAULT_MESSAGE_LEVEL_PROMPT,
+                "conversation_level": DEFAULT_CONVERSATION_LEVEL_PROMPT,
+                "issue_analysis": DEFAULT_ISSUE_ANALYSIS_PROMPT,
+            }.get(kind, DEFAULT_CONVERSATION_LEVEL_PROMPT)
         return PromptTemplate(
             system_prompt=row["system_prompt"],
             output_schema=row["output_schema"],
@@ -583,6 +603,65 @@ class Database:
         )
         return int(cur.lastrowid)
 
+    def save_issue_analysis_result(self, run_id: int, ir: dict) -> int:
+        """Persist one Layer 3 (issue-analysis) result row for an issue type."""
+        now = _now_iso()
+        cur = self._exec(
+            "INSERT INTO issue_analysis_results"
+            "(run_id, issue_type, journey_count, parse_status, error_message, raw_response,"
+            " parsed_json, journey_ids_json, prompt_id, debug_json, created_at)"
+            " VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                int(run_id),
+                str(ir.get("issue_type", "")),
+                int(ir.get("journey_count") or 0),
+                ir.get("parse_status", "ok"),
+                ir.get("error_message"),
+                ir.get("raw_model_response"),
+                _json_dump(ir.get("evaluation_output", ir.get("parsed_json")))
+                if ir.get("evaluation_output", ir.get("parsed_json")) is not None else None,
+                _json_dump(ir.get("journey_ids")) if ir.get("journey_ids") is not None else None,
+                int(ir["prompt_id"]) if ir.get("prompt_id") is not None else None,
+                _json_dump(ir.get("debug")) if ir.get("debug") is not None else None,
+                now,
+            ),
+        )
+        return int(cur.lastrowid)
+
+    def clear_issue_analysis_results(self, run_id: int) -> None:
+        self._exec("DELETE FROM issue_analysis_results WHERE run_id=?", (int(run_id),))
+
+    def delete_issue_analysis_result(self, run_id: int, issue_type: str) -> None:
+        """Remove the saved Layer 3 result for one issue type in a run."""
+        self._exec(
+            "DELETE FROM issue_analysis_results WHERE run_id=? AND issue_type=?",
+            (int(run_id), str(issue_type)),
+        )
+
+    def load_issue_analysis_results(self, run_id: int) -> list[dict]:
+        rows = self._fetchall(
+            "SELECT * FROM issue_analysis_results WHERE run_id=? ORDER BY issue_type ASC",
+            (int(run_id),),
+        )
+        out: list[dict] = []
+        for r in rows:
+            d = dict(r)
+            out.append(
+                {
+                    "issue_type": d.get("issue_type"),
+                    "journey_count": d.get("journey_count"),
+                    "parse_status": d.get("parse_status"),
+                    "error_message": d.get("error_message"),
+                    "raw_model_response": d.get("raw_response"),
+                    "parsed_json": _json_load(d.get("parsed_json")),
+                    "evaluation_output": _json_load(d.get("parsed_json")),
+                    "journey_ids": _json_load(d.get("journey_ids_json")) or [],
+                    "prompt_id": d.get("prompt_id"),
+                    "debug": _json_load(d.get("debug_json")),
+                }
+            )
+        return out
+
     def get_run_result_counts(self, run_id: int) -> dict[str, int]:
         run_id = int(run_id)
         conv = self._fetchone(
@@ -597,10 +676,15 @@ class Database:
             "SELECT COUNT(*) AS n FROM run_errors WHERE run_id=?",
             (run_id,),
         )
+        issue = self._fetchone(
+            "SELECT COUNT(*) AS n FROM issue_analysis_results WHERE run_id=?",
+            (run_id,),
+        )
         return {
             "conversation_results": int(conv["n"] if conv else 0),
             "message_results": int(msg["n"] if msg else 0),
             "run_errors": int(err["n"] if err else 0),
+            "issue_analysis_results": int(issue["n"] if issue else 0),
         }
 
     def clear_run_results(self, run_id: int) -> None:
@@ -609,6 +693,7 @@ class Database:
             c.execute("DELETE FROM message_results WHERE run_id=?", (run_id,))
             c.execute("DELETE FROM conversation_results WHERE run_id=?", (run_id,))
             c.execute("DELETE FROM run_errors WHERE run_id=?", (run_id,))
+            c.execute("DELETE FROM issue_analysis_results WHERE run_id=?", (run_id,))
 
     def load_run_results(self, run_id: int) -> dict:
         """Reconstruct the structures the rest of the app uses for a saved run.
@@ -700,6 +785,7 @@ class Database:
             "run": run,
             "conversation_results": conversation_results,
             "message_level_results": message_level_results,
+            "issue_analysis_results": self.load_issue_analysis_results(run_id),
             "errors": errors,
             "started_at": _to_epoch(run.get("started_at")),
             "finished_at": _to_epoch(run.get("finished_at")),
