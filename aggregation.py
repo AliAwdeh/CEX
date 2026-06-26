@@ -84,6 +84,17 @@ def _norm_text(value: Any) -> str:
     return str(value or "").strip().lower().replace(" ", "_").replace("-", "_")
 
 
+def _final_score_value(cl: dict) -> float | None:
+    score = cl.get("conversation_score") if isinstance(cl, dict) else None
+    if not isinstance(score, dict):
+        return None
+    raw = score.get("final_score", score.get("raw_total_score"))
+    try:
+        return float(raw)
+    except (TypeError, ValueError):
+        return None
+
+
 def _normalize_handled_status(cl: dict) -> str | None:
     handled = _norm_text(cl.get("handled_status"))
     if handled in {"handled", "unhandled"}:
@@ -97,6 +108,10 @@ def _normalize_handled_status(cl: dict) -> str | None:
 
 
 def _normalize_customer_experience(cl: dict) -> str | None:
+    final_score = _final_score_value(cl)
+    if final_score is not None and final_score >= 75:
+        return "good"
+
     experience = _norm_text(cl.get("customer_experience"))
     old_severity = _norm_text(cl.get("cx_issue_severity"))
     old_class = str(cl.get("final_classification", "") or "").strip().lower()

@@ -26,6 +26,11 @@ htmlcov/
 # Streamlit / local app state
 .streamlit/secrets.toml
 
+# Local evaluator runtime database
+cx_evaluator.db
+cx_evaluator.db-shm
+cx_evaluator.db-wal
+
 # Secrets / env
 .env
 .env.*

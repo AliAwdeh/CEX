@@ -76,6 +76,9 @@ st.set_page_config(
 )
 
 
+REVIEW_DB_PATH = Path("cx_evaluator_review_runs_59_57_55.db")
+
+
 # --------- Session state defaults ---------
 
 
@@ -110,11 +113,17 @@ def _init_state() -> None:
         "message_target_role": "agent",
         # When set, the run evaluates ONLY these IDs (random sampler).
         "selected_conversation_ids": None,
+        "selection_import_feedback": None,
         "run_results": None,
         "run_in_progress": False,
         "progress_log": [],
         "cancel_flag": False,
         # DB integration
+        "db_path": str(
+            REVIEW_DB_PATH
+            if REVIEW_DB_PATH.exists() and not Path(DEFAULT_DB_PATH).exists()
+            else DEFAULT_DB_PATH
+        ),
         "current_run_id": None,        # id of the run we're writing to (or loaded from)
         "loaded_run_label": None,
         "review_selected_conversation_id": None,
@@ -135,6 +144,89 @@ _init_state()
 def get_db(path: str = str(DEFAULT_DB_PATH)) -> Database:
     """Return a process-wide :class:`Database` instance (cached by Streamlit)."""
     return Database(path)
+
+
+def _resolve_db_path(path: str | Path) -> Path:
+    db_path = Path(path)
+    return db_path if db_path.is_absolute() else Path.cwd() / db_path
+
+
+def _active_db_path() -> str:
+    return str(st.session_state.get("db_path") or DEFAULT_DB_PATH)
+
+
+def get_active_db() -> Database:
+    return get_db(_active_db_path())
+
+
+def _available_database_options() -> tuple[list[str], dict[str, str]]:
+    options: list[str] = []
+    labels: dict[str, str] = {}
+
+    def add_option(path: str | Path, label: str) -> None:
+        value = str(path)
+        if value in labels:
+            return
+        options.append(value)
+        labels[value] = label
+
+    add_option(DEFAULT_DB_PATH, "Local working DB - cx_evaluator.db")
+    if REVIEW_DB_PATH.exists():
+        add_option(REVIEW_DB_PATH, "Review DB - runs 59, 57, 55")
+
+    known = {Path(str(DEFAULT_DB_PATH)).name, REVIEW_DB_PATH.name}
+    for path in sorted(Path.cwd().glob("*.db")):
+        if path.name in known:
+            continue
+        add_option(path.name, f"Database file - {path.name}")
+
+    current = _active_db_path()
+    if current not in labels:
+        add_option(current, f"Selected DB - {Path(current).name}")
+
+    return options, labels
+
+
+def _on_database_source_changed() -> None:
+    st.session_state.current_run_id = None
+    st.session_state.loaded_run_label = None
+    st.session_state.run_results = None
+    st.session_state.review_selected_conversation_id = None
+    st.session_state.selection_import_feedback = None
+    st.session_state.progress_log = []
+    try:
+        get_db.clear()
+    except Exception:
+        pass
+
+
+def render_database_selector() -> None:
+    options, labels = _available_database_options()
+    if st.session_state.get("db_path") not in labels:
+        st.session_state.db_path = options[0]
+
+    st.markdown("### Database source")
+    selected = st.selectbox(
+        "Load runs from",
+        options=options,
+        key="db_path",
+        format_func=lambda value: labels.get(value, value),
+        on_change=_on_database_source_changed,
+        help="Switch between your full local database and the small review database.",
+    )
+
+    resolved = _resolve_db_path(selected)
+    if resolved.exists():
+        size_mb = resolved.stat().st_size / (1024 * 1024)
+        st.caption(f"Using `{selected}` ({size_mb:.2f} MB).")
+    else:
+        st.warning(f"`{selected}` does not exist yet. The app will create it when needed.")
+
+    if Path(selected).name == REVIEW_DB_PATH.name:
+        st.info(
+            "Review DB selected. It contains only runs 59, 57, and 55 "
+            "(150, 71, and 49 journeys)."
+        )
 
 
 def _db_path(db: Database) -> str:
@@ -265,7 +357,7 @@ def _clear_run_results(db: Database, run_id: int) -> None:
 
 def _load_active_prompts() -> tuple[PromptTemplate, PromptTemplate, int | None, int | None]:
     """Pull the currently active prompt templates (and their ids) from the DB."""
-    db = get_db()
+    db = get_active_db()
     ml_row = db.get_active_prompt("message_level")
     cl_row = db.get_active_prompt("conversation_level")
     ml_tpl = (
@@ -443,6 +535,9 @@ def _normalize_conversation_dataframe_markers(df: pd.DataFrame) -> pd.DataFrame:
     experience = experience.where(valid_experience, None)
     experience = experience.mask(experience.isna() & legacy_bad_experience, "bad")
     experience = experience.mask(experience.isna() & legacy_good_experience, "good")
+    if "score_final" in out.columns:
+        final_score = pd.to_numeric(out["score_final"], errors="coerce")
+        experience = experience.mask(final_score >= 75, "good")
     out["customer_experience"] = experience
 
     if "frustration_detected" in out.columns:
@@ -481,6 +576,32 @@ def _ordered_selected_ids(all_ids: list[str], selected_ids: list[str] | None) ->
     ordered = [str(x) for x in all_ids if str(x) in wanted]
     extra = [str(x) for x in selected_ids if str(x) not in set(ordered)]
     return ordered + extra
+
+
+def _customer_ids_from_saved_run(db: Database, run_id: int) -> tuple[list[str], str]:
+    """Return customer journey IDs represented by a saved run.
+
+    Prefer the run's explicit pinned selection. If the run was not pinned,
+    fall back to the saved conversation result IDs so a completed run can be
+    reused as the next run's scope.
+    """
+    run = db.get_run(int(run_id)) or {}
+    run_config = run.get("run_config") or {}
+    selected_ids = [
+        str(x)
+        for x in (run_config.get("selected_conversation_ids") or [])
+        if str(x).strip()
+    ]
+    if selected_ids:
+        return selected_ids, "pinned selection"
+
+    loaded = db.load_run_results(int(run_id))
+    result_ids = [
+        str(c.get("conversation_id") or c.get("thread_id") or "")
+        for c in loaded.get("conversation_results", [])
+    ]
+    result_ids = [x for x in result_ids if x]
+    return result_ids, "saved run results"
 
 
 def _journey_selector_rows(df: pd.DataFrame) -> pd.DataFrame:
@@ -1294,7 +1415,6 @@ def render_sidebar() -> None:
         st.toggle("Save raw model responses", key="save_raw_responses")
 
         st.markdown("---")
-        st.caption(f"Database file: `{DEFAULT_DB_PATH}`")
         if st.session_state.current_run_id is not None:
             st.caption(f"Current run id: **#{st.session_state.current_run_id}**")
 
@@ -1378,7 +1498,7 @@ def tab_upload() -> None:
 
 def _render_prompt_editor(kind: str, label: str) -> None:
     """Reusable editor for one prompt template kind."""
-    db = get_db()
+    db = get_active_db()
     active = db.get_active_prompt(kind)
     versions = db.list_prompts(kind)
 
@@ -1547,7 +1667,7 @@ def tab_run() -> None:
     st.subheader("Run CX Evaluation")
 
     # --- Past runs (load from DB) ---
-    db = get_db()
+    db = get_active_db()
     with st.expander("Past runs (saved in the database)", expanded=False):
         if st.button("Refresh saved runs", key="refresh_saved_runs", use_container_width=True):
             st.rerun()
@@ -1702,6 +1822,107 @@ def tab_run() -> None:
         "Leave selection empty to use the sidebar journey scope. "
         "Pin specific journeys to evaluate only those customers."
     )
+
+    import_feedback = st.session_state.get("selection_import_feedback")
+    if import_feedback:
+        st.session_state.selection_import_feedback = None
+        level, message = import_feedback
+        if level == "warning":
+            st.warning(message)
+        elif level == "error":
+            st.error(message)
+        else:
+            st.success(message)
+
+    with st.expander("Reuse customers from previous run", expanded=False):
+        previous_runs = db.list_runs(limit=200)
+        if not previous_runs:
+            st.caption("No saved runs are available yet.")
+        elif not all_ids:
+            st.caption("Upload a CSV with customer journeys before importing a previous selection.")
+        else:
+            previous_runs_df = _fill_saved_run_counts(db, pd.DataFrame(previous_runs))
+            previous_runs_df = previous_runs_df.copy()
+            previous_runs_df["saved_conversations_num"] = pd.to_numeric(
+                previous_runs_df.get("saved_conversations", pd.Series(0, index=previous_runs_df.index)),
+                errors="coerce",
+            ).fillna(0).astype(int)
+
+            def reuse_label(row: pd.Series) -> str:
+                run_id = int(row["id"])
+                name = str(row.get("name") or "Untitled run").strip()
+                csv_name = str(row.get("csv_name") or "unknown CSV").strip()
+                status = str(row.get("status") or "unknown").strip()
+                started_at = str(row.get("started_at") or "").strip()
+                saved_count = int(row.get("saved_conversations_num") or 0)
+                return f"#{run_id} - {name} - {csv_name} - {saved_count:,} saved - {status} - {started_at}"
+
+            previous_runs_df["reuse_label"] = previous_runs_df.apply(reuse_label, axis=1)
+            reuse_labels = previous_runs_df["reuse_label"].tolist()
+            reuse_key = "selection_import_run_label"
+            if reuse_key in st.session_state and st.session_state[reuse_key] not in reuse_labels:
+                st.session_state[reuse_key] = reuse_labels[0] if reuse_labels else None
+
+            selected_reuse_label = st.selectbox(
+                "Previous run",
+                options=reuse_labels,
+                key=reuse_key,
+                help="Use the previous run's pinned customers when available; otherwise use its saved result customers.",
+            )
+            label_to_run_id = dict(zip(previous_runs_df["reuse_label"], previous_runs_df["id"]))
+            selected_reuse_run_id = int(label_to_run_id[selected_reuse_label])
+
+            def import_previous_run_selection(replace: bool) -> None:
+                previous_ids, source = _customer_ids_from_saved_run(db, selected_reuse_run_id)
+                unique_previous_ids = list(dict.fromkeys(str(x) for x in previous_ids if str(x).strip()))
+                current_id_set = {str(x) for x in all_ids}
+                matched_ids = [journey_id for journey_id in unique_previous_ids if journey_id in current_id_set]
+                missing_count = len(unique_previous_ids) - len(matched_ids)
+                matched_ids = _ordered_selected_ids(all_ids, matched_ids)
+
+                if not matched_ids:
+                    st.session_state.selection_import_feedback = (
+                        "warning",
+                        (
+                            f"Run #{selected_reuse_run_id} had no reusable customers in the current CSV "
+                            f"from its {source}."
+                        ),
+                    )
+                    st.rerun()
+
+                if replace:
+                    next_ids = matched_ids
+                    action = "Replaced the pinned selection with"
+                else:
+                    next_ids = _ordered_selected_ids(all_ids, selected_ids + matched_ids)
+                    action = "Added"
+
+                st.session_state.selected_conversation_ids = next_ids
+                missing_note = f" {missing_count:,} customer(s) were not found in the current CSV." if missing_count else ""
+                st.session_state.selection_import_feedback = (
+                    "success",
+                    (
+                        f"{action} {len(matched_ids):,} customer journey/journeys from run "
+                        f"#{selected_reuse_run_id} ({source}).{missing_note}"
+                    ),
+                )
+                st.rerun()
+
+            import_cols = st.columns(2)
+            with import_cols[0]:
+                if st.button(
+                    "Replace with previous run customers",
+                    use_container_width=True,
+                    help="Clear the current pinned selection and use customers from the chosen previous run.",
+                ):
+                    import_previous_run_selection(replace=True)
+            with import_cols[1]:
+                if st.button(
+                    "Add previous run customers",
+                    use_container_width=True,
+                    help="Add customers from the chosen previous run to the current pinned selection.",
+                ):
+                    import_previous_run_selection(replace=False)
 
     search = st.text_input(
         "Find customer journey",
@@ -1914,7 +2135,7 @@ def tab_run() -> None:
         client = build_client(config.api.base_url, config.api.api_key)
 
         # Start a DB run record.
-        db = get_db()
+        db = get_active_db()
         run_config_serializable = {
             "api_base_url": config.api.base_url,
             "model": config.api.model,
@@ -3581,9 +3802,11 @@ def main() -> None:
         "Built for management review — focused on outcomes, frustration, and root cause."
     )
 
+    render_database_selector()
+
     # Force DB initialization at app start so the seeded defaults exist before
     # any tab tries to read them.
-    _refresh_default_prompts(get_db())
+    _refresh_default_prompts(get_active_db())
 
     tabs = st.tabs(
         [
