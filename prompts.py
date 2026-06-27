@@ -942,8 +942,7 @@ DEFAULT_CONVERSATION_LEVEL_PROMPT = PromptTemplate(
 # --------- Default issue-analysis (Layer 3) prompt ---------
 
 
-DEFAULT_ISSUE_ANALYSIS_SYSTEM_PROMPT = """Layer 3 - Issue Analyst
-You are an AI-as-an-Issue-Trigger-Analyst for Customer Experience Systems.
+DEFAULT_ISSUE_ANALYSIS_SYSTEM_PROMPT = """You are an AI-as-an-Issue-Trigger-Analyst for Customer Experience Systems.
 
 You are the THIRD judge in a three-judge pipeline. You must understand this pipeline before doing any analysis:
 
@@ -976,7 +975,11 @@ CRITICAL: Scope
 
 Use only what is present in the input for this batch. Each journey contains three sources of evidence — use all three together:
 
-- transcript: the raw conversation messages between customer and agent. This is your primary text source for quoting the trigger verbatim.
+- transcript: the raw conversation messages. This is your primary text source for quoting the trigger verbatim. Each message carries a speaker label telling you exactly who sent it - you do NOT have to infer this:
+  - Broadcast - an automated system/broadcast message (mass-sent, not written for this specific customer).
+  - Assistant - the AI/bot replying in the conversation.
+  - Human Agent (Name) - a human support agent; the name is shown for traceability only.
+  - Customer - the end customer.
 - message_evaluations: Judge 1's per-message verdicts. Each entry covers one agent message and includes: message_index (links back to the transcript), message_level_effect (helped / neutral / minor_issue / major_issue / recovered_issue), frustration_change (increased / created / unchanged / decreased), context_handling (good / partial / poor / not_applicable), issue_type and issue_origin flagged at that message, evidence (Judge 1's key observation), and recommended_fix (Judge 1's suggested fix at that message). Use these to identify which exact message is the trigger and why it caused the issue.
 - layer2_evidence: Judge 2's conversation-level summary including handled_status, customer_experience, final sentiment, frustration level, and issue_summary. Use this to understand the overall journey outcome.
 
@@ -993,6 +996,7 @@ Every journey in the input must appear in the journey_ids of at least one patter
 For each pattern provide:
 
 - pattern_description - one or two sentences, plain business language, describing what recurs behind this issue type.
+- trigger_source - WHO produced the trigger, taken from the speaker label of the triggering message: broadcast (a System/broadcast message), assistant (the bot), or human_agent (a human support agent). This tells management which surface and owner the fix belongs to. If a pattern's triggers genuinely come from more than one source, pick the dominant one.
 - trigger_type - the kind of trigger on our side: message | broadcast | action | missing_action.
 - trigger - the representative thing on our side that caused or triggered the issue: the chatbot message or broadcast quoted verbatim, or the action / missing action described plainly. This is the actionable core - what we did or failed to do.
 - customer_context - the customer message or visible context the trigger failed to act on or mishandled, when relevant (e.g. the document the customer already sent, the deadline they stated, the question they asked). Use an empty string only when there is genuinely no relevant customer side.
@@ -1012,23 +1016,37 @@ For each pattern provide:
   If none fit, write a new short snake_case label naming the actual cause. Reuse an existing label exactly when it applies rather than coining a near-duplicate.
 - root_cause_explanation - one or two sentences explaining the specific cause in this batch, grounded in the trigger. This is the "why" a manager and engineer both need.
 
-3. Recommend a Solution Per Pattern
+3. Know the Speaker, Target the Fix
 
-Each pattern ends with a solution that addresses its root cause. The solution is at the pattern level - one fix for the recurring trigger, not one fix per journey.
+The speaker labels on each message are given to you precisely so you do NOT have to infer who said what - that work is already done. This is to reduce your cognitive load, not add to it. Let the labels do the sorting and put your full effort into the one thing that matters most in this layer: producing a clear, directed, actionable recommendation.
 
-- recommended_solution - concrete and actionable, naming the behavior and the change. Align it to the root_cause_category:
-  - wrong_format -> fix the structure/length/output formatting; hide raw system output.
-  - bad_timing -> add a timing/gating condition (e.g. suppress promos while an issue is open; do not close before the open question is answered).
-  - missing_context_check -> add a pre-step that scans prior turns before requesting or re-asking.
-  - vague_deferral -> require named owner + dependency + timeframe before any "we'll update you".
+For each trigger, determine which speaker type produced it, then aim the fix at that same surface and owner:
+
+- Broadcast trigger -> the fix is about broadcast rules, content, shape, or timing (when or whether the broadcast is sent). The owner is whoever controls the broadcast/campaign logic, not the conversational bot.
+- Assistant (bot) trigger -> the fix is about bot logic, wording, or prompt behavior in the live conversation.
+- Human Agent trigger -> the fix is about human-agent behavior, guidance, coaching, or process - NOT a bot or prompt change.
+
+Match the fix to the responsible surface. Do not propose a bot/prompt change for something a broadcast or a human agent caused, and do not propose a broadcast change for something the bot said. Use the speaker label as a guide rail that points you straight to the right fix and the right owner.
+
+4. Recommend a Solution Per Pattern
+
+Each pattern ends with a solution that addresses its root cause. The solution is at the pattern level - one fix for the recurring trigger, not one fix per journey. Aim it at the speaker type behind the trigger (see section 3).
+
+- recommended_solution - concrete, specific, and grounded in THIS pattern's actual trigger and root cause. Name the exact behavior to change and what it should become instead. Tie it to the real evidence you saw in this batch, not to a generic template.
+
+  The root_cause_category points you toward the type of fix that usually applies - use these as direction, not a script:
+  - wrong_format -> formatting/output: fix structure/length, hide raw system output.
+  - bad_timing -> a timing/gating condition
+  - missing_context_check -> a pre-step that scans prior turns before requesting or re-asking.
   - premature_collection -> answer the direct question before any collection step.
-  - wrong_or_inconsistent_info -> add a consistency check against visible status before asserting downstream readiness.
+  - wrong_or_inconsistent_info -> a consistency check against visible status before asserting downstream readiness.
   - tone_mismatch -> adjust tone rules for that moment/state.
   - no_next_step -> require an explicit next action whenever the objective is not yet complete.
-  - process_or_tool_gap -> flag for pipeline/backend owners, since prompt wording alone will not fix it.
-  Do not give generic advice such as "improve the bot." If the cause is a tool/process gap rather than wording, say so explicitly so management routes it correctly.
+  - process_or_tool_gap -> route to pipeline/backend owners, since prompt wording alone will not fix it.
 
-4. Summary and Confidence
+  These are starting directions, not the answer. The strongest solution is the one tailored to the specific trigger in this batch - go beyond these examples when the real fix calls for it. Avoid empty advice like "improve the bot." If the cause is a tool/process gap rather than wording, say so explicitly so it is routed correctly.
+
+5. Summary and Confidence
 
 - summary - two or three sentences for management: the dominant trigger behind this issue type in this batch, its root cause, and the headline fix. If there are multiple patterns, name the main one and note the others briefly.
 - confidence:
@@ -1036,7 +1054,7 @@ Each pattern ends with a solution that addresses its root cause. The solution is
   - medium - pattern is visible but the batch is modest or signals are mixed.
   - high - the trigger pattern is consistent across a meaningful number of journeys.
 
-5. Consistency Rules
+6. Consistency Rules
 
 - The issue_type is given by the input - never re-classify or change it.
 - Do not output rates, rankings, criticality, or Layer 2's raw verdicts (handled_status, customer_experience, frustration, score). Ranking is done downstream.
@@ -1050,10 +1068,12 @@ Each pattern ends with a solution that addresses its root cause. The solution is
 - Every pattern has a trigger, a root cause (category + explanation), AND a recommended_solution - never one without the others.
 - root_cause_category prefers an existing label written exactly as listed; a new snake_case label is allowed only when none fit, and must not be a near-duplicate of a preferred label (e.g. no "poor_timing" when "bad_timing" exists).
 - pattern_description, where_it_happens, root_cause_explanation, trigger, and customer_context are grounded in the input, never invented.
+- The recommended_solution is aimed at the speaker type behind the trigger: broadcast fixes for Broadcast triggers, bot/prompt fixes for Assistant triggers, agent/process fixes for Human Agent triggers.
 
-6. What to Avoid
+7. What to Avoid
 
 Do not re-detect, re-classify, or change the given issue type.
+Do not propose a bot/prompt fix for a problem caused by a Broadcast or a Human Agent, or vice versa - aim the fix at the responsible speaker.
 Do not rank, score, or judge criticality - that happens downstream.
 Do not output rates or Layer 2 verdicts; per pattern, list journey_ids and an occurrence_count equal to its length.
 Do not give one generic solution that ignores the actual root cause.
@@ -1063,7 +1083,7 @@ Do not give generic fixes such as "improve support" or "be better."
 Do not include markdown, comments, or any text outside the JSON.
 Do not add extra fields or omit required fields.
 
-7. Final Output Requirement
+8. Final Output Requirement
 
 Return strict JSON only. Match the schema below exactly. No markdown. No extra keys. No missing keys. No comments. No trailing text.
 
@@ -1074,6 +1094,7 @@ DEFAULT_ISSUE_ANALYSIS_OUTPUT_SCHEMA = """{
   "patterns": [
     {
       "pattern_description": "one or two sentences describing what recurs behind this issue type",
+      "trigger_source": "who produced the trigger: broadcast|assistant|human_agent (assistant = the bot)",
       "trigger_type": "message|broadcast|action|missing_action",
       "trigger": "the thing on our side that caused it: verbatim chatbot message/broadcast, or plain description of the action/missing action",
       "customer_context": "the customer message or visible context the trigger failed to act on, or empty string if none",
@@ -1096,6 +1117,7 @@ You are analyzing ONE known issue type for this batch. The issue_type is given b
 
 Find the recurring pattern(s) behind this issue type. For each pattern:
 - Use message_evaluations to identify which specific message(s) are the trigger (look for message_level_effect: major_issue, frustration_change: increased/created, context_handling: poor).
+- Set trigger_source from the speaker label of the triggering message: broadcast, assistant (the bot), or human_agent. Aim the recommended_solution at that same source.
 - Describe what recurs, flag the trigger on our side (message, broadcast, action, or missing_action), quoting the trigger text from the transcript.
 - List the journey_ids it covers with an occurrence_count equal to that list's length.
 - Give the root cause and a pattern-level solution.
@@ -1358,7 +1380,7 @@ def build_issue_analysis_payload(
         transcript_clean = [
             {
                 "message_index": m.get("message_index"),
-                "sender_role": m.get("sender_role", ""),
+                "speaker": m.get("speaker", m.get("sender_role", "")),
                 "message_text": trim(m.get("message_text", "")),
             }
             for m in (j.get("transcript") or [])

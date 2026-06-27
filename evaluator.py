@@ -616,7 +616,49 @@ def validate_conversation_level_result(data: dict) -> dict:
 
 # ---------- Issue-analysis (Layer 3) validation ----------
 
+
+def _speaker_label(msg: dict) -> str:
+    """Derive the human-readable speaker label for a transcript message.
+
+    Mirrors the Journey Review display rules (ui_components.render_*): the
+    RAW_SENDER_ROLE distinguishes a broadcast (System) from the bot (Bot) from a
+    human agent (Agent, shown with name), so Layer 3 can target its fix at the
+    right surface instead of guessing from the text.
+    """
+    raw = str(msg.get("raw_sender_role") or "").strip().lower()
+    if raw == "system":
+        return "Broadcast"
+    if raw == "bot":
+        return "Assistant"
+    if raw == "agent":
+        name = str(msg.get("agent_full_name") or "").strip()
+        return f"Human Agent ({name})" if name else "Human Agent"
+    if str(msg.get("sender_role") or "").strip().lower() == "customer":
+        return "Customer"
+    return "Assistant"
+
+
 _TRIGGER_TYPES = {"message", "broadcast", "action", "missing_action"}
+_TRIGGER_SOURCES = {"broadcast", "assistant", "human_agent"}
+
+
+def _normalize_trigger_source(value: Any) -> str:
+    """Normalize the speaker behind a trigger to broadcast|assistant|human_agent.
+
+    Tolerates the labels the model may echo from the transcript (Broadcast,
+    Assistant, "Human Agent (Name)", bot, system, agent) and maps them to the
+    canonical enum. Defaults to assistant (the bot) when unclear.
+    """
+    raw = str(value or "").strip().lower()
+    if not raw:
+        return "assistant"
+    if "broadcast" in raw or raw == "system":
+        return "broadcast"
+    if "human" in raw or raw == "agent":
+        return "human_agent"
+    if "assistant" in raw or raw == "bot":
+        return "assistant"
+    return raw if raw in _TRIGGER_SOURCES else "assistant"
 _PREFERRED_ROOT_CAUSES = {
     "wrong_format",
     "bad_timing",
@@ -671,12 +713,14 @@ def validate_issue_analysis_result(data: dict, valid_ids: set[str] | None = None
         trigger_type = str(pat.get("trigger_type", "") or "").strip().lower().replace(" ", "_")
         if trigger_type not in _TRIGGER_TYPES:
             trigger_type = "action"
+        trigger_source = _normalize_trigger_source(pat.get("trigger_source"))
         root_cause = str(pat.get("root_cause_category", "") or "").strip().lower().replace(" ", "_")
         if not root_cause:
             root_cause = "process_or_tool_gap"
         clean_patterns.append(
             {
                 "pattern_description": str(pat.get("pattern_description", "") or ""),
+                "trigger_source": trigger_source,
                 "trigger_type": trigger_type,
                 "trigger": str(pat.get("trigger", "") or ""),
                 "customer_context": str(pat.get("customer_context", "") or ""),
@@ -735,7 +779,7 @@ def group_journeys_by_issue_type(conversation_results: list[dict]) -> dict[str, 
         transcript_clean = [
             {
                 "message_index": m.get("message_index"),
-                "sender_role": m.get("sender_role", ""),
+                "speaker": _speaker_label(m),
                 "message_text": m.get("message_text", ""),
             }
             for m in transcript

@@ -3416,6 +3416,22 @@ def _root_cause_badge_html(root_cause: str) -> str:
     )
 
 
+def _trigger_source_badge_html(trigger_source: str) -> str:
+    """Color-coded chip showing who produced the trigger (broadcast/bot/human)."""
+    src = str(trigger_source or "").strip().lower()
+    styles = {
+        "broadcast": ("#7c2d12", "#fed7aa", "Broadcast"),
+        "assistant": ("#065f46", "#a7f3d0", "Assistant (bot)"),
+        "human_agent": ("#581c87", "#e9d5ff", "Human Agent"),
+    }
+    bg, fg, label = styles.get(src, ("#374151", "#d1d5db", trigger_source or "—"))
+    label = html_lib.escape(label)
+    return (
+        f'<span style="background:{bg};color:{fg};padding:2px 10px;border-radius:999px;'
+        f'font-weight:700;font-size:0.78rem;letter-spacing:0.02em;">{label}</span>'
+    )
+
+
 def tab_issue_analysis() -> None:
     st.subheader("Issue Analysis — Layer 3 (Issue Analyst)")
     st.caption(
@@ -3632,8 +3648,9 @@ def tab_issue_analysis() -> None:
             for pat in sorted(patterns, key=lambda p: int(p.get("occurrence_count") or 0), reverse=True):
                 badge = _root_cause_badge_html(pat.get("root_cause_category", ""))
                 occ_count = int(pat.get("occurrence_count") or 0)
+                source_html = _trigger_source_badge_html(pat.get("trigger_source", ""))
                 st.markdown(
-                    f"{badge} &nbsp; **{occ_count} occurrence(s)** &nbsp;·&nbsp; "
+                    f"{badge} &nbsp; {source_html} &nbsp; **{occ_count} occurrence(s)** &nbsp;·&nbsp; "
                     f"trigger: {humanize_label(pat.get('trigger_type', '—'))}",
                     unsafe_allow_html=True,
                 )
