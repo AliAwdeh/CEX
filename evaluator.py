@@ -133,6 +133,77 @@ _FORBIDDEN_ID_FIELDS = {
     "target_message_id",
 }
 
+_CAREGIVER_PROMO_RE = re.compile(
+    r"\b(certified\s+caregivers?|caregivers?\s+for\s+children|elderly\s+family|view\s+profiles|perfect\s+match)\b",
+    re.IGNORECASE,
+)
+_CUSTOMER_CLOSING_RE = re.compile(
+    r"\b(thanks?|thank\s+you|got\s+it|great|ok(?:ay)?|will\s+do|perfect|noted|appreciate)\b",
+    re.IGNORECASE,
+)
+_ACTIVE_SENSITIVE_RE = re.compile(
+    r"\b(cancel|refund|payment\s+fail|paid\s+already|overstay|abscond|expired|expiry|urgent|asap|"
+    r"complain|complaint|escalat|legal|police|fine|blocked|not\s+working|issue\s+not\s+resolved)\b",
+    re.IGNORECASE,
+)
+
+
+def _last_customer_text(history_records: list[dict]) -> str:
+    for record in reversed(history_records or []):
+        role = str(record.get("sender_role") or record.get("raw_sender_role") or "").strip().lower()
+        if role == "customer":
+            return str(record.get("message_text") or "")
+    return ""
+
+
+def _is_low_risk_caregiver_promo(target_text: str, history_records: list[dict]) -> bool:
+    if not _CAREGIVER_PROMO_RE.search(target_text or ""):
+        return False
+
+    last_customer = _last_customer_text(history_records)
+    if _CUSTOMER_CLOSING_RE.search(last_customer):
+        return True
+
+    recent_customer_text = "\n".join(
+        str(record.get("message_text") or "")
+        for record in (history_records or [])[-8:]
+        if str(record.get("sender_role") or "").strip().lower() == "customer"
+    )
+    return not _ACTIVE_SENSITIVE_RE.search(recent_customer_text)
+
+
+def _downgrade_low_risk_caregiver_promo(result: dict, target_text: str, history_records: list[dict]) -> dict:
+    if not _is_low_risk_caregiver_promo(target_text, history_records):
+        return result
+    last_customer = _last_customer_text(history_records)
+    post_resolution = (not last_customer.strip()) or bool(_CUSTOMER_CLOSING_RE.search(last_customer))
+    if result.get("message_level_effect") == "major_issue":
+        result["message_level_effect"] = "neutral" if post_resolution else "minor_issue"
+    if result.get("frustration_level_after_message") in {"medium", "high", "cancellation_risk"}:
+        result["frustration_level_after_message"] = "none" if result.get("message_level_effect") == "neutral" else "low"
+    if result.get("frustration_change") in {"created", "increased"}:
+        result["frustration_change"] = "unchanged" if result.get("message_level_effect") == "neutral" else "created"
+    if result.get("customer_effort_level") == "high":
+        result["customer_effort_level"] = "low"
+    if result.get("context_handling") == "poor":
+        result["context_handling"] = "not_applicable" if result.get("message_level_effect") == "neutral" else "partial"
+    if result.get("message_level_effect") == "neutral":
+        result["issue_origin"] = "none"
+        result["issue_type"] = "none"
+        result["frustration_cause"] = "none"
+        result["business_impact"] = "none"
+        result["recommended_fix"] = "none"
+    elif result.get("message_level_effect") == "minor_issue":
+        result["issue_origin"] = "our_side"
+        if result.get("issue_type") in {"ignored_context", "poor_tone", "dead_end", "missing_next_step", "delay", "wrong_info"}:
+            result["issue_type"] = "other"
+        result["frustration_cause"] = result.get("frustration_cause") or "irrelevant promotional message"
+        result["business_impact"] = result.get("business_impact") or "Minor promotional noise in the support thread"
+        result["recommended_fix"] = result.get("recommended_fix") or "Send promotional messages outside active support threads"
+    elif result.get("issue_type") in {"ignored_context", "poor_tone", "dead_end", "missing_next_step", "delay"}:
+        result["issue_type"] = "other"
+    return result
+
 
 def validate_message_level_result(data: dict) -> dict:
     """Coerce a parsed message-level JSON object into the strict schema shape.
@@ -368,6 +439,17 @@ def _rating_from_score(score: Any) -> str:
     return "Critical"
 
 
+def _final_score_value(score: Any) -> float | None:
+    """Return a numeric final score when the conversation score is present."""
+    if not isinstance(score, dict):
+        return None
+    raw = score.get("final_score", score.get("raw_total_score"))
+    try:
+        return float(raw)
+    except (TypeError, ValueError):
+        return None
+
+
 def _normalize_conversation_score(value: Any) -> dict:
     if not isinstance(value, dict):
         return {}
@@ -555,6 +637,10 @@ def validate_conversation_level_result(data: dict) -> dict:
     conversation_score = _normalize_conversation_score(data.get("conversation_score"))
     if conversation_score:
         out["conversation_score"] = conversation_score
+        final_score = _final_score_value(conversation_score)
+        if final_score is not None and final_score >= 75 and customer_experience == "bad":
+            customer_experience = "good"
+            out["customer_experience"] = customer_experience
 
     if not main_out["issue_exists"]:
         main_out["issue_origin"] = "none"
@@ -1053,6 +1139,11 @@ def _eval_message_level(
         try:
             obj = extract_json_object(raw)
             validated = validate_message_level_result(obj)
+            validated = _downgrade_low_risk_caregiver_promo(
+                validated,
+                str(target_record.get("message_text") or ""),
+                history_records,
+            )
             if not validated.get("message_index") and record["message_index"] is not None:
                 try:
                     validated["message_index"] = int(record["message_index"])

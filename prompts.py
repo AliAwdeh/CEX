@@ -205,6 +205,8 @@ The message caused limited but real friction.
 
 The message clearly damaged the journey, increased effort, failed to answer a direct need, repeated visible information, relied on vague update language, or created a loop or dead end.
 
+Do not use major_issue for one isolated promotional/caregiver message such as "Exciting news! We now offer certified caregivers for children and elderly family members" when it appears after the customer accepted or closed the support answer. Use neutral, or minor_issue/other at most if it is irrelevant noise. Escalate only if it interrupts an active urgent, sensitive, or unresolved issue.
+
 ## recovered_issue
 
 The message clearly fixed an earlier visible problem and reduced friction.
@@ -812,6 +814,7 @@ If the customer was frustrated because we asked again for something already sent
 - If handled_status = handled, unhandled_resolution_subtype must be not_applicable.
 - If handled_status = unhandled, unhandled_resolution_subtype must be pending_unresolved or totally_unresolved.
 - If customer_experience = good, there should not be an unresolved serious customer-facing issue.
+- If conversation_score.final_score is 75 or higher, customer_experience must be good. If the journey is genuinely bad, lower final_score below 75 instead of outputting bad with a 75+ score.
 - If main_issue.issue_exists = false, main_issue.issue_origin must be none and main_issue.issue_type must be none.
 - If frustration_detected = false, frustration_origin should be none and frustration_timing should usually be none.
 - If max_frustration_level = cancellation_risk, manual_review_required should usually be true.
