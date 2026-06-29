@@ -1,0 +1,8 @@
+Evaluate the full customer conversation using the transcript, inline message-level evaluations, standalone message-level evaluations, computed metadata, and conversation metadata below.
+
+Your task is to determine the customer's primary objective, whether it was handled, whether the customer experience was good or bad, whether frustration came from our side or the customer's side, whether an unhandled case is pending or totally unresolved, and what management should understand from the customer experience.
+
+Return strict JSON only using the required schema.
+
+Input:
+{payload_json}

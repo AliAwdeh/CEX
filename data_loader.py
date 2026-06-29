@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import io
+import random
 from typing import Any
 
 import pandas as pd
@@ -165,6 +166,74 @@ def get_conversation_groups(df: pd.DataFrame) -> list[tuple[str, pd.DataFrame]]:
             sorted_group = group.reset_index(drop=True)
         out.append((str(conv_id), sorted_group))
     return out
+
+
+def proportional_stratified_sample_ids(
+    rows: pd.DataFrame,
+    sample_size: int,
+    id_column: str = "journey_id",
+    stratum_column: str = "journey_starter",
+    rng: random.Random | None = None,
+) -> list[str]:
+    """Randomly sample IDs while preserving each stratum's source proportion.
+
+    Whole-journey allocations use the largest-remainder method, so percentages
+    are exact when possible and otherwise as close as the sample size permits.
+    """
+    if rows.empty or id_column not in rows.columns:
+        return []
+
+    work = rows.copy()
+    work[id_column] = work[id_column].astype(str)
+    if stratum_column not in work.columns:
+        work[stratum_column] = "unknown"
+    work[stratum_column] = (
+        work[stratum_column]
+        .fillna("unknown")
+        .astype(str)
+        .str.strip()
+        .str.lower()
+        .replace("", "unknown")
+    )
+
+    total = len(work)
+    target = min(max(int(sample_size), 0), total)
+    if target == 0:
+        return []
+
+    randomizer = rng or random.Random()
+    groups = {
+        stratum: group[id_column].tolist()
+        for stratum, group in work.groupby(stratum_column, sort=True)
+    }
+
+    exact_allocations = {
+        stratum: target * len(ids) / total
+        for stratum, ids in groups.items()
+    }
+    allocations = {
+        stratum: int(exact_allocations[stratum])
+        for stratum in groups
+    }
+    remaining = target - sum(allocations.values())
+    remainder_order = sorted(
+        groups,
+        key=lambda stratum: (
+            -(exact_allocations[stratum] - allocations[stratum]),
+            -len(groups[stratum]),
+            stratum,
+        ),
+    )
+    for stratum in remainder_order[:remaining]:
+        allocations[stratum] += 1
+
+    selected: list[str] = []
+    for stratum, ids in groups.items():
+        count = allocations[stratum]
+        if count:
+            selected.extend(randomizer.sample(ids, count))
+    randomizer.shuffle(selected)
+    return selected
 
 
 def conversation_metadata_from_group(group: pd.DataFrame) -> dict:
