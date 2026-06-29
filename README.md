@@ -2,6 +2,8 @@
 
 AI-as-a-Judge web app for evaluating chatbot/customer conversations from the **customer's perspective**.
 
+This is a test version
+
 The app reads a CSV exported from Snowflake (one row per visible message), then runs a two-layer evaluation:
 
 1. **Message-level**: every agent message is judged using the full visible history up to that point.
