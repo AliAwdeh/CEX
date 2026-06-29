@@ -608,8 +608,11 @@ def render_message_evaluation_panel(message_result: dict) -> None:
         st.write(pj.get("frustration_cause") or "_(none)_")
 
 
-def render_conversation_summary_card(conv_result: dict) -> None:
-    """Render a clean summary card for a customer journey."""
+def render_conversation_summary_card(
+    conv_result: dict,
+    show_details: bool = True,
+) -> None:
+    """Render a journey's overall result, with optional supporting details."""
     pj = conv_result.get("parsed_json") or {}
     md = conv_result.get("conversation_metadata") or {}
     cm = conv_result.get("computed_metadata") or {}
@@ -657,6 +660,9 @@ def render_conversation_summary_card(conv_result: dict) -> None:
         """,
         unsafe_allow_html=True,
     )
+
+    if not show_details:
+        return
 
     badges = []
     badges.append(_badge("Outcome", humanize_label(handled), "#16a34a" if handled == "handled" else "#dc2626"))
@@ -836,11 +842,16 @@ def render_conversation_summary_card(conv_result: dict) -> None:
             st.json(conv_result, expanded=False)
 
 
-def conversation_filters(conv_df: pd.DataFrame, key_prefix: str = "conv_filters") -> dict:
+def conversation_filters(
+    conv_df: pd.DataFrame,
+    key_prefix: str = "conv_filters",
+    include_journey_starter: bool = False,
+) -> dict:
     """Render filter widgets and return the active filter values."""
     if conv_df.empty:
         return {}
 
+    sel_journey_starter: list[str] = []
     with st.expander("Filters", expanded=True):
         c1, c2, c3 = st.columns(3)
         with c1:
@@ -909,6 +920,38 @@ def conversation_filters(conv_df: pd.DataFrame, key_prefix: str = "conv_filters"
                 key=f"{key_prefix}_issue_type",
             )
         with c3:
+            if include_journey_starter:
+                starters = [
+                    value
+                    for value in (
+                        conv_df.get("journey_starter", pd.Series(dtype=str))
+                        .dropna()
+                        .astype(str)
+                        .str.strip()
+                        .str.lower()
+                        .unique()
+                    )
+                    if value
+                ]
+                starter_priority = {
+                    "consumer": 0,
+                    "bot": 1,
+                    "system": 2,
+                    "agent": 3,
+                    "unknown": 99,
+                }
+                starters = sorted(
+                    starters,
+                    key=lambda value: (starter_priority.get(value, 50), value),
+                )
+                sel_journey_starter = st.multiselect(
+                    "Journey started by",
+                    starters,
+                    default=[],
+                    format_func=humanize_label,
+                    key=f"{key_prefix}_journey_starter",
+                    help="The sender type of the first message in the appended customer journey.",
+                )
             mr_options = ["Any", "Only manual review", "Only no manual review"]
             sel_mr = st.selectbox("Human review", mr_options, index=0, key=f"{key_prefix}_manual_review")
             date_range = None
@@ -934,6 +977,7 @@ def conversation_filters(conv_df: pd.DataFrame, key_prefix: str = "conv_filters"
         "frustration_origin": sel_frustration_origin,
         "main_issue_origin": sel_origin,
         "main_issue_type": sel_issue_type,
+        "journey_starter": sel_journey_starter,
         "manual_review": sel_mr,
         "date_range": date_range,
     }
@@ -958,6 +1002,7 @@ def apply_conversation_filters(conv_df: pd.DataFrame, filters: dict) -> pd.DataF
     in_filter("frustration_origin", "frustration_origin")
     in_filter("main_issue_origin", "main_issue_origin")
     in_filter("main_issue_type", "main_issue_type")
+    in_filter("journey_starter", "journey_starter")
     mr = filters.get("manual_review")
     manual_review_series = None
     if "manual_review_required" in conv_df.columns:

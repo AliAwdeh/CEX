@@ -26,10 +26,12 @@ htmlcov/
 # Streamlit / local app state
 .streamlit/secrets.toml
 
-# Local evaluator runtime database
-cx_evaluator.db
-cx_evaluator.db-shm
-cx_evaluator.db-wal
+# Local SQLite databases and runtime sidecars
+*.db
+*.db-shm
+*.db-wal
+*.sqlite
+*.sqlite3
 
 # Secrets / env
 .env
@@ -41,13 +43,6 @@ cx_evaluator.db-wal
 db_backups/
 
 __pycache__
-
-# SQLite runtime databases and sidecar files
-#*.db
-#*.db-shm
-#*.db-wal
-#*.sqlite
-#*.sqlite3
 
 # Exported evaluation outputs
 cx_conversation_results.csv

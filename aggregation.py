@@ -270,9 +270,24 @@ def flatten_conversation_row(
                 return conversation_metadata[k]
         return None
 
+    transcript = conv_result.get("transcript") or []
+    journey_starter = None
+    if isinstance(transcript, list) and transcript and isinstance(transcript[0], dict):
+        first_message = transcript[0]
+        journey_starter = str(
+            first_message.get("raw_sender_role")
+            or first_message.get("sender_role")
+            or "unknown"
+        ).strip().lower()
+        journey_starter = {
+            "customer": "consumer",
+            "assistant": "bot",
+        }.get(journey_starter, journey_starter)
+
     row = {
         "conversation_id": conv_result.get("conversation_id", ""),
         "customer_journey_id": conv_result.get("conversation_id", ""),
+        "journey_starter": journey_starter,
         "customer_name": get_md("customer_name"),
         "customer_phone": get_md("customer_phone"),
         "source_conversation_ids": get_md("source_conversation_ids", "conversation_ids"),

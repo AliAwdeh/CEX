@@ -18,6 +18,7 @@ import streamlit.components.v1 as components
 import ui_components as ui_components_module
 
 from api_client import APIConfig, DEFAULT_BASE_URL, build_client, fetch_models
+from cost_estimator import estimate_gpt5_mini_run_cost, is_gpt5_mini
 from data_loader import (
     JOURNEY_ID_COLUMN,
     METADATA_COLUMNS,
@@ -27,6 +28,7 @@ from data_loader import (
     get_conversation_groups,
     load_csv,
     normalize_dataframe,
+    proportional_stratified_sample_ids,
     summarize_dataframe,
     validate_csv,
 )
@@ -609,6 +611,15 @@ def _journey_selector_rows(df: pd.DataFrame) -> pd.DataFrame:
     rows: list[dict[str, Any]] = []
     for journey_id, group in get_conversation_groups(df):
         md = conversation_metadata_from_group(group)
+        first_message = group.iloc[0] if not group.empty else pd.Series(dtype=object)
+        raw_starter = first_message.get("RAW_SENDER_ROLE")
+        if pd.isna(raw_starter) or not str(raw_starter).strip():
+            raw_starter = first_message.get("SENDER_ROLE", "unknown")
+        journey_starter = str(raw_starter or "unknown").strip().lower()
+        journey_starter = {
+            "customer": "consumer",
+            "assistant": "bot",
+        }.get(journey_starter, journey_starter)
         customer_name = str(md.get("customer_name") or "").strip()
         customer_phone = str(md.get("customer_phone") or journey_id or "").strip()
         source_ids = str(md.get("source_conversation_ids") or "").strip()
@@ -636,6 +647,7 @@ def _journey_selector_rows(df: pd.DataFrame) -> pd.DataFrame:
         rows.append(
             {
                 "journey_id": str(journey_id),
+                "journey_starter": journey_starter,
                 "customer_name": customer_name,
                 "customer_phone": customer_phone,
                 "source_conversation_ids": source_ids,
@@ -652,12 +664,24 @@ def _journey_selector_rows(df: pd.DataFrame) -> pd.DataFrame:
     return pd.DataFrame(rows)
 
 
-def _conversation_filters_with_keys(conv_df: pd.DataFrame, key_prefix: str) -> dict:
+def _conversation_filters_with_keys(
+    conv_df: pd.DataFrame,
+    key_prefix: str,
+    include_journey_starter: bool = False,
+) -> dict:
     try:
-        return conversation_filters(conv_df, key_prefix=key_prefix)
+        return conversation_filters(
+            conv_df,
+            key_prefix=key_prefix,
+            include_journey_starter=include_journey_starter,
+        )
     except TypeError:
         reloaded = importlib.reload(ui_components_module)
-        return reloaded.conversation_filters(conv_df, key_prefix=key_prefix)
+        return reloaded.conversation_filters(
+            conv_df,
+            key_prefix=key_prefix,
+            include_journey_starter=include_journey_starter,
+        )
 
 
 def _apply_conversation_filters_fresh(conv_df: pd.DataFrame, filters: dict) -> pd.DataFrame:
@@ -665,9 +689,15 @@ def _apply_conversation_filters_fresh(conv_df: pd.DataFrame, filters: dict) -> p
     return reloaded.apply_conversation_filters(conv_df, filters)
 
 
-def _render_conversation_summary_card_fresh(conv_result: dict) -> None:
+def _render_conversation_summary_card_fresh(
+    conv_result: dict,
+    show_details: bool = True,
+) -> None:
     reloaded = importlib.reload(ui_components_module)
-    reloaded.render_conversation_summary_card(conv_result)
+    reloaded.render_conversation_summary_card(
+        conv_result,
+        show_details=show_details,
+    )
 
 
 def _humanize_columns(df: pd.DataFrame, columns: list[str]) -> pd.DataFrame:
@@ -1999,18 +2029,40 @@ def tab_run() -> None:
             "Random sample",
             use_container_width=True,
             help=(
-                "Pick a random sample of IDs from the uploaded CSV. "
+                "Pick a random sample while preserving the uploaded CSV's proportions of "
+                "consumer-, system-, bot-, and agent-initiated journeys. "
                 "Sample size uses the sidebar journey count, or all journeys when Run all uploaded journeys is enabled."
             ),
             disabled=not all_ids,
         ):
-            import random
             if st.session_state.get("run_all_conversations"):
                 n = len(all_ids)
             else:
                 n = max(1, int(st.session_state.max_conversations or 1))
             n = min(n, len(all_ids))
-            st.session_state.selected_conversation_ids = _ordered_selected_ids(all_ids, random.sample(all_ids, n))
+            sampled_ids = proportional_stratified_sample_ids(selector_df, n)
+            st.session_state.selected_conversation_ids = _ordered_selected_ids(
+                all_ids,
+                sampled_ids,
+            )
+            source_mix = selector_df["journey_starter"].value_counts()
+            sample_mix = (
+                selector_df[selector_df["journey_id"].astype(str).isin(sampled_ids)]
+                ["journey_starter"]
+                .value_counts()
+            )
+            mix_summary = ", ".join(
+                (
+                    f"{humanize_label(starter)} "
+                    f"{int(sample_mix.get(starter, 0)):,}/{n:,} "
+                    f"({int(sample_mix.get(starter, 0)) / n:.1%}; source {count / len(selector_df):.1%})"
+                )
+                for starter, count in source_mix.items()
+            )
+            st.session_state.selection_import_feedback = (
+                "success",
+                f"Selected a proportional random sample of {n:,} journeys: {mix_summary}.",
+            )
             st.rerun()
     with pick_cols[4]:
         if st.button(
@@ -2093,6 +2145,24 @@ def tab_run() -> None:
             ("Total estimated AI calls", f"{estimate['total_calls']:,}", None),
         ]
     )
+
+    if is_gpt5_mini(st.session_state.selected_model):
+        cost_config, _, _ = _build_run_config()
+        cost_estimate = estimate_gpt5_mini_run_cost(df, cost_config)
+        st.markdown("#### Estimated GPT-5 mini cost")
+        metric_row(
+            [
+                ("Estimated input tokens", f"{cost_estimate['input_tokens']:,}", None),
+                ("Estimated output tokens", f"{cost_estimate['output_tokens']:,}", None),
+                ("Estimated input cost", f"${cost_estimate['input_cost']:,.4f}", None),
+                ("Estimated output cost", f"${cost_estimate['output_cost']:,.4f}", None),
+                ("Estimated total cost", f"${cost_estimate['total_cost']:,.4f}", None),
+            ]
+        )
+        st.caption(
+            "Pricing used: $0.25 per 1M input tokens and $2.00 per 1M output tokens. "
+            "Input counts use the loaded journeys and active prompts; output size is estimated from the active JSON schemas."
+        )
 
     large_job = estimate["total_calls"] > 200
     if large_job:
@@ -3395,7 +3465,18 @@ def tab_review() -> None:
         "Browse customer journeys by result, customer frustration, review priority, or the main customer problem."
     )
 
-    review_filters = _conversation_filters_with_keys(conv_df, "review_filters")
+    show_review_details = st.toggle(
+        "Show journey analysis and review metrics",
+        value=False,
+        key="review_show_supporting_details",
+        help="Filters and conversation transcripts remain visible. Turn this on to show the KPI strip and selected journey analysis.",
+    )
+
+    review_filters = _conversation_filters_with_keys(
+        conv_df,
+        "review_filters",
+        include_journey_starter=True,
+    )
     filtered_df = _apply_conversation_filters_fresh(conv_df, review_filters)
 
     search = st.text_input(
@@ -3442,7 +3523,8 @@ def tab_review() -> None:
             None,
         ),
     ]
-    metric_row(review_metrics)
+    if show_review_details:
+        metric_row(review_metrics)
 
     options = []
     label_to_id = {}
@@ -3571,7 +3653,10 @@ def tab_review() -> None:
         return
 
     target_cr = _normalize_conversation_result_for_display(target_cr)
-    _render_conversation_summary_card_fresh(target_cr)
+    _render_conversation_summary_card_fresh(
+        target_cr,
+        show_details=show_review_details,
+    )
 
     st.markdown("### Full Customer Journey")
     st.caption(
@@ -3840,4 +3925,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-
