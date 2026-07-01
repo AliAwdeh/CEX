@@ -174,7 +174,7 @@ def _available_database_options() -> tuple[list[str], dict[str, str]]:
 
     add_option(DEFAULT_DB_PATH, "Local working DB - cx_evaluator.db")
     if REVIEW_DB_PATH.exists():
-        add_option(REVIEW_DB_PATH, "Review DB - runs 59, 57, 55")
+        add_option(REVIEW_DB_PATH, "Review DB - runs 5, 59, 57, 55")
 
     known = {Path(str(DEFAULT_DB_PATH)).name, REVIEW_DB_PATH.name}
     for path in sorted(Path.cwd().glob("*.db")):
@@ -226,8 +226,8 @@ def render_database_selector() -> None:
 
     if Path(selected).name == REVIEW_DB_PATH.name:
         st.info(
-            "Review DB selected. It contains only runs 59, 57, and 55 "
-            "(150, 71, and 49 journeys)."
+            "Review DB selected. It contains runs 5, 59, 57, and 55 "
+            "(200, 150, 71, and 49 journeys)."
         )
 
 
@@ -568,6 +568,42 @@ def _normalize_conversation_dataframe_markers(df: pd.DataFrame) -> pd.DataFrame:
         )
 
     return out
+
+
+def _norm_export_marker(value: Any) -> str:
+    return (
+        str(value or "")
+        .strip()
+        .lower()
+        .replace(" ", "_")
+        .replace("-", "_")
+    )
+
+
+def _filter_conversation_results_for_export(
+    conversation_results: list[dict],
+    *,
+    handled_status: str | None = None,
+    customer_experience: str | None = None,
+    unhandled_resolution_subtype: str | None = None,
+) -> list[dict]:
+    filtered: list[dict] = []
+    for cr in conversation_results:
+        normalized = _normalize_conversation_result_for_display(cr)
+        parsed = normalized.get("parsed_json") or normalized.get("evaluation_output") or {}
+        if not isinstance(parsed, dict):
+            parsed = {}
+        if handled_status and _norm_export_marker(parsed.get("handled_status")) != handled_status:
+            continue
+        if customer_experience and _norm_export_marker(parsed.get("customer_experience")) != customer_experience:
+            continue
+        if (
+            unhandled_resolution_subtype
+            and _norm_export_marker(parsed.get("unhandled_resolution_subtype")) != unhandled_resolution_subtype
+        ):
+            continue
+        filtered.append(normalized)
+    return filtered
 
 
 def _ordered_selected_ids(all_ids: list[str], selected_ids: list[str] | None) -> list[str]:
@@ -3711,11 +3747,15 @@ def tab_exports() -> None:
         "finished_at": rr.finished_at,
     }
 
-    conv_bytes = build_conversation_csv_bytes(rr.conversation_results)
+    conversation_results = [
+        _normalize_conversation_result_for_display(cr)
+        for cr in rr.conversation_results
+    ]
+    conv_bytes = build_conversation_csv_bytes(conversation_results)
     msg_bytes = build_message_csv_bytes(rr.message_level_results)
     json_bytes = build_full_json_bytes(
         run_config=run_config,
-        conversation_results=rr.conversation_results,
+        conversation_results=conversation_results,
         message_level_results=rr.message_level_results,
         errors=rr.errors,
     )
@@ -3751,6 +3791,80 @@ def tab_exports() -> None:
             mime="application/json",
             use_container_width=True,
         )
+
+    st.markdown("---")
+    st.markdown("### Journey Category CSVs")
+    st.caption("Each file uses the same journey-level columns, filtered by outcome and customer experience.")
+
+    category_specs = [
+        (
+            "Handled",
+            "cx_journeys_handled.csv",
+            {"handled_status": "handled"},
+        ),
+        (
+            "Handled / Good",
+            "cx_journeys_handled_good.csv",
+            {"handled_status": "handled", "customer_experience": "good"},
+        ),
+        (
+            "Handled / Bad",
+            "cx_journeys_handled_bad.csv",
+            {"handled_status": "handled", "customer_experience": "bad"},
+        ),
+        (
+            "Not Handled",
+            "cx_journeys_not_handled.csv",
+            {"handled_status": "unhandled"},
+        ),
+        (
+            "Pending Unresolved / Bad",
+            "cx_journeys_pending_unresolved_bad.csv",
+            {
+                "handled_status": "unhandled",
+                "customer_experience": "bad",
+                "unhandled_resolution_subtype": "pending_unresolved",
+            },
+        ),
+        (
+            "Totally Unresolved / Bad",
+            "cx_journeys_totally_unresolved_bad.csv",
+            {
+                "handled_status": "unhandled",
+                "customer_experience": "bad",
+                "unhandled_resolution_subtype": "totally_unresolved",
+            },
+        ),
+        (
+            "Not Handled / Good",
+            "cx_journeys_not_handled_good.csv",
+            {"handled_status": "unhandled", "customer_experience": "good"},
+        ),
+        (
+            "Overall Good",
+            "cx_journeys_overall_good.csv",
+            {"customer_experience": "good"},
+        ),
+        (
+            "Overall Bad",
+            "cx_journeys_overall_bad.csv",
+            {"customer_experience": "bad"},
+        ),
+    ]
+
+    for row_start in range(0, len(category_specs), 3):
+        cols = st.columns(3)
+        for col, (label, file_name, filters) in zip(cols, category_specs[row_start:row_start + 3]):
+            subset = _filter_conversation_results_for_export(conversation_results, **filters)
+            with col:
+                st.download_button(
+                    f"{label} ({len(subset):,})",
+                    data=build_conversation_csv_bytes(subset),
+                    file_name=file_name,
+                    mime="text/csv",
+                    disabled=not subset,
+                    use_container_width=True,
+                )
 
     st.markdown("---")
     st.markdown("### Preview")

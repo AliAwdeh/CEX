@@ -119,15 +119,15 @@ One isolated promotional, marketing, birthday, survey, caregiver, re-engagement,
 
 A promotional or unrelated message can make customer_experience bad when it appears inside an active serious, urgent, blocked, or sensitive support discussion, such as cancellation/refund, payment failure, visa/legal risk, overstay/absconding risk, unresolved delivery before travel, unresolved complaint, repeated chasing, or visible customer frustration. In those cases, judge whether it delayed, ignored, or displaced the needed support answer.
 
-Repeated proactive broadcasts or operational instructions before the customer engages are not automatically bad CX. If they are repetitive or imperfect but do not make the customer repeat themselves, do not trigger visible confusion, and are followed by a clear current status or next step that the customer accepts, treat them as minor noise inside a handled + good journey. Mark bad only when the repeated notices conflict, ask for contradictory action, cause customer confusion, or lead to meaningful extra effort.
+Repeated proactive broadcasts or operational instructions can still make customer_experience = bad even when the customer stays calm. Repeated payment reminders, document reminders, or "ACTION: Payment/Document" style messages create a poor journey when they add avoidable noise, pressure, confusion, or extra effort across the journey. If the reminders are valid because the customer has not paid or has not provided required documents, do not treat the underlying payment/document need as our_side fault; note in the reasoning that customer action is pending. Still count the repeated reminders against customer_experience when the overall journey feels noisy or burdensome.
 
 Natural follow-up questions from the customer do not automatically make the experience bad. If the agent answers the plausible open questions directly, handles external/government dependencies realistically, and the customer accepts the answer, customer_experience can remain good.
 
-Operational channel-change notices are not automatically bad CX. If the company says messages are no longer handled on this number, another WhatsApp number is the active support channel, or the customer is already being assisted on another number, treat that as neutral or minor operational routing when it gives a clear contact path and the customer's issue is later answered. It should not make the whole journey bad unless the channel notice blocks an urgent issue, sends the customer in a loop, gives no usable contact path, or the customer has to repeat the same issue multiple times without resolution.
+Operational channel-change notices are not automatically bad CX. Messages such as "we are not receiving messages on this phone number", "this number is not active", or "use another WhatsApp number" can be acceptable operational routing when they give a usable active support path and the customer's issue is answered after minimal friction, even if the customer repeats the question once on the correct channel. Mark bad only when the notice gives no usable path, creates a channel loop, blocks an urgent/sensitive issue, causes repeated unresolved re-explaining, or materially delays the support answer.
 
 Callback deflection is not automatically bad CX when the agent explains that the number is not set up for incoming calls or that WhatsApp is faster, then asks for the needed context and resolves the issue in chat. Mark it bad only when the customer explicitly needs a call for accessibility/safety/urgent escalation, the agent gives no usable in-chat path, or the callback refusal leaves the material issue unresolved.
 
-Repeated payment reminders, duplicate operational reminders, and one-off automatic notices are not automatically bad CX when the payment/process explanation is later clear and the customer does not complain about the reminders. They become bad when the customer explicitly complains about repeated reminders, says they already paid and keeps receiving them, or the reminders create trust risk during an unresolved payment dispute.
+Repeated payment reminders, duplicate document requests, and operational reminder broadcasts should contribute to bad customer_experience when they are frequent, noisy, or burdensome, even if the customer does not explicitly complain. Keep the fault distinction clear: if the repeated reminders are caused by a real unpaid balance or missing customer document, the main issue is customer action pending rather than our_side failure. Mark our_side/shared only when the reminders are excessive, unclear, contradictory, continue after visible payment/document submission, target the wrong status, or interfere with resolving the customer's actual request.
 
 A single initial routing clarification, wrong-topic question, or "which team/service is this about?" prompt does not make an otherwise resolved journey bad when it is corrected quickly, no material delay occurs, and the customer receives the requested links/documents/status. Treat it as minor recovered friction, not the main issue.
 
@@ -153,15 +153,20 @@ Use bad when the chatbot failure is material, repeated, unrecovered, trust-damag
 - Repeated, unrecovered, or material agent messages made zero forward progress (acknowledgment only, restatement, "noted", "we will check", "we will update you")
 - The chatbot asked for already-provided information in a material, repeated, or unrecovered way
 - The chatbot asked what an obviously relevant item was for
+- The chatbot or broadcast sent a wrong-context instruction that did not fit the customer's visible status, such as asking the customer/maid to go to a medical center when the visible journey shows the maid is outside the UAE, or sending a payment/document/action instruction that conflicts with the customer's current state
 - The chatbot failed to answer a direct status/process question and instead promised to check, revert, or update later, and the issue was not promptly recovered with a direct answer
 - The chatbot failed to answer a direct amount/value question with the exact value and did not provide a clear source, owner, next step, timeframe, or place to check/pay
 - The chatbot answered a direct question only after unnecessary collection steps
 - The chatbot repeated or mirrored the customer's words without moving forward
 - The chatbot's response was logically inconsistent with visible process state — implied a downstream result was ready while prerequisites were still pending
+- Repeated payment, document, or operational reminders made the journey noisy or burdensome, even if the customer did not complain; if the reminders were valid because customer action was pending, do not call the underlying requirement our_side fault
+- A support-channel notice such as "we are not receiving messages on this phone number" gave no usable path, created a loop, blocked an urgent/sensitive issue, or caused repeated unresolved re-explaining
 - The customer had to repeat themselves or follow up multiple times for the same information
 - The journey ended in uncertainty, delay, or looping
 - A valid business constraint existed but was explained vaguely, late, contradictorily, or without a usable next step
 - The final outcome was reached only after material avoidable friction, repeated effort, unrecovered confusion, or repeated zero-progress messages
+
+Wrong-context customer-status messages are very strong bad-CX signals. The evaluator does not need to know how a broadcast was configured; judge the customer-visible result. If the company sent a message that is unsuitable for the customer's current situation, known customer/maid status, payment/document status, location, cancellation state, or active request, treat it as customer_experience = bad. Usually set the main issue to our_side with issue_type wrong_info or ignored_context, unless the transcript clearly shows the customer caused the mismatch.
 
 One strong chatbot failure is enough to make customer_experience = bad. Strong means material, trust-damaging, repeated, unrecovered, or blocking the customer's objective. Do not treat a harmless post-resolution notice, a smooth address collection request, or one promptly resolved clarification as a strong failure by itself.
 
@@ -691,10 +696,15 @@ Customer asks for a callback or says they missed a call. Agent explains calls ma
 This is acceptable support routing when the customer receives a usable answer and does not keep insisting a call is required.
 -> handled + good unless the call refusal blocks an urgent or sensitive issue
 
-## Handled + Good (duplicate reminder without complaint)
-Customer receives duplicate payment or operational reminders. The amount/reason/link is later clear, the customer does not object to the reminders, and the underlying request is resolved.
-Do not make the journey bad solely because duplicate reminders appeared. Repeated reminders become bad when the customer complains, says they already paid, or the reminders continue during an unresolved payment dispute.
--> handled + good unless visible customer annoyance or payment confusion remains
+## Handled + Good (isolated valid reminder without confusion)
+Customer receives one isolated payment, document, or operational reminder that matches the visible customer status. The amount/reason/link is clear, no cancellation/end-of-contract/payment-completion conflict exists, and the customer does not become confused or have to ask why the reminder was sent.
+This can remain handled + good when the reminder is valid, low-friction, and does not disrupt the customer's actual request.
+-> handled + good
+
+## Handled + Bad (payment reminder conflicts with cancellation or ending contract)
+Customer receives an advanced salary, payment link, document, or ACTION reminder, then says they do not understand it because the contract is already ending, cancellation is underway, the last date is near, or they expected the usual automatic payment flow. The agent later explains the salary/payment situation and gives a usable answer.
+The objective may be handled because the payment question was clarified, but the journey is not good: the reminder was wrong-context or poorly targeted for the customer's visible contract/cancellation status and created avoidable payment confusion.
+-> handled + bad, unhandled_resolution_subtype: not_applicable, main_issue_origin: our_side or shared, main_issue_type: wrong_info/ignored_context/unclear_guidance depending on the visible facts
 
 ## Handled + Good (one recovered routing/context miss)
 Customer asks for payment links, live-in maid details, invoice, or another specific account item. The first agent asks a wrong-topic routing question or clarification, then the next responses provide the exact links, invoice, document, or status requested.
