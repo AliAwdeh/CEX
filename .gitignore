@@ -27,11 +27,6 @@ htmlcov/
 .streamlit/secrets.toml
 
 # Local SQLite databases and runtime sidecars
-*.db
-*.db-shm
-*.db-wal
-*.sqlite
-*.sqlite3
 
 # Secrets / env
 .env
