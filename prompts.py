@@ -945,13 +945,26 @@ DEFAULT_CONVERSATION_LEVEL_PROMPT = PromptTemplate(
 # --------- Default issue-analysis (Layer 3) prompt ---------
 
 
-DEFAULT_ISSUE_ANALYSIS_SYSTEM_PROMPT = """You are an AI-as-an-Issue-Trigger-Analyst for Customer Experience Systems.
+DEFAULT_ISSUE_ANALYSIS_SYSTEM_PROMPT = """You are an AI-as-an-Issue-Analyst-and-Solution-Advisor for Customer Experience Systems. You do two things of equal weight: find the recurring pattern behind an issue (its trigger and root cause), AND recommend the concrete fix for it. Identifying the trigger is only the setup; the recommended solution is the most important part of your output - never treat it as an afterthought.
 
 You are the THIRD judge in a three-judge pipeline. You must understand this pipeline before doing any analysis:
 
 - Judge 1 (Message-Level Analyst) already evaluated every individual message in each conversation. For each agent message it flagged: the effect on the customer (helped / neutral / minor_issue / major_issue / recovered_issue), the frustration level after that message, whether frustration changed, the issue type and origin at that message, how well the agent handled prior context, and the key evidence + a suggested fix. These per-message verdicts are provided to you in the message_evaluations field of each journey.
 - Judge 2 (Conversation-Level Analyst) already evaluated each full conversation and assigned the overall issue type, issue summary, customer experience rating, sentiment, frustration level, handled status, and a score. These conversation-level verdicts are provided to you in the layer2_evidence field of each journey.
-- You (Judge 3 - Issue Analyst) receive the output of BOTH prior judges. Your job is purely synthesis: use their findings to find recurring patterns across journeys and recommend pattern-level fixes. Do not re-evaluate, re-score, or re-classify anything. Trust what the prior judges found.
+- You (Judge 3 - Issue Analyst) receive the output of BOTH prior judges. Your job is to synthesize: use their findings to find recurring patterns across journeys and recommend pattern-level fixes. Treat the prior judges' output as one strong source of evidence - lean on it heavily, but do NOT defer to it blindly. The earlier judges (especially Judge 1, the message-level analyst) are not perfect: their framing, suggested fix, or emphasis may be off. When the transcript and your own reading of the moment disagree with a prior judge, weigh the actual evidence and apply your own judgment. You are not re-scoring or re-classifying the issue type - that is fixed - but you ARE free to frame the trigger, root cause, and fix better than the earlier layers did.
+
+About the Assistant (background context, NOT a rulebook)
+
+The assistant being analyzed is a WhatsApp support assistant for maids.cc. It helps customers (and sometimes their spouse or maid) with everything related to a two-year maid visa contract. It answers questions and guides users through supported processes such as: visa status updates (medical / biometrics / EID / residency / renewal), payments and billing explanations, sending official documents on request (contracts, EID, visa, receipts where applicable), contract changes (renewal, replacement, cancellation), salary / ATM topics, and travel-related policies when applicable.
+
+Expected behavior: it should sound like a real person texting - short, clear, warm, professional - with no robotic policy language and no internal jargon. It answers only what was asked, without volunteering extra details or planting ideas like cancellation or refunds. It avoids repeating itself; if the user asks again, it re-explains from a new angle rather than copy-pasting. It never claims an action was done unless it was actually executed (especially cancellation), and only promises actions it can perform immediately under the rules.
+
+Escalation to a human team: it does NOT transfer just because the user is impatient. It escalates only in specific cases such as: (1) the user repeatedly demands a human after the bot has already tried to solve the issue at least twice; (2) the user insists on a call after one retention attempt; (3) the request is a "hard-route" category for a specialized team/bot (e.g. certain PRO/travel services); or (4) policy explicitly requires escalation because the case is sensitive, ambiguous, or outside the bot's safe scope.
+
+IMPORTANT - this description is partial background only, to help you understand the bot's role and capabilities so your fixes are realistic. It is NOT the bot's full rulebook. The bot operates under many more rules, ERP/ECP steps, tools, and information fetched at runtime that are NOT shown here. Therefore:
+- Do NOT assume a behavior is correct or incorrect just because a rule for it is, or is not, listed above. Judge from the actual conversation evidence, not from whether this summary mentions it.
+- Do NOT limit your patterns, triggers, or fixes to only the processes named here. If the evidence shows an issue outside this summary, analyze it anyway.
+- Use this only as orientation for what the assistant is and what it can plausibly do.
 
 You produce a management-facing analysis used to improve customer experience (CX). The reader is a CX/operations manager. Your output must be clear enough for a manager to understand what is going wrong and decisive enough for an engineer to act on.
 
@@ -1001,7 +1014,7 @@ For each pattern provide:
 - pattern_description - one or two sentences, plain business language, describing what recurs behind this issue type.
 - trigger_source - WHO produced the trigger, taken from the speaker label of the triggering message: broadcast (a System/broadcast message), assistant (the bot), or human_agent (a human support agent). This tells management which surface and owner the fix belongs to. If a pattern's triggers genuinely come from more than one source, pick the dominant one.
 - trigger_type - the kind of trigger on our side: message | broadcast | action | missing_action.
-- trigger - the representative thing on our side that caused or triggered the issue: the chatbot message or broadcast quoted verbatim, or the action / missing action described plainly. This is the actionable core - what we did or failed to do.
+- trigger - the representative thing on our side that caused or triggered the issue: the chatbot message or broadcast quoted verbatim, or the action / missing action described plainly. This is the actionable core - what we did or failed to do. When you cite an example to justify the pattern, pick the clearest, most representative moment - not a vague or borderline one. Concisely describe what happened at that moment (1-2 sentences), and quote the specific message(s) involved - the triggering line, and the customer line it failed to act on when relevant - rather than dumping the whole conversation. A reader should understand the example from your description plus the quoted line(s) alone.
 - customer_context - the customer message or visible context the trigger failed to act on or mishandled, when relevant (e.g. the document the customer already sent, the deadline they stated, the question they asked). Use an empty string only when there is genuinely no relevant customer side.
 - where_it_happens - the journey moment(s) where this trigger most often appears (e.g. after a document upload, after a direct status question, at handoff, at the closing). If mixed or unclear, say so plainly.
 - journey_ids - the list of journey identifiers (from the input) where this pattern appears. Every id here must be a real journey from the input.
@@ -1035,7 +1048,13 @@ Match the fix to the responsible surface. Do not propose a bot/prompt change for
 
 Each pattern ends with a solution that addresses its root cause. The solution is at the pattern level - one fix for the recurring trigger, not one fix per journey. Aim it at the speaker type behind the trigger (see section 3).
 
-- recommended_solution - concrete, specific, and grounded in THIS pattern's actual trigger and root cause. Name the exact behavior to change and what it should become instead. Tie it to the real evidence you saw in this batch, not to a generic template.
+- recommended_solution - concrete, specific, and IMPLEMENTABLE. Name the exact behavior to change and what it should become instead, grounded in THIS pattern's actual trigger and root cause. Tie it to the real evidence you saw in this batch, not to a generic template.
+
+  CRITICAL - the assistant is a PROMPTED large language model (e.g. GPT, DeepSeek), NOT a fine-tuned or trainable model. Therefore:
+  - NEVER recommend "train", "retrain", "fine-tune", or "teach the bot/model" anything. There is no training step. Any fix for the assistant must be expressed as a change to its PROMPT or INSTRUCTIONS - a rule, condition, or wording the system prompt should add or change.
+  - For an Assistant (bot) trigger, write the fix as a specific instruction to add to the prompt. For example, not "make the bot better at context" but "add an instruction: before asking the customer to upload a document, check whether it was already provided earlier in the thread; if so, acknowledge it instead of re-requesting." Quote or paraphrase the concrete rule.
+  - For a Broadcast or Human Agent trigger, name the concrete operational change (a broadcast gating rule, an agent guideline/script change, a process step) - again, never training.
+  - Banned outputs: "improve responses", "make the assistant better at X", "enhance handling", "train the bot to ...", or any vague directional advice. If your sentence would still be true for almost any issue type, it is too generic - rewrite it as a specific, named change.
 
   The root_cause_category points you toward the type of fix that usually applies - use these as direction, not a script:
   - wrong_format -> formatting/output: fix structure/length, hide raw system output.
@@ -1048,6 +1067,10 @@ Each pattern ends with a solution that addresses its root cause. The solution is
   - process_or_tool_gap -> route to pipeline/backend owners, since prompt wording alone will not fix it.
 
   These are starting directions, not the answer. The strongest solution is the one tailored to the specific trigger in this batch - go beyond these examples when the real fix calls for it. Avoid empty advice like "improve the bot." If the cause is a tool/process gap rather than wording, say so explicitly so it is routed correctly.
+
+  Availability check before recommending "provide concrete data/details": A common but lazy fix is to say the bot should have given a specific date, identifier, amount, or other concrete detail. Before recommending this, verify from the input that the detail was actually AVAILABLE to give at that point - present in the data or knowable at that moment in the conversation. Distinguish two cases:
+  - The bot HAD the info (it is visible in the input / earlier in the thread) and failed to give it -> a "provide the concrete detail" fix is valid; name which detail and where it was available.
+  - The info was NOT available or not yet knowable (not in the data, not yet determined, depends on an unfinished step) -> do NOT recommend providing it. The honest fix is different (e.g. set expectations, give a named owner + timeframe, or route to the process that produces that info). Recommending the bot "provide the date/ID" when no date/ID exists is wrong - never use it as a blanket fallback for a vague-feeling response.
 
 5. Summary and Confidence
 
@@ -1080,6 +1103,11 @@ Do not propose a bot/prompt fix for a problem caused by a Broadcast or a Human A
 Do not rank, score, or judge criticality - that happens downstream.
 Do not output rates or Layer 2 verdicts; per pattern, list journey_ids and an occurrence_count equal to its length.
 Do not give one generic solution that ignores the actual root cause.
+Do not recommend training, retraining, fine-tuning, or "teaching" the assistant - it is a prompted LLM; express bot fixes as prompt/instruction changes only.
+Do not give vague directional advice ("improve responses", "make the assistant better at X") - name the specific, implementable change.
+Do not recommend the bot "provide a concrete date/identifier/detail" without first confirming that detail was actually available to give at that point.
+Do not justify a pattern with an unclear or unrepresentative example, and do not quote an entire conversation - describe the moment and quote only the specific message(s) involved.
+Do not treat the earlier judges' output as unquestionable - lean on it, but apply your own judgment when the evidence warrants.
 Do not fabricate triggers, messages, or journeys.
 Do not miss a MISSING action - when the trigger is something the bot failed to do, flag it as missing_action.
 Do not give generic fixes such as "improve support" or "be better."
@@ -1123,7 +1151,9 @@ Find the recurring pattern(s) behind this issue type. For each pattern:
 - Set trigger_source from the speaker label of the triggering message: broadcast, assistant (the bot), or human_agent. Aim the recommended_solution at that same source.
 - Describe what recurs, flag the trigger on our side (message, broadcast, action, or missing_action), quoting the trigger text from the transcript.
 - List the journey_ids it covers with an occurrence_count equal to that list's length.
-- Give the root cause and a pattern-level solution.
+- Give the root cause and a pattern-level solution that is concrete and implementable. The assistant is a prompted LLM - express bot fixes as prompt/instruction changes, never as training. Do not recommend providing a concrete date/detail unless it was actually available to give.
+
+Lean on the earlier judges' evidence but apply your own judgment - they are not always right. When citing an example, describe the moment briefly and quote only the specific message(s), not the whole conversation.
 
 Return strict JSON only using the required schema.
 
@@ -1150,6 +1180,81 @@ DEFAULT_ISSUE_ANALYSIS_PROMPT = PromptTemplate(
     system_prompt=DEFAULT_ISSUE_ANALYSIS_SYSTEM_PROMPT,
     output_schema=DEFAULT_ISSUE_ANALYSIS_OUTPUT_SCHEMA,
     user_prompt_template=DEFAULT_ISSUE_ANALYSIS_USER_TEMPLATE,
+)
+
+
+# --------- Variant B (reduced-input A/B experiment) ---------
+# Variant B is the SAME analyst with the SAME output schema and the same quality
+# rules (no-retraining, availability check, About the Assistant, etc.). The only
+# difference is the INPUT: instead of the full transcript + full L1/L2 evidence,
+# B receives only the issue type, each journey's handled status + experience, and
+# the messages Judge 1 flagged as bad/frustrated (each with up to 2 preceding
+# messages for context). We build B's system prompt by replacing A's Evidence
+# Rule section with one that describes this reduced input.
+
+_A_EVIDENCE_BLOCK = """1. Evidence Rule
+
+Use only what is present in the input for this batch. Each journey contains three sources of evidence — use all three together:
+
+- transcript: the raw conversation messages. This is your primary text source for quoting the trigger verbatim. Each message carries a speaker label telling you exactly who sent it - you do NOT have to infer this:
+  - Broadcast - an automated system/broadcast message (mass-sent, not written for this specific customer).
+  - Assistant - the AI/bot replying in the conversation.
+  - Human Agent (Name) - a human support agent; the name is shown for traceability only.
+  - Customer - the end customer.
+- message_evaluations: Judge 1's per-message verdicts. Each entry covers one agent message and includes: message_index (links back to the transcript), message_level_effect (helped / neutral / minor_issue / major_issue / recovered_issue), frustration_change (increased / created / unchanged / decreased), context_handling (good / partial / poor / not_applicable), issue_type and issue_origin flagged at that message, evidence (Judge 1's key observation), and recommended_fix (Judge 1's suggested fix at that message). Use these to identify which exact message is the trigger and why it caused the issue.
+- layer2_evidence: Judge 2's conversation-level summary including handled_status, customer_experience, final sentiment, frustration level, and issue_summary. Use this to understand the overall journey outcome.
+
+Build patterns and triggers using all three sources. Quote the trigger verbatim from the transcript when it is a real message or broadcast. When the trigger is an action or a missing action, describe it plainly. Root cause and pattern descriptions must be grounded in what is actually visible, not assumed. Do not fabricate messages, journeys, or triggers not present in the input."""
+
+_B_EVIDENCE_BLOCK = """1. Evidence Rule (REDUCED INPUT - read carefully)
+
+You receive a FOCUSED, reduced view of each journey - NOT the full conversation. For each journey the input contains:
+
+- handled_status and customer_experience: Judge 2's journey-level outcome (handled / unhandled, and good / bad experience). Use this to understand how the journey ended.
+- flagged_moments: only the messages Judge 1 flagged as bad - meaning the message had a major negative effect (message_level_effect = major_issue) or it increased/created customer frustration. Each flagged moment includes up to 2 preceding messages for context, so you see the lead-up from both the customer and our side. Each message carries a speaker label so you know who sent it:
+  - Broadcast - an automated system/broadcast message.
+  - Assistant - the AI/bot.
+  - Human Agent (Name) - a human support agent (name for traceability only).
+  - Customer - the end customer.
+
+You do NOT have the full transcript or the full L1/L2 evidence in this variant - only these flagged bad moments plus their short context. This is intentional: work from the flagged moments. Quote the trigger verbatim from the flagged messages. Treat the flag as a strong signal but still apply your own judgment on what the real trigger and root cause are. Do not fabricate messages, journeys, or moments that are not in the input, and do not assume anything about parts of the conversation you were not shown."""
+
+DEFAULT_ISSUE_ANALYSIS_B_SYSTEM_PROMPT = DEFAULT_ISSUE_ANALYSIS_SYSTEM_PROMPT.replace(
+    _A_EVIDENCE_BLOCK, _B_EVIDENCE_BLOCK
+)
+
+DEFAULT_ISSUE_ANALYSIS_B_USER_TEMPLATE = """You are the third judge in a three-judge pipeline. In THIS variant you receive a reduced input: only each journey's handled_status + customer_experience, and the messages Judge 1 flagged as bad/frustrated (each with up to 2 preceding messages for context). You do NOT have the full conversation. You do not re-evaluate — you synthesize from these flagged moments.
+
+You are analyzing ONE known issue type for this batch. The issue_type is given below and every journey in the batch was marked by Judge 2 as carrying that issue type.
+
+Find the recurring pattern(s) behind this issue type. For each pattern:
+- Use the flagged_moments to identify the trigger - the specific message on our side that caused the bad moment.
+- Set trigger_source from the speaker label of the triggering message: broadcast, assistant (the bot), or human_agent. Aim the recommended_solution at that same source.
+- Describe what recurs, flag the trigger (message, broadcast, action, or missing_action), quoting the trigger text from the flagged moment.
+- List the journey_ids it covers with an occurrence_count equal to that list's length.
+- Give the root cause and a pattern-level solution that is concrete and implementable. The assistant is a prompted LLM - express bot fixes as prompt/instruction changes, never as training. Do not recommend providing a concrete date/detail unless it was actually available to give.
+
+Lean on the flags but apply your own judgment - they are not always right. When citing an example, describe the moment briefly and quote only the specific message(s).
+
+Return strict JSON only using the required schema.
+
+Input:
+{payload_json}
+"""
+
+DEFAULT_ISSUE_ANALYSIS_B_SYSTEM_PROMPT = _load_external_prompt_default(
+    "issue analysis b prompt",
+    DEFAULT_ISSUE_ANALYSIS_B_SYSTEM_PROMPT,
+)
+DEFAULT_ISSUE_ANALYSIS_B_USER_TEMPLATE = _load_external_prompt_default(
+    "issue analysis b user input",
+    DEFAULT_ISSUE_ANALYSIS_B_USER_TEMPLATE,
+)
+
+DEFAULT_ISSUE_ANALYSIS_B_PROMPT = PromptTemplate(
+    system_prompt=DEFAULT_ISSUE_ANALYSIS_B_SYSTEM_PROMPT,
+    output_schema=DEFAULT_ISSUE_ANALYSIS_OUTPUT_SCHEMA,  # same output schema as A
+    user_prompt_template=DEFAULT_ISSUE_ANALYSIS_B_USER_TEMPLATE,
 )
 
 
@@ -1406,6 +1511,118 @@ def build_issue_analysis_payload(
                 "layer2_issue_evidence": trim(j.get("layer2_issue_evidence", "")),
                 "transcript": transcript_clean,
                 "message_evaluations": message_evals_clean,
+            }
+        )
+
+    return {
+        "issue_type": issue_type,
+        "journey_count": len(journeys_clean),
+        "journeys": journeys_clean,
+    }
+
+
+# Fields used to decide whether a Layer 1 message is "flagged bad" for Variant B.
+_B_BAD_EFFECTS = {"major_issue"}
+_B_BAD_FRUSTRATION_CHANGES = {"increased", "created"}
+_B_CONTEXT_MESSAGES_ABOVE = 2
+
+
+def _b_message_is_flagged(eval_entry: dict) -> bool:
+    """A message is 'bad/frustrated' if it had a major negative effect or it
+    increased/created customer frustration (per Judge 1)."""
+    if not isinstance(eval_entry, dict):
+        return False
+    effect = str(eval_entry.get("message_level_effect", "") or "").strip().lower()
+    fchange = str(eval_entry.get("frustration_change", "") or "").strip().lower()
+    return effect in _B_BAD_EFFECTS or fchange in _B_BAD_FRUSTRATION_CHANGES
+
+
+def build_issue_analysis_b_payload(
+    issue_type: str,
+    journeys: list[dict],
+    truncate_chars: int | None = None,
+) -> dict:
+    """Build the REDUCED Variant-B payload for a Layer 3 call.
+
+    For each journey, send only:
+      - handled_status + customer_experience (from Layer 2 evidence)
+      - flagged_moments: each Layer 1-flagged bad message, with up to
+        ``_B_CONTEXT_MESSAGES_ABOVE`` preceding transcript messages for context.
+    No full transcript and no full L1/L2 evidence.
+    """
+
+    def trim(text: Any) -> str:
+        if text is None:
+            return ""
+        text = str(text)
+        if truncate_chars and len(text) > truncate_chars:
+            return text[:truncate_chars] + "...[truncated]"
+        return text
+
+    journeys_clean = []
+    for j in journeys:
+        transcript = j.get("transcript") or []
+        # Index transcript messages by message_index for context lookup.
+        by_index: dict[Any, dict] = {}
+        ordered_indices: list[Any] = []
+        for m in transcript:
+            if not isinstance(m, dict):
+                continue
+            mi = m.get("message_index")
+            by_index[mi] = m
+            ordered_indices.append(mi)
+
+        def clean_msg(m: dict) -> dict:
+            return {
+                "message_index": m.get("message_index"),
+                "speaker": m.get("speaker", m.get("sender_role", "")),
+                "message_text": trim(m.get("message_text", "")),
+            }
+
+        flagged_moments = []
+        for ev in (j.get("message_evaluations") or []):
+            if not _b_message_is_flagged(ev):
+                continue
+            mi = ev.get("message_index")
+            flagged_msg = by_index.get(mi)
+            if flagged_msg is None:
+                continue
+            # Gather up to N preceding transcript messages for context.
+            try:
+                pos = ordered_indices.index(mi)
+            except ValueError:
+                pos = None
+            context = []
+            if pos is not None:
+                start = max(0, pos - _B_CONTEXT_MESSAGES_ABOVE)
+                for k in range(start, pos + 1):
+                    ctx_msg = by_index.get(ordered_indices[k])
+                    if ctx_msg is not None:
+                        context.append(clean_msg(ctx_msg))
+            else:
+                context = [clean_msg(flagged_msg)]
+            effect = str(ev.get("message_level_effect", "") or "").strip().lower()
+            fchange = str(ev.get("frustration_change", "") or "").strip().lower()
+            reasons = []
+            if effect in _B_BAD_EFFECTS:
+                reasons.append(effect)
+            if fchange in _B_BAD_FRUSTRATION_CHANGES:
+                reasons.append(f"frustration_{fchange}")
+            flagged_moments.append(
+                {
+                    "message_index": mi,
+                    "flag_reason": ", ".join(reasons) or "flagged",
+                    "context": context,
+                }
+            )
+
+        l2 = j.get("layer2_evidence") or {}
+        journeys_clean.append(
+            {
+                "conversation_id": j.get("conversation_id", ""),
+                "handled_status": l2.get("handled_status", ""),
+                "customer_experience": l2.get("customer_experience", ""),
+                "flagged_moments": flagged_moments,
             }
         )
 

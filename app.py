@@ -32,18 +32,20 @@ from data_loader import (
     summarize_dataframe,
     validate_csv,
 )
-from db import DEFAULT_DB_PATH, Database
+from db import DEFAULT_DB_PATH, DEFAULT_ISSUE_DB_PATH, Database, IssueAnalysisDB
 from evaluator import (
     RunConfig,
     RunResults,
     run_evaluation,
     run_issue_analysis,
     group_journeys_by_issue_type,
+    build_issue_analysis_batches,
     validate_conversation_level_result,
 )
 from prompts import (
     DEFAULT_CONVERSATION_LEVEL_PROMPT,
     DEFAULT_ISSUE_ANALYSIS_PROMPT,
+    DEFAULT_ISSUE_ANALYSIS_B_PROMPT,
     DEFAULT_MESSAGE_LEVEL_PROMPT,
     PromptTemplate,
 )
@@ -126,7 +128,8 @@ def _init_state() -> None:
         "selected_conversation_ids": None,
         "selection_import_feedback": None,
         "run_results": None,
-        "issue_analysis_results": None,
+        "issue_results_A": None,
+        "issue_results_B": None,
         "issue_analysis_in_progress": False,
         "run_in_progress": False,
         "progress_log": [],
@@ -157,6 +160,12 @@ _init_state()
 def get_db(path: str = str(DEFAULT_DB_PATH)) -> Database:
     """Return a process-wide :class:`Database` instance (cached by Streamlit)."""
     return Database(path)
+
+
+@st.cache_resource(show_spinner=False)
+def get_issue_db(path: str = str(DEFAULT_ISSUE_DB_PATH)) -> IssueAnalysisDB:
+    """Return the dedicated Layer 3 (issue analysis) DB, cached by Streamlit."""
+    return IssueAnalysisDB(path)
 
 
 def _resolve_db_path(path: str | Path) -> Path:
@@ -276,6 +285,12 @@ def _refresh_default_prompts(db: Database) -> None:
             "issue analysis prompt",
             "issue analysis output scheme",
             "issue analysis user input",
+        ),
+        # Variant B shares Variant A's output schema file.
+        "issue_analysis_b": (
+            "issue analysis b prompt",
+            "issue analysis output scheme",
+            "issue analysis b user input",
         ),
     }
     now = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
@@ -460,6 +475,73 @@ def _has_results() -> bool:
     return st.session_state.run_results is not None and bool(
         getattr(st.session_state.run_results, "conversation_results", [])
     )
+
+
+def _load_run_into_session(db: Database, sel_id: int, label: str, selected_run: dict | None = None) -> None:
+    """Load a saved run from the DB into session state. Shared by the Run tab
+    and the in-place loaders on result tabs. Raises on failure."""
+    loaded = db.load_run_results(sel_id)
+    n_conv = int((selected_run or {}).get("n_conversations") or 0)
+    if not loaded["conversation_results"] and n_conv > 0:
+        raise ValueError(
+            "This run has summary metadata but no saved result rows. "
+            "It cannot be reconstructed from the database."
+        )
+    rr = RunResults(
+        conversation_results=loaded["conversation_results"],
+        message_level_results=loaded["message_level_results"],
+        errors=loaded["errors"],
+        started_at=loaded["started_at"],
+        finished_at=loaded["finished_at"],
+    )
+    rr = _normalize_run_results_for_display(rr)
+    st.session_state.run_results = rr
+    # Layer 3 results live in the dedicated issue DB; load per variant.
+    try:
+        _idb = get_issue_db()
+        st.session_state.issue_results_A = _idb.load_results(sel_id, variant="A") or []
+        st.session_state.issue_results_B = _idb.load_results(sel_id, variant="B") or []
+    except Exception:
+        st.session_state.issue_results_A = None
+        st.session_state.issue_results_B = None
+    st.session_state.current_run_id = sel_id
+    st.session_state.loaded_run_label = label
+
+
+def _render_inline_run_loader(context_key: str) -> bool:
+    """Render a compact 'load a saved run' picker for result tabs when no run is
+    in session. Returns True if a run is now loaded. Lets the user start from the
+    DB without re-uploading a CSV."""
+    db = get_db()
+    try:
+        runs = db.list_runs()
+    except Exception:
+        runs = []
+    # Keep only runs that actually have saved result rows (loadable).
+    loadable = [r for r in runs if int(r.get("saved_conversations") or 0) > 0]
+    if not loadable:
+        st.info("No saved runs with results in the selected database. Upload a CSV and run an evaluation first.")
+        return False
+
+    def _fmt(r: dict) -> str:
+        name = (r.get("name") or "").strip()
+        rid = r.get("id")
+        nc = int(r.get("saved_conversations") or 0)
+        return f"#{rid}" + (f" — {name}" if name else "") + f" ({nc} journeys)"
+
+    st.markdown("##### Load a saved run from the database")
+    st.caption("You don't need to re-upload a CSV — pick a run that's already in the selected database.")
+    options = {_fmt(r): r for r in loadable}
+    pick = st.selectbox("Saved run", list(options.keys()), key=f"inline_run_pick_{context_key}")
+    chosen = options.get(pick)
+    if st.button("Load this run", type="primary", key=f"inline_run_load_{context_key}"):
+        try:
+            _load_run_into_session(db, int(chosen["id"]), pick, chosen)
+            st.success(f"Loaded run #{chosen['id']}.")
+            st.rerun()
+        except Exception as e:
+            st.error(f"Could not load run: {e}")
+    return False
 
 
 def _normalize_conversation_result_for_display(cr: dict) -> dict:
@@ -1699,15 +1781,22 @@ def tab_prompts() -> None:
         "one used on the next run."
     )
 
-    sub_ml, sub_cl, sub_ia = st.tabs(
-        ["Message-Level Prompt", "Conversation-Level Prompt", "Issue-Analysis Prompt"]
+    sub_ml, sub_cl, sub_ia, sub_iab = st.tabs(
+        [
+            "Message-Level Prompt",
+            "Conversation-Level Prompt",
+            "Issue-Analysis Prompt (A)",
+            "Issue-Analysis Prompt (B)",
+        ]
     )
     with sub_ml:
         _render_prompt_editor("message_level", "Message-Level Prompt")
     with sub_cl:
         _render_prompt_editor("conversation_level", "Conversation-Level Prompt")
     with sub_ia:
-        _render_prompt_editor("issue_analysis", "Issue-Analysis Prompt (Layer 3)")
+        _render_prompt_editor("issue_analysis", "Issue-Analysis Prompt — Variant A (Layer 3, full input)")
+    with sub_iab:
+        _render_prompt_editor("issue_analysis_b", "Issue-Analysis Prompt — Variant B (Layer 3, reduced input)")
 
 
 # --------- Tab: Run Evaluation ---------
@@ -1796,29 +1885,7 @@ def tab_run() -> None:
                     st.caption("This run has no saved result rows, so it cannot be loaded.")
                 if st.button("Load this run", use_container_width=True, disabled=is_incomplete_run):
                     try:
-                        loaded = db.load_run_results(sel_id)
-                        if (
-                            not loaded["conversation_results"]
-                            and int(selected_run.get("n_conversations") or 0) > 0
-                        ):
-                            raise ValueError(
-                                "This run has summary metadata but no saved result rows. "
-                                "It cannot be reconstructed from the database."
-                            )
-                        rr = RunResults(
-                            conversation_results=loaded["conversation_results"],
-                            message_level_results=loaded["message_level_results"],
-                            errors=loaded["errors"],
-                            started_at=loaded["started_at"],
-                            finished_at=loaded["finished_at"],
-                        )
-                        rr = _normalize_run_results_for_display(rr)
-                        st.session_state.run_results = rr
-                        st.session_state.issue_analysis_results = (
-                            loaded.get("issue_analysis_results") or None
-                        )
-                        st.session_state.current_run_id = sel_id
-                        st.session_state.loaded_run_label = sel
+                        _load_run_into_session(db, sel_id, sel, selected_run)
                         st.success(f"Loaded run #{sel_id}.")
                     except Exception as e:
                         st.error(f"Could not load run: {e}")
@@ -1834,10 +1901,15 @@ def tab_run() -> None:
                 if st.button("Delete this run", use_container_width=True, type="secondary"):
                     try:
                         db.delete_run(sel_id)
+                        try:
+                            get_issue_db().clear_results(sel_id)
+                        except Exception:
+                            pass
                         if st.session_state.current_run_id == sel_id:
                             st.session_state.current_run_id = None
                             st.session_state.run_results = None
-                            st.session_state.issue_analysis_results = None
+                            st.session_state.issue_results_A = None
+                            st.session_state.issue_results_B = None
                         st.success(f"Deleted run #{sel_id}.")
                     except Exception as e:
                         st.error(f"Could not delete run: {e}")
@@ -2365,10 +2437,11 @@ def tab_run() -> None:
             )
             st.session_state.run_results = results
             # A fresh Layer 2 run invalidates any previously computed Layer 3.
-            st.session_state.issue_analysis_results = None
+            st.session_state.issue_results_A = None
+            st.session_state.issue_results_B = None
             if st.session_state.current_run_id is not None:
                 try:
-                    db.clear_issue_analysis_results(st.session_state.current_run_id)
+                    get_issue_db().clear_results(st.session_state.current_run_id)
                 except Exception:
                     pass
             persist_completed_results()
@@ -3711,7 +3784,7 @@ def tab_review() -> None:
 
 
 def _has_issue_results() -> bool:
-    return bool(st.session_state.get("issue_analysis_results"))
+    return bool(st.session_state.get("issue_results_A") or st.session_state.get("issue_results_B"))
 
 
 def _root_cause_badge_html(root_cause: str) -> str:
@@ -3738,183 +3811,8 @@ def _trigger_source_badge_html(trigger_source: str) -> str:
     )
 
 
-def tab_issue_analysis() -> None:
-    st.subheader("Issue Analysis — Layer 3 (Issue Analyst)")
-    st.caption(
-        "Groups the evaluated journeys by the issue type Layer 2 assigned, then runs "
-        "one AI pass per issue type to flag the trigger in each journey, find the recurring "
-        "pattern and root cause, and recommend a pattern-level fix."
-    )
-
-    if not _has_results():
-        st.info(
-            "Run (or load) an evaluation first. Layer 3 reads the conversation-level results "
-            "of the current run."
-        )
-        return
-
-    rr = st.session_state.run_results
-    batches = group_journeys_by_issue_type(rr.conversation_results)
-    issue_types = sorted(batches.keys())
-
-    if not issue_types:
-        st.warning(
-            "No journeys in the current run carry an issue type from Layer 2 "
-            "(all `main_issue.issue_type` are `none`). There is nothing for Layer 3 to analyze."
-        )
-        return
-
-    st.markdown("### Batches to analyze")
-    st.caption("One AI call per issue type. Each journey is sent in exactly one batch.")
-    overview_df = pd.DataFrame(
-        [
-            {"Issue type": humanize_label(it), "Journeys in batch": len(batches[it])}
-            for it in issue_types
-        ]
-    )
-    _render_display_table(overview_df, empty_message="No batches.")
-
-    # --- Filter: choose which issue types to send to Layer 3 ---
-    st.markdown("#### Issue types to analyze")
-    select_key = "issue_analysis_selected_types"
-    # Keep any previously chosen types that still exist; default to nothing selected.
-    prior = [it for it in (st.session_state.get(select_key) or []) if it in issue_types]
-    btn_clear, _ = st.columns([1, 5])
-    with btn_clear:
-        if st.button("Clear", use_container_width=True, key="ia_clear"):
-            st.session_state[select_key] = []
-            st.rerun()
-    selected_types = st.multiselect(
-        "Send these issue types (each is one AI call)",
-        options=issue_types,
-        default=prior,
-        format_func=lambda it: f"{humanize_label(it)} ({len(batches[it])} journeys)",
-        key=select_key,
-        label_visibility="collapsed",
-    )
-
-    db = get_db()
-    run_id = st.session_state.current_run_id
-
-    col_run, col_info = st.columns([1, 2])
-    with col_run:
-        run_clicked = st.button(
-            "Run Issue Analysis",
-            type="primary",
-            use_container_width=True,
-            disabled=(
-                bool(st.session_state.get("issue_analysis_in_progress"))
-                or not selected_types
-            ),
-        )
-    with col_info:
-        if selected_types:
-            st.caption(
-                f"{len(selected_types)} of {len(issue_types)} issue type(s) selected • "
-                f"{sum(len(batches[it]) for it in selected_types)} journeys will be sent. "
-                "Uses the active Issue-Analysis prompt and the API settings in the sidebar."
-            )
-        else:
-            st.caption("Select at least one issue type to run.")
-
-    if run_clicked:
-        if not st.session_state.selected_model:
-            st.error("Select a model in the sidebar first.")
-        else:
-            api = _build_api_config()
-            try:
-                client = build_client(api.base_url, api.api_key)
-            except Exception as e:
-                st.error(f"Could not build API client: {e}")
-                client = None
-            if client is not None:
-                prompt_row = db.get_active_prompt("issue_analysis")
-                prompt_tpl = (
-                    PromptTemplate(
-                        system_prompt=prompt_row["system_prompt"],
-                        output_schema=prompt_row["output_schema"],
-                        user_prompt_template=prompt_row["user_prompt_template"],
-                    )
-                    if prompt_row
-                    else DEFAULT_ISSUE_ANALYSIS_PROMPT
-                )
-                prompt_id = prompt_row["id"] if prompt_row else None
-                truncate_chars = (
-                    int(st.session_state.max_chars_per_message)
-                    if st.session_state.truncate_messages
-                    else None
-                )
-
-                progress = st.progress(0.0)
-                status = st.empty()
-                done_count = {"n": 0}
-                total = len(selected_types)
-
-                def on_progress(ev: dict) -> None:
-                    if ev.get("phase") == "issue_type_done":
-                        done_count["n"] += 1
-                        progress.progress(min(1.0, done_count["n"] / max(total, 1)))
-                        status.info(
-                            f"Analyzed {done_count['n']}/{total}: "
-                            f"{humanize_label(ev.get('issue_type', ''))} ({ev.get('status')})"
-                        )
-
-                def on_issue_result(ir: dict) -> None:
-                    if run_id is not None:
-                        try:
-                            ir["prompt_id"] = prompt_id
-                            db.save_issue_analysis_result(run_id, ir)
-                        except Exception:
-                            pass
-
-                # Re-running a type replaces its prior result; types not selected
-                # this time keep whatever was stored before.
-                if run_id is not None:
-                    try:
-                        for it in selected_types:
-                            db.delete_issue_analysis_result(run_id, it)
-                    except Exception:
-                        pass
-
-                st.session_state.issue_analysis_in_progress = True
-                try:
-                    with st.spinner("Running Layer 3 issue analysis..."):
-                        results = run_issue_analysis(
-                            conversation_results=rr.conversation_results,
-                            client=client,
-                            api=api,
-                            prompt=prompt_tpl,
-                            issue_types=selected_types,
-                            save_raw=bool(st.session_state.save_raw_responses),
-                            truncate_chars=truncate_chars,
-                            on_progress=on_progress,
-                            on_issue_result=on_issue_result,
-                        )
-                    # Merge: keep prior results for types we did NOT just run,
-                    # replace the ones we did.
-                    just_run = {r.get("issue_type") for r in results}
-                    prior_results = [
-                        r
-                        for r in (st.session_state.issue_analysis_results or [])
-                        if r.get("issue_type") not in just_run
-                    ]
-                    st.session_state.issue_analysis_results = prior_results + results
-                    progress.progress(1.0)
-                    ok = sum(1 for r in results if r.get("parse_status") == "ok")
-                    status.success(f"Done. {ok}/{len(results)} issue types analyzed successfully.")
-                except Exception as e:
-                    status.error(f"Issue analysis failed: {e}")
-                finally:
-                    st.session_state.issue_analysis_in_progress = False
-
-    if not _has_issue_results():
-        return
-
-    st.markdown("---")
-    st.markdown("### Results")
-
-    results = st.session_state.issue_analysis_results or []
-
+def _render_issue_results(results: list[dict]) -> None:
+    """Render a list of Layer 3 result records (shared by Variant A and B)."""
     def _max_occurrences(ir: dict) -> int:
         parsed = ir.get("parsed_json") or {}
         return max(
@@ -3922,22 +3820,20 @@ def tab_issue_analysis() -> None:
             default=0,
         )
 
-    # Show the issue types with the highest-occurrence patterns first.
     for ir in sorted(results, key=_max_occurrences, reverse=True):
         issue_type = ir.get("issue_type", "")
+        jid = ir.get("journey_id")
         parsed = ir.get("parsed_json") or {}
         patterns = parsed.get("patterns") or []
         status_label = ir.get("parse_status", "")
-        header = (
-            f"**{humanize_label(issue_type)}** — {ir.get('journey_count', 0)} journeys"
-            f" • {len(patterns)} pattern(s)"
-        )
+        label = f"Journey {jid}" if jid else humanize_label(issue_type)
+        header = f"**{label}** — {ir.get('journey_count', 0)} journeys • {len(patterns)} pattern(s)"
         if status_label != "ok":
             header += f" • ⚠️ {status_label}"
 
         with st.expander(header, expanded=True):
             if status_label != "ok":
-                st.error(ir.get("error_message") or "This issue type failed to analyze.")
+                st.error(ir.get("error_message") or "This batch failed to analyze.")
                 if ir.get("raw_model_response"):
                     with st.expander("Raw model response"):
                         st.code(ir.get("raw_model_response"))
@@ -3950,7 +3846,6 @@ def tab_issue_analysis() -> None:
             st.markdown("#### Recurring patterns")
             if not patterns:
                 st.caption("No patterns returned.")
-            # Highest-occurrence patterns first within an issue type.
             for pat in sorted(patterns, key=lambda p: int(p.get("occurrence_count") or 0), reverse=True):
                 badge = _root_cause_badge_html(pat.get("root_cause_category", ""))
                 occ_count = int(pat.get("occurrence_count") or 0)
@@ -3978,6 +3873,283 @@ def tab_issue_analysis() -> None:
                         f"Journeys ({len(journey_ids)}): {', '.join(str(x) for x in journey_ids)}"
                     )
                 st.markdown("")
+
+
+def _render_issue_variant(variant: str) -> None:
+    """Render the controls + run + results for one A/B variant."""
+    rr = st.session_state.run_results
+    batches = group_journeys_by_issue_type(rr.conversation_results)
+    issue_types = sorted(batches.keys())
+    if not issue_types:
+        st.warning(
+            "No journeys in the current run carry an issue type from Layer 2. "
+            "There is nothing for Layer 3 to analyze."
+        )
+        return
+
+    v = variant.upper()
+    prompt_kind = "issue_analysis" if v == "A" else "issue_analysis_b"
+    default_prompt = DEFAULT_ISSUE_ANALYSIS_PROMPT if v == "A" else DEFAULT_ISSUE_ANALYSIS_B_PROMPT
+    results_key = f"issue_results_{v}"
+    progress_key = "issue_analysis_in_progress"
+
+    db = get_db()
+    idb = get_issue_db()
+    run_id = st.session_state.current_run_id
+
+    # Load persisted results for this variant once per run, if not in session yet.
+    if st.session_state.get(results_key) is None and run_id is not None:
+        try:
+            st.session_state[results_key] = idb.load_results(run_id, variant=v) or []
+        except Exception:
+            st.session_state[results_key] = []
+
+    if v == "B":
+        st.caption(
+            "Variant B sends a REDUCED input: only each journey's handled status + experience "
+            "and the message-level-flagged bad moments (with up to 2 messages of context). "
+            "Same output schema as A."
+        )
+    else:
+        st.caption(
+            "Variant A sends the FULL input: transcript + message-level (L1) + conversation-level (L2) evidence."
+        )
+
+    # --- Run scope ---
+    scope_label = st.radio(
+        "Run scope",
+        ["Per issue type", "All journeys", "One journey"],
+        horizontal=True,
+        key=f"ia_scope_{v}",
+    )
+    scope = {"Per issue type": "per_issue", "All journeys": "all_journeys", "One journey": "single_journey"}[scope_label]
+
+    selected_types: list[str] = []
+    grouping = "grouped"
+    journey_id = None
+
+    if scope == "per_issue":
+        prior = [it for it in (st.session_state.get(f"ia_types_{v}") or []) if it in issue_types]
+        selected_types = st.multiselect(
+            "Issue types to analyze (each is one AI call)",
+            options=issue_types,
+            default=prior,
+            format_func=lambda it: f"{humanize_label(it)} ({len(batches[it])} journeys)",
+            key=f"ia_types_{v}",
+        )
+    elif scope == "all_journeys":
+        grp = st.radio(
+            "Grouping",
+            ["Group by issue type", "Ungrouped (one call)"],
+            horizontal=True,
+            key=f"ia_group_{v}",
+        )
+        grouping = "grouped" if grp.startswith("Group") else "ungrouped"
+    else:  # single_journey
+        all_ids = sorted(
+            {str(j.get("conversation_id", "")) for js in batches.values() for j in js if j.get("conversation_id")}
+        )
+        journey_id = st.selectbox("Journey to analyze", options=all_ids, key=f"ia_journey_{v}") if all_ids else None
+
+    # Determine if a run is possible
+    can_run = (
+        (scope == "per_issue" and bool(selected_types))
+        or scope == "all_journeys"
+        or (scope == "single_journey" and bool(journey_id))
+    )
+
+    run_clicked = st.button(
+        f"Run Issue Analysis (Variant {v})",
+        type="primary",
+        use_container_width=True,
+        key=f"ia_run_{v}",
+        disabled=bool(st.session_state.get(progress_key)) or not can_run,
+    )
+    if not can_run:
+        st.caption("Select what to run above.")
+
+    if run_clicked:
+        if not st.session_state.selected_model:
+            st.error("Select a model in the sidebar first.")
+        else:
+            api = _build_api_config()
+            try:
+                client = build_client(api.base_url, api.api_key)
+            except Exception as e:
+                st.error(f"Could not build API client: {e}")
+                client = None
+            if client is not None:
+                prompt_row = db.get_active_prompt(prompt_kind)
+                prompt_tpl = (
+                    PromptTemplate(
+                        system_prompt=prompt_row["system_prompt"],
+                        output_schema=prompt_row["output_schema"],
+                        user_prompt_template=prompt_row["user_prompt_template"],
+                    )
+                    if prompt_row
+                    else default_prompt
+                )
+                prompt_id = prompt_row["id"] if prompt_row else None
+                truncate_chars = (
+                    int(st.session_state.max_chars_per_message)
+                    if st.session_state.truncate_messages
+                    else None
+                )
+
+                # Preview the batches so we know the total for progress.
+                planned = build_issue_analysis_batches(
+                    rr.conversation_results,
+                    scope=scope,
+                    grouping=grouping,
+                    issue_types=selected_types or None,
+                    journey_id=journey_id,
+                )
+                total = max(len(planned), 1)
+                # Per-batch journey counts (advance both bars as each batch finishes).
+                journeys_per_label = {b["label"]: len(b["journeys"]) for b in planned}
+                # Bottom bar denominator: journeys in THIS run's selection.
+                selected_journeys = max(sum(journeys_per_label.values()), 1)
+                # Top bar denominator: ALL analyzable journeys in the whole run.
+                run_total_journeys = max(sum(len(js) for js in batches.values()), 1)
+
+                progress = st.progress(
+                    0.0, text=f"Run coverage: 0/{run_total_journeys} journeys • 0.0%"
+                )
+                journey_progress = st.progress(
+                    0.0, text=f"This run: 0/{selected_journeys} journeys • 0.0%"
+                )
+                status = st.empty()
+                done_count = {"n": 0}
+                journeys_done = {"n": 0}
+
+                def on_progress(ev: dict) -> None:
+                    if ev.get("phase") == "issue_type_done":
+                        done_count["n"] += 1
+                        label = ev.get("issue_type", "")
+                        journeys_done["n"] += journeys_per_label.get(label, 0)
+                        # Top bar: coverage of the whole run.
+                        rfrac = min(1.0, journeys_done["n"] / run_total_journeys)
+                        rpct = rfrac * 100
+                        progress.progress(
+                            rfrac,
+                            text=f"Run coverage: {journeys_done['n']}/{run_total_journeys} journeys • {rpct:.1f}%",
+                        )
+                        # Bottom bar: progress within this run's selection.
+                        jfrac = min(1.0, journeys_done["n"] / selected_journeys)
+                        jpct = jfrac * 100
+                        journey_progress.progress(
+                            jfrac,
+                            text=f"This run: {journeys_done['n']}/{selected_journeys} journeys • {jpct:.1f}%",
+                        )
+                        status.info(
+                            f"Analyzed batch {done_count['n']} of {total}: {label} ({ev.get('status')})"
+                        )
+
+                def on_issue_result(ir: dict) -> None:
+                    if run_id is not None:
+                        try:
+                            ir["prompt_id"] = prompt_id
+                            idb.save_result(run_id, ir, variant=v, run_scope=scope, grouping=grouping)
+                        except Exception:
+                            pass
+
+                # Replace prior rows that this run will regenerate (per variant).
+                if run_id is not None:
+                    try:
+                        if scope == "single_journey" and journey_id:
+                            idb.delete_journey_result(run_id, v, str(journey_id))
+                        elif scope == "per_issue":
+                            for it in selected_types:
+                                idb.delete_result(run_id, v, it)
+                        else:  # all_journeys -> clear all of this variant for the run
+                            idb.clear_results(run_id, variant=v)
+                    except Exception:
+                        pass
+
+                st.session_state[progress_key] = True
+                try:
+                    with st.spinner(f"Running Layer 3 (Variant {v})..."):
+                        results = run_issue_analysis(
+                            conversation_results=rr.conversation_results,
+                            client=client,
+                            api=api,
+                            prompt=prompt_tpl,
+                            variant=v,
+                            scope=scope,
+                            grouping=grouping,
+                            journey_id=journey_id,
+                            issue_types=selected_types or None,
+                            save_raw=bool(st.session_state.save_raw_responses),
+                            truncate_chars=truncate_chars,
+                            on_progress=on_progress,
+                            on_issue_result=on_issue_result,
+                        )
+                    # Merge with prior session results: replace by (issue_type, journey_id) key.
+                    just_run = {(r.get("issue_type"), r.get("journey_id")) for r in results}
+                    prior_results = [
+                        r for r in (st.session_state.get(results_key) or [])
+                        if (r.get("issue_type"), r.get("journey_id")) not in just_run
+                    ]
+                    st.session_state[results_key] = prior_results + results
+                    progress.progress(
+                        min(1.0, journeys_done["n"] / run_total_journeys),
+                        text=f"Run coverage: {journeys_done['n']}/{run_total_journeys} journeys • "
+                        f"{min(100.0, journeys_done['n'] / run_total_journeys * 100):.1f}%",
+                    )
+                    journey_progress.progress(
+                        1.0, text=f"This run: {selected_journeys}/{selected_journeys} journeys • 100.0%"
+                    )
+                    ok = sum(1 for r in results if r.get("parse_status") == "ok")
+                    status.success(f"Done. {ok}/{len(results)} batch(es) analyzed successfully.")
+                except Exception as e:
+                    status.error(f"Issue analysis failed: {e}")
+                finally:
+                    st.session_state[progress_key] = False
+
+    results = st.session_state.get(results_key) or []
+    if not results:
+        return
+
+    st.markdown("---")
+    st.markdown(f"### Results (Variant {v})")
+    with st.expander("⚙️ Manage results", expanded=False):
+        if st.button(
+            f"🗑️ Delete all Variant {v} results",
+            use_container_width=True,
+            key=f"ia_delete_{v}",
+            help="Clear this variant's Issue Analysis results for this run. Layer 1/2 data is untouched.",
+            disabled=bool(st.session_state.get(progress_key)),
+        ):
+            if run_id is not None:
+                idb.clear_results(run_id, variant=v)
+            st.session_state[results_key] = []
+            st.success(f"Variant {v} results cleared.")
+            st.rerun()
+
+    _render_issue_results(results)
+
+
+def tab_issue_analysis() -> None:
+    st.subheader("Issue Analysis — Layer 3 (Issue Analyst)")
+    st.caption(
+        "A/B testing of the Layer 3 analyst. Variant A sends the full evidence; Variant B sends "
+        "a reduced view (only the flagged bad moments + short context). Switch tabs to run each. "
+        "Results are stored in a dedicated issue-analysis database."
+    )
+
+    if not _has_results():
+        st.info(
+            "No run is loaded. Load a saved run below (no CSV upload needed), or run a new "
+            "evaluation in the Run Evaluation tab."
+        )
+        _render_inline_run_loader("issue_analysis")
+        return
+
+    sub_a, sub_b = st.tabs(["Variant A (full input)", "Variant B (reduced input)"])
+    with sub_a:
+        _render_issue_variant("A")
+    with sub_b:
+        _render_issue_variant("B")
 
 
 def tab_exports() -> None:
@@ -4012,7 +4184,9 @@ def tab_exports() -> None:
         "finished_at": rr.finished_at,
     }
 
-    issue_results = st.session_state.get("issue_analysis_results") or []
+    issue_results = (st.session_state.get("issue_results_A") or []) + (
+        st.session_state.get("issue_results_B") or []
+    )
     conv_bytes = build_conversation_csv_bytes(rr.conversation_results)
     msg_bytes = build_message_csv_bytes(rr.message_level_results)
     json_bytes = build_full_json_bytes(

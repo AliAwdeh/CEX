@@ -52,6 +52,8 @@ def build_issue_analysis_csv_bytes(issue_analysis_results: list[dict]) -> bytes:
         if not patterns:
             rows.append(
                 {
+                    "variant": ir.get("variant", ""),
+                    "journey_id": ir.get("journey_id", "") or "",
                     "issue_type": issue_type,
                     "journeys_analyzed": ir.get("journey_count", 0),
                     "parse_status": ir.get("parse_status", ""),
@@ -77,6 +79,8 @@ def build_issue_analysis_csv_bytes(issue_analysis_results: list[dict]) -> bytes:
             journey_ids = pat.get("journey_ids") or []
             rows.append(
                 {
+                    "variant": ir.get("variant", ""),
+                    "journey_id": ir.get("journey_id", "") or "",
                     "issue_type": issue_type,
                     "journeys_analyzed": ir.get("journey_count", 0),
                     "parse_status": ir.get("parse_status", ""),

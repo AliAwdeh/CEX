@@ -1,0 +1,19 @@
+{
+  "patterns": [
+    {
+      "pattern_description": "one or two sentences describing what recurs behind this issue type",
+      "trigger_source": "who produced the trigger: broadcast|assistant|human_agent (assistant = the bot)",
+      "trigger_type": "message|broadcast|action|missing_action",
+      "trigger": "the thing on our side that caused it: verbatim chatbot message/broadcast, or plain description of the action/missing action",
+      "customer_context": "the customer message or visible context the trigger failed to act on, or empty string if none",
+      "where_it_happens": "the journey moment(s) where this trigger most often appears",
+      "journey_ids": ["ids of the journeys from the input where this pattern appears"],
+      "occurrence_count": 0,
+      "root_cause_category": "short snake_case cause label; prefer one of: wrong_format|bad_timing|missing_context_check|vague_deferral|premature_collection|wrong_or_inconsistent_info|tone_mismatch|no_next_step|process_or_tool_gap, otherwise a new concise snake_case label",
+      "root_cause_explanation": "one or two sentences explaining the specific cause in this batch, grounded in the trigger",
+      "recommended_solution": "specific actionable solution that addresses this pattern's root cause"
+    }
+  ],
+  "summary": "two or three sentences for management: the dominant trigger, its root cause, and the headline fix",
+  "confidence": "low|medium|high"
+}

@@ -26,12 +26,17 @@ from typing import Any, Iterable, Optional
 from prompts import (
     DEFAULT_CONVERSATION_LEVEL_PROMPT,
     DEFAULT_ISSUE_ANALYSIS_PROMPT,
+    DEFAULT_ISSUE_ANALYSIS_B_PROMPT,
     DEFAULT_MESSAGE_LEVEL_PROMPT,
     PromptTemplate,
 )
 
 
 DEFAULT_DB_PATH = Path("cx_evaluator.db")
+
+# Layer 3 (issue analysis) results live in their own dedicated database so the
+# A/B experiment outputs are isolated from the main evaluation store.
+DEFAULT_ISSUE_DB_PATH = Path("issue_analysis.db")
 
 
 SCHEMA = """
@@ -300,6 +305,7 @@ class Database:
             ("message_level", DEFAULT_MESSAGE_LEVEL_PROMPT),
             ("conversation_level", DEFAULT_CONVERSATION_LEVEL_PROMPT),
             ("issue_analysis", DEFAULT_ISSUE_ANALYSIS_PROMPT),
+            ("issue_analysis_b", DEFAULT_ISSUE_ANALYSIS_B_PROMPT),
         ):
             existing = self._fetchone(
                 "SELECT id FROM prompt_templates WHERE kind=? AND is_default=1",
@@ -381,6 +387,7 @@ class Database:
                 "message_level": DEFAULT_MESSAGE_LEVEL_PROMPT,
                 "conversation_level": DEFAULT_CONVERSATION_LEVEL_PROMPT,
                 "issue_analysis": DEFAULT_ISSUE_ANALYSIS_PROMPT,
+                "issue_analysis_b": DEFAULT_ISSUE_ANALYSIS_B_PROMPT,
             }.get(kind, DEFAULT_CONVERSATION_LEVEL_PROMPT)
         return PromptTemplate(
             system_prompt=row["system_prompt"],
@@ -790,3 +797,180 @@ class Database:
             "started_at": _to_epoch(run.get("started_at")),
             "finished_at": _to_epoch(run.get("finished_at")),
         }
+
+
+# --------------------------------------------------------------------------
+# Dedicated Issue-Analysis (Layer 3) database
+# --------------------------------------------------------------------------
+
+ISSUE_DB_SCHEMA = """
+CREATE TABLE IF NOT EXISTS issue_analysis_results (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    run_id INTEGER NOT NULL,
+    variant TEXT NOT NULL DEFAULT 'A',
+    run_scope TEXT NOT NULL DEFAULT 'per_issue',
+    grouping TEXT NOT NULL DEFAULT 'grouped',
+    issue_type TEXT NOT NULL,
+    journey_id TEXT,
+    journey_count INTEGER NOT NULL DEFAULT 0,
+    parse_status TEXT NOT NULL,
+    error_message TEXT,
+    raw_response TEXT,
+    parsed_json TEXT,
+    journey_ids_json TEXT,
+    prompt_id INTEGER,
+    debug_json TEXT,
+    created_at TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_ia_run ON issue_analysis_results(run_id);
+CREATE INDEX IF NOT EXISTS idx_ia_run_variant ON issue_analysis_results(run_id, variant);
+"""
+
+
+class IssueAnalysisDB:
+    """Standalone SQLite store used ONLY for Layer 3 (issue analysis) results.
+
+    Kept separate from the main evaluation database so A/B experiment outputs
+    live on their own. Input (transcripts, L1/L2 results) is still read from the
+    main :class:`Database`; only Layer 3 outputs are written here. Results are
+    tagged by ``variant`` (A/B), ``run_scope`` (per_issue / all_journeys /
+    single_journey) and ``grouping`` (grouped / ungrouped).
+    """
+
+    def __init__(self, path: str | Path = DEFAULT_ISSUE_DB_PATH):
+        self.path = Path(path)
+        self._lock = threading.Lock()
+        self._conn = sqlite3.connect(
+            str(self.path),
+            check_same_thread=False,
+            isolation_level=None,
+        )
+        self._conn.row_factory = sqlite3.Row
+        self._conn.execute("PRAGMA journal_mode = WAL")
+        with self._lock:
+            self._conn.executescript(ISSUE_DB_SCHEMA)
+
+    def close(self) -> None:
+        with self._lock:
+            try:
+                self._conn.close()
+            except Exception:
+                pass
+
+    def _exec(self, sql: str, params: Iterable = ()) -> sqlite3.Cursor:
+        with self._lock:
+            return self._conn.execute(sql, tuple(params))
+
+    def _fetchall(self, sql: str, params: Iterable = ()) -> list[sqlite3.Row]:
+        return self._exec(sql, params).fetchall()
+
+    def save_result(
+        self,
+        run_id: int,
+        ir: dict,
+        *,
+        variant: str = "A",
+        run_scope: str = "per_issue",
+        grouping: str = "grouped",
+    ) -> int:
+        """Persist one Layer 3 result row, tagged by variant/scope/grouping."""
+        now = _now_iso()
+        output = ir.get("evaluation_output", ir.get("parsed_json"))
+        cur = self._exec(
+            "INSERT INTO issue_analysis_results"
+            "(run_id, variant, run_scope, grouping, issue_type, journey_id, journey_count,"
+            " parse_status, error_message, raw_response, parsed_json, journey_ids_json,"
+            " prompt_id, debug_json, created_at)"
+            " VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                int(run_id),
+                str(variant or "A"),
+                str(run_scope or "per_issue"),
+                str(grouping or "grouped"),
+                str(ir.get("issue_type", "")),
+                str(ir["journey_id"]) if ir.get("journey_id") is not None else None,
+                int(ir.get("journey_count") or 0),
+                ir.get("parse_status", "ok"),
+                ir.get("error_message"),
+                ir.get("raw_model_response"),
+                _json_dump(output) if output is not None else None,
+                _json_dump(ir.get("journey_ids")) if ir.get("journey_ids") is not None else None,
+                int(ir["prompt_id"]) if ir.get("prompt_id") is not None else None,
+                _json_dump(ir.get("debug")) if ir.get("debug") is not None else None,
+                now,
+            ),
+        )
+        return int(cur.lastrowid)
+
+    def clear_results(self, run_id: int, variant: Optional[str] = None) -> None:
+        """Clear results for a run; optionally only for one variant."""
+        if variant is None:
+            self._exec("DELETE FROM issue_analysis_results WHERE run_id=?", (int(run_id),))
+        else:
+            self._exec(
+                "DELETE FROM issue_analysis_results WHERE run_id=? AND variant=?",
+                (int(run_id), str(variant)),
+            )
+
+    def delete_result(
+        self,
+        run_id: int,
+        variant: str,
+        issue_type: str,
+        journey_id: Optional[str] = None,
+    ) -> None:
+        """Remove a saved result for one issue type (and optional journey) in a run/variant."""
+        if journey_id is None:
+            self._exec(
+                "DELETE FROM issue_analysis_results WHERE run_id=? AND variant=? AND issue_type=?",
+                (int(run_id), str(variant), str(issue_type)),
+            )
+        else:
+            self._exec(
+                "DELETE FROM issue_analysis_results WHERE run_id=? AND variant=? "
+                "AND issue_type=? AND journey_id=?",
+                (int(run_id), str(variant), str(issue_type), str(journey_id)),
+            )
+
+    def delete_journey_result(self, run_id: int, variant: str, journey_id: str) -> None:
+        """Remove any single-journey result for this run/variant/journey."""
+        self._exec(
+            "DELETE FROM issue_analysis_results WHERE run_id=? AND variant=? AND journey_id=?",
+            (int(run_id), str(variant), str(journey_id)),
+        )
+
+    def load_results(self, run_id: int, variant: Optional[str] = None) -> list[dict]:
+        if variant is None:
+            rows = self._fetchall(
+                "SELECT * FROM issue_analysis_results WHERE run_id=? ORDER BY issue_type ASC",
+                (int(run_id),),
+            )
+        else:
+            rows = self._fetchall(
+                "SELECT * FROM issue_analysis_results WHERE run_id=? AND variant=? "
+                "ORDER BY issue_type ASC",
+                (int(run_id), str(variant)),
+            )
+        out: list[dict] = []
+        for r in rows:
+            d = dict(r)
+            out.append(
+                {
+                    "variant": d.get("variant"),
+                    "run_scope": d.get("run_scope"),
+                    "grouping": d.get("grouping"),
+                    "issue_type": d.get("issue_type"),
+                    "journey_id": d.get("journey_id"),
+                    "journey_count": d.get("journey_count"),
+                    "parse_status": d.get("parse_status"),
+                    "error_message": d.get("error_message"),
+                    "raw_model_response": d.get("raw_response"),
+                    "parsed_json": _json_load(d.get("parsed_json")),
+                    "evaluation_output": _json_load(d.get("parsed_json")),
+                    "journey_ids": _json_load(d.get("journey_ids_json")) or [],
+                    "prompt_id": d.get("prompt_id"),
+                    "debug": _json_load(d.get("debug_json")),
+                }
+            )
+        return out

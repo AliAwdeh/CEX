@@ -20,10 +20,12 @@ from api_client import APIConfig, chat_completion
 from prompts import (
     DEFAULT_CONVERSATION_LEVEL_PROMPT,
     DEFAULT_ISSUE_ANALYSIS_PROMPT,
+    DEFAULT_ISSUE_ANALYSIS_B_PROMPT,
     DEFAULT_MESSAGE_LEVEL_PROMPT,
     PromptTemplate,
     build_conversation_level_payload,
     build_issue_analysis_payload,
+    build_issue_analysis_b_payload,
     build_message_level_payload,
     _issue_journey_evidence,
 )
@@ -894,6 +896,69 @@ def group_journeys_by_issue_type(conversation_results: list[dict]) -> dict[str, 
     return batches
 
 
+def build_issue_analysis_batches(
+    conversation_results: list[dict],
+    *,
+    scope: str = "per_issue",
+    grouping: str = "grouped",
+    issue_types: Optional[list[str]] = None,
+    journey_id: Optional[str] = None,
+) -> list[dict]:
+    """Build the list of Layer 3 batches for a run, honoring scope + grouping.
+
+    Returns a list of batch dicts, each: ``{"label", "issue_type", "journeys",
+    "journey_id"}``. One batch == one AI call.
+
+    Scope:
+      - ``per_issue``      one batch per issue type (grouping forced on).
+      - ``all_journeys``   every analyzable journey. ``grouped`` -> one batch per
+                           issue type covering all journeys; ``ungrouped`` -> a
+                           single batch with every journey, issue_type "all".
+      - ``single_journey`` exactly one batch for ``journey_id`` (no grouping).
+    """
+    by_type = group_journeys_by_issue_type(conversation_results)
+
+    if issue_types is not None:
+        wanted = {str(it).strip().lower() for it in issue_types}
+        by_type = {it: js for it, js in by_type.items() if it in wanted}
+
+    all_journeys: list[dict] = []
+    journey_to_type: dict[str, str] = {}
+    for it, js in by_type.items():
+        for j in js:
+            all_journeys.append(j)
+            journey_to_type[str(j.get("conversation_id", ""))] = it
+
+    scope = str(scope or "per_issue").lower()
+
+    if scope == "single_journey":
+        if not journey_id:
+            return []
+        jid = str(journey_id)
+        match = next((j for j in all_journeys if str(j.get("conversation_id", "")) == jid), None)
+        if match is None:
+            return []
+        it = journey_to_type.get(jid, "all")
+        return [{"label": jid, "issue_type": it, "journeys": [match], "journey_id": jid}]
+
+    if scope == "all_journeys":
+        if str(grouping or "grouped").lower() == "ungrouped":
+            if not all_journeys:
+                return []
+            return [{"label": "all", "issue_type": "all", "journeys": all_journeys, "journey_id": None}]
+        # grouped: one batch per issue type covering all its journeys
+        return [
+            {"label": it, "issue_type": it, "journeys": js, "journey_id": None}
+            for it, js in sorted(by_type.items())
+        ]
+
+    # per_issue (default) - one batch per issue type
+    return [
+        {"label": it, "issue_type": it, "journeys": js, "journey_id": None}
+        for it, js in sorted(by_type.items())
+    ]
+
+
 def _eval_issue_analysis(
     client,
     api: APIConfig,
@@ -902,13 +967,26 @@ def _eval_issue_analysis(
     save_raw: bool,
     truncate_chars: Optional[int],
     prompt: PromptTemplate,
+    variant: str = "A",
+    journey_id: Optional[str] = None,
 ) -> dict:
-    """Run one Layer 3 call for a single issue type. Always returns a record."""
-    payload = build_issue_analysis_payload(
-        issue_type=issue_type,
-        journeys=journeys,
-        truncate_chars=truncate_chars,
-    )
+    """Run one Layer 3 call for a single batch. Always returns a record.
+
+    ``variant`` selects the input shape: "A" sends the full transcript + L1/L2
+    evidence; "B" sends only the L1-flagged bad moments plus short context.
+    """
+    if str(variant).upper() == "B":
+        payload = build_issue_analysis_b_payload(
+            issue_type=issue_type,
+            journeys=journeys,
+            truncate_chars=truncate_chars,
+        )
+    else:
+        payload = build_issue_analysis_payload(
+            issue_type=issue_type,
+            journeys=journeys,
+            truncate_chars=truncate_chars,
+        )
     system_prompt = prompt.build_system()
     user_prompt = prompt.build_user(payload)
     journey_ids = [str(j.get("conversation_id", "")) for j in journeys]
@@ -916,6 +994,7 @@ def _eval_issue_analysis(
 
     record: dict[str, Any] = {
         "issue_type": issue_type,
+        "journey_id": journey_id,
         "journey_count": len(journeys),
         "journey_ids": journey_ids,
         "raw_model_response": None,
@@ -952,6 +1031,10 @@ def run_issue_analysis(
     api: APIConfig,
     prompt: Optional[PromptTemplate] = None,
     *,
+    variant: str = "A",
+    scope: str = "per_issue",
+    grouping: str = "grouped",
+    journey_id: Optional[str] = None,
     issue_types: Optional[list[str]] = None,
     save_raw: bool = True,
     truncate_chars: Optional[int] = None,
@@ -959,68 +1042,79 @@ def run_issue_analysis(
     cancel_requested: Optional[Callable[[], bool]] = None,
     on_issue_result: Optional[Callable[[dict], None]] = None,
 ) -> list[dict]:
-    """Run Layer 3 over finished conversation results, one call per issue type.
+    """Run Layer 3 over finished conversation results.
 
-    Journeys are grouped by the issue type Layer 2 committed to. Each issue type
-    becomes one concurrent AI call. Returns a list of issue-analysis records,
-    sorted by issue type. Persistence is delegated to ``on_issue_result``.
+    ``variant``  : "A" (full input) or "B" (reduced flagged-moments input).
+    ``scope``    : per_issue | all_journeys | single_journey.
+    ``grouping`` : grouped (one call per issue type) | ungrouped (one call total)
+                   - only applies when scope == all_journeys.
+    ``journey_id``: required when scope == single_journey.
+    ``issue_types``: when provided, restricts to that subset (per_issue / grouped).
 
-    ``issue_types`` (when provided) restricts the run to that subset of issue
-    types; anything not present in the grouped batches is ignored. When None,
-    every issue type found in the results is analyzed.
+    Each batch becomes one concurrent AI call. Persistence is delegated to
+    ``on_issue_result``; results carry ``variant``/``journey_id`` so the caller
+    can tag them in the dedicated issue-analysis DB.
     """
-    prompt = prompt or DEFAULT_ISSUE_ANALYSIS_PROMPT
-    batches = group_journeys_by_issue_type(conversation_results)
-    if issue_types is not None:
-        wanted = {str(it).strip().lower() for it in issue_types}
-        batches = {it: js for it, js in batches.items() if it in wanted}
-    issue_types = sorted(batches.keys())
+    if prompt is None:
+        prompt = DEFAULT_ISSUE_ANALYSIS_B_PROMPT if str(variant).upper() == "B" else DEFAULT_ISSUE_ANALYSIS_PROMPT
+
+    batches = build_issue_analysis_batches(
+        conversation_results,
+        scope=scope,
+        grouping=grouping,
+        issue_types=issue_types,
+        journey_id=journey_id,
+    )
 
     if on_progress:
         on_progress(
             {
                 "phase": "issue_start",
-                "total_issue_types": len(issue_types),
-                "issue_types": issue_types,
+                "total_issue_types": len(batches),
+                "issue_types": [b["label"] for b in batches],
             }
         )
 
     results: list[dict] = []
-    if not issue_types:
+    if not batches:
         if on_progress:
             on_progress({"phase": "issue_done", "total_issue_types": 0})
         return results
 
-    workers = max(1, min(len(issue_types), int(getattr(api, "concurrency", 1) or 1)))
-    fut_info: dict[cf.Future, str] = {}
+    workers = max(1, min(len(batches), int(getattr(api, "concurrency", 1) or 1)))
+    fut_info: dict[cf.Future, dict] = {}
 
     with cf.ThreadPoolExecutor(max_workers=workers) as ex:
-        for issue_type in issue_types:
+        for batch in batches:
             fut = ex.submit(
                 _eval_issue_analysis,
                 client=client,
                 api=api,
-                issue_type=issue_type,
-                journeys=batches[issue_type],
+                issue_type=batch["issue_type"],
+                journeys=batch["journeys"],
                 save_raw=save_raw,
                 truncate_chars=truncate_chars,
                 prompt=prompt,
+                variant=variant,
+                journey_id=batch.get("journey_id"),
             )
-            fut_info[fut] = issue_type
+            fut_info[fut] = batch
 
         pending = set(fut_info.keys())
         while pending:
             done, _ = cf.wait(pending, return_when=cf.FIRST_COMPLETED)
             for fut in done:
                 pending.discard(fut)
-                issue_type = fut_info.pop(fut)
+                batch = fut_info.pop(fut)
+                label = batch["label"]
                 try:
                     ir = fut.result()
                 except Exception as e:  # noqa: BLE001
                     ir = {
-                        "issue_type": issue_type,
-                        "journey_count": len(batches.get(issue_type, [])),
-                        "journey_ids": [str(j.get("conversation_id", "")) for j in batches.get(issue_type, [])],
+                        "issue_type": batch["issue_type"],
+                        "journey_id": batch.get("journey_id"),
+                        "journey_count": len(batch["journeys"]),
+                        "journey_ids": [str(j.get("conversation_id", "")) for j in batch["journeys"]],
                         "raw_model_response": None,
                         "parsed_json": None,
                         "evaluation_output": None,
@@ -1028,6 +1122,7 @@ def run_issue_analysis(
                         "error_message": f"Worker raised: {e}",
                         "debug": None,
                     }
+                ir["variant"] = variant
                 results.append(ir)
                 if on_issue_result:
                     try:
@@ -1038,9 +1133,9 @@ def run_issue_analysis(
                     on_progress(
                         {
                             "phase": "issue_type_done",
-                            "issue_type": issue_type,
+                            "issue_type": label,
                             "status": ir.get("parse_status"),
-                            "total_issue_types": len(issue_types),
+                            "total_issue_types": len(batches),
                         }
                     )
             if cancel_requested and cancel_requested():
@@ -1050,9 +1145,9 @@ def run_issue_analysis(
                     pending.discard(f)
                 break
 
-    results.sort(key=lambda r: str(r.get("issue_type", "")))
+    results.sort(key=lambda r: (str(r.get("issue_type", "")), str(r.get("journey_id") or "")))
     if on_progress:
-        on_progress({"phase": "issue_done", "total_issue_types": len(issue_types)})
+        on_progress({"phase": "issue_done", "total_issue_types": len(batches)})
     return results
 
 
