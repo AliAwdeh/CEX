@@ -84,6 +84,56 @@ def _norm_text(value: Any) -> str:
     return str(value or "").strip().lower().replace(" ", "_").replace("-", "_")
 
 
+def _message_result_is_red(message_result: dict) -> bool:
+    """Match the UI's red-severity rules for one message-level result."""
+    if not message_result:
+        return False
+    if message_result.get("parse_status") != "ok":
+        return True
+    parsed = message_result.get("parsed_json") or {}
+    effect = parsed.get("message_level_effect")
+    frustration = parsed.get("frustration_level_after_message")
+    change = parsed.get("frustration_change")
+    issue_type = parsed.get("issue_type") or "none"
+    issue_origin = parsed.get("issue_origin") or "none"
+    has_issue = effect in {"minor_issue", "major_issue"} or issue_type != "none" or issue_origin != "none"
+    if effect == "major_issue" or frustration in {"high", "cancellation_risk"}:
+        return True
+    if change == "created" and has_issue:
+        return True
+    return False
+
+
+def _broadcast_only_red_issue_flag(
+    message_evaluations: list[dict],
+    message_records: list[dict],
+) -> bool:
+    """Return True when the journey's only red message is a system/broadcast row."""
+    if not message_evaluations or not message_records:
+        return False
+
+    records_by_idx: dict[Any, dict] = {}
+    for record in message_records:
+        idx = record.get("message_index")
+        if idx is not None and idx not in records_by_idx:
+            records_by_idx[idx] = record
+
+    red_results = [message for message in message_evaluations if _message_result_is_red(message)]
+    if len(red_results) != 1:
+        return False
+
+    target = red_results[0]
+    idx = target.get("message_index")
+    if idx is None:
+        parsed = target.get("parsed_json") or {}
+        idx = parsed.get("message_index")
+    record = records_by_idx.get(idx)
+    if not record:
+        return False
+
+    return _norm_text(record.get("raw_sender_role")) == "system"
+
+
 def _normalize_handled_status(cl: dict) -> str | None:
     handled = _norm_text(cl.get("handled_status"))
     if handled in {"handled", "unhandled"}:
@@ -200,6 +250,7 @@ def compute_metadata(
     cancellation = any(
         p.get("frustration_level_after_message") == "cancellation_risk" for p in parsed
     )
+    broadcast_only_red_issue = _broadcast_only_red_issue_flag(message_evaluations, message_records)
 
     return {
         "total_messages": int(total),
@@ -224,6 +275,7 @@ def compute_metadata(
         "first_frustration_message_index": first_frustration_idx,
         "first_major_issue_message_index": first_major_idx,
         "cancellation_risk_detected": bool(cancellation),
+        "broadcast_only_red_issue": bool(broadcast_only_red_issue),
     }
 
 
@@ -337,6 +389,7 @@ def flatten_conversation_row(
         "our_side_issue_count",
         "shared_issue_count",
         "cancellation_risk_detected",
+        "broadcast_only_red_issue",
     ]
     for f in cm_fields:
         row[f] = computed_metadata.get(f)

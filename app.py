@@ -473,15 +473,15 @@ def _conv_dataframe_from_results() -> pd.DataFrame:
     if not rr:
         return pd.DataFrame()
     rows = []
-    for cr in rr.conversation_results:
+    for idx, cr in enumerate(rr.conversation_results):
         cr = _normalize_conversation_result_for_display(cr)
-        rows.append(
-            flatten_conversation_row(
-                cr,
-                cr.get("conversation_metadata", {}) or {},
-                cr.get("computed_metadata", {}) or {},
-            )
+        row = flatten_conversation_row(
+            cr,
+            cr.get("conversation_metadata", {}) or {},
+            cr.get("computed_metadata", {}) or {},
         )
+        row["__run_order"] = idx
+        rows.append(row)
     return _normalize_conversation_dataframe_markers(build_conversation_table(rows))
 
 
@@ -3711,6 +3711,9 @@ def tab_review() -> None:
         key="review_score_order",
         help="Use the final conversation score to browse from worst to best, or best to worst.",
     )
+    previous_order_choice = st.session_state.get("review_last_applied_order_choice")
+    if "__run_order" in filtered_df.columns:
+        filtered_df = filtered_df.sort_values("__run_order", kind="stable")
     if order_choice != "Current order":
         if "score_final" not in filtered_df.columns:
             st.caption("No final conversation score is available for this run.")
@@ -3773,6 +3776,11 @@ def tab_review() -> None:
         ordered_ids.append(cid)
 
     current_id = str(st.session_state.get("review_selected_conversation_id") or "")
+    if previous_order_choice is not None and previous_order_choice != order_choice and ordered_ids:
+        current_id = ordered_ids[0]
+        st.session_state.review_selected_conversation_id = current_id
+        st.session_state.review_scroll_to_conversation_start = True
+    st.session_state.review_last_applied_order_choice = order_choice
     if current_id not in ordered_ids:
         current_id = ordered_ids[0]
         st.session_state.review_selected_conversation_id = current_id

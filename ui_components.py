@@ -954,6 +954,12 @@ def conversation_filters(
                 )
             mr_options = ["Any", "Only manual review", "Only no manual review"]
             sel_mr = st.selectbox("Human review", mr_options, index=0, key=f"{key_prefix}_manual_review")
+            show_broadcast_only = st.checkbox(
+                "Show broadcast-only issue journeys",
+                value=False,
+                key=f"{key_prefix}_show_broadcast_only_red",
+                help="Hidden by default when the only red message in the journey is a system/broadcast message.",
+            )
             date_range = None
             if "conversation_start_date" in conv_df.columns:
                 parsed = pd.to_datetime(conv_df["conversation_start_date"], errors="coerce")
@@ -979,6 +985,7 @@ def conversation_filters(
         "main_issue_type": sel_issue_type,
         "journey_starter": sel_journey_starter,
         "manual_review": sel_mr,
+        "show_broadcast_only_red": show_broadcast_only,
         "date_range": date_range,
     }
 
@@ -1013,6 +1020,13 @@ def apply_conversation_filters(conv_df: pd.DataFrame, filters: dict) -> pd.DataF
         mask &= manual_review_series
     elif mr == "Only no manual review" and "manual_review_required" in conv_df.columns:
         mask &= ~manual_review_series
+
+    show_broadcast_only = bool(filters.get("show_broadcast_only_red"))
+    if not show_broadcast_only and "broadcast_only_red_issue" in conv_df.columns:
+        broadcast_only_series = conv_df["broadcast_only_red_issue"].map(
+            lambda value: str(value if value is not None else False).strip().lower() in {"true", "1", "yes", "y"}
+        )
+        mask &= ~broadcast_only_series
 
     dr = filters.get("date_range")
     if dr and "conversation_start_date" in conv_df.columns:
