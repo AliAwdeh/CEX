@@ -814,7 +814,7 @@ If the customer was frustrated because we asked again for something already sent
 - If handled_status = handled, unhandled_resolution_subtype must be not_applicable.
 - If handled_status = unhandled, unhandled_resolution_subtype must be pending_unresolved or totally_unresolved.
 - If customer_experience = good, there should not be an unresolved serious customer-facing issue.
-- If conversation_score.final_score is 75 or higher, customer_experience must be good. If the journey is genuinely bad, lower final_score below 75 instead of outputting bad with a 75+ score.
+- Numeric final_score must not overwrite customer_experience. If the score and marker feel inconsistent, keep the customer_experience marker that best matches the visible journey evidence and explain the tension in score_explanation.
 - If main_issue.issue_exists = false, main_issue.issue_origin must be none and main_issue.issue_type must be none.
 - If frustration_detected = false, frustration_origin should be none and frustration_timing should usually be none.
 - If max_frustration_level = cancellation_risk, manual_review_required should usually be true.

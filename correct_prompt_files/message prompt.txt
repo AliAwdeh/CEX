@@ -32,6 +32,7 @@ Ask: "Did this message move the customer forward at this point, or did it create
 
 A message moves the customer forward when it:
 - answers the customer's immediate need directly and early
+- answers each material part of a multi-question customer message, or clearly says what will happen next for any part not fully answered
 - uses visible context correctly
 - avoids asking for already-provided information
 - avoids repeating the customer's words without adding progress
@@ -74,6 +75,8 @@ Do not mark a message as an issue solely because it cannot confirm a final outco
 Contract and case-record fields are direct-answer questions. If the customer asks for a contract status, contract end date, contract start date, job/position title, salary, payment schedule, renewal date, cancellation status, or what to enter on an official/government/medical/employer form, the ideal chatbot should retrieve the official value from the current case/contract record and answer directly.
 
 "It is not showing clearly", "I cannot see it", "not available here", "I am not sure", or a guessed/caveated answer is a CX issue for contract/case-record fields unless the message gives a specific current state, named system/source limitation, concrete owner or dependency, and a next step/timeframe. If the contract is genuinely not issued yet because a prerequisite is pending, the message must say that clearly and still answer any immediate field question the customer can act on, such as the official position to provide.
+
+For multi-question customer messages, judge the target message by material coverage. If the agent answers useful parts of the message but misses one clear operational request, such as rescheduling a visit while answering payment method and process duration, use minor_issue with missing_next_step or ignored_context. Do not use major_issue when the answer still provides useful information and the missed item can be fixed with one follow-up.
 
 ## B. "We will update you" is bad by default
 "I will let you know" / "We will update you" / "Our team will check and revert" are bad by default. They are only acceptable when the message also gives the specific current state + a named concrete dependency + a specific timeframe. Without all three, they are not an acceptable substitute for a direct answer.
@@ -132,6 +135,8 @@ Government, bank, embassy, medical, card, or other external dependencies can be 
 
 Mandatory medical-center requirements such as vaccines, signatures, paperwork, passport checks, or fitness-center steps can be helped when the message explains they are part of the government medical/residency process and tells the customer to proceed. Do not mark the message as an issue solely because it does not provide detailed clinical/legal reasoning.
 
+A first outbound or proactive passport renewal service message can be helped when it gives the passport expiry date, explains the renewal option, gives the home visit or embassy alternative, states the cost, and tells the customer what is needed next. Do not mark wrong_info solely because the passport expiry date is in the future, even if it is months away or in the next year. Future expiry does not prove renewal is unnecessary. Use wrong_info only when visible context proves the passport was already renewed, the expiry date is false, the customer already declined renewal, or the message requests payment/action under a visibly false premise.
+
 A queue or handoff message for a specialized request can be neutral or helped when it gives a clear routing reason, queue position or expected wait, and preserves the request for the right teammate. Do not mark it as a major issue when the customer accepts the wait and the request is later handled within the stated window. Mark an issue only if it is vague, loses the request, omits any expectation, or blocks an urgent/material answer.
 
 A very brief "let me check / grant me a moment" response can be neutral or minor_issue, not major_issue, when it is the first response to a direct status question, it promises immediate checking, and there is no visible repeated chase, severe urgency, blocked payment/refund/cancellation risk, or long prior delay. It is still not a complete answer, but do not mark it as a major issue unless it becomes repeated, vague, or leaves the customer waiting without progress.
@@ -182,13 +187,19 @@ Signature, VAT, bank-rejection, refund, or payment-confirmation requests should 
 
 Do not mark salary, card-payment, advance-salary, direct-debit, billing-cycle, future-renewal, or pay-period explanations as wrong_info unless visible context proves the explanation is false or contradictory. If the message plausibly explains which month or period a payment covers, how a credit/VAT/payment-plan calculation works, when salary will be released, or what future renewal amount means, treat it as helped or neutral. Use minor_issue/unclear_guidance only when the explanation is hard to act on or uses wording that could confuse the customer.
 
+A new or unexplained salary advance/deduction broadcast can be minor_issue with unclear_guidance when it says a salary will be deducted at the start of the month and transferred later, but does not explain why, whether the deduction is automatic, which month the deduction covers, or whether the customer must do anything. Use neutral only when visible context already explained this cycle or the broadcast is clearly an established recurring reminder. Do not use wrong_info unless visible context proves the dates, amount, or payment basis is false.
+
+A later payment-cycle clarification can be recovered_issue when it acknowledges the customer's confusion or concern, explains the updated flow, maps each deduction to the salary month it covers, states any cash-payment responsibility, gives deduction and transfer dates, and explains the business reason for the setup. Use frustration_change: decreased.
+
+If a customer asks for a replacement expired signing, direct-debit, bank authorization, or payment-form link, and the agent answers only that the signature/form is pending approval or there is no need to sign again, treat it as minor_issue with unclear_guidance unless the message explicitly reconciles why the expired link no longer matters. Do not classify it as helped merely because "pending approval" may be true; the answer must explain the relationship between the expired link, the prior signing request, and the current approval state.
+
 A follow-up EID signature, direct-debit mandate, bank authorization, Tadbeer contract signature, or payment-confirmation request after a setup step is completed is not automatically repetition, ignored_context, or a major issue. If the follow-up request clearly names a distinct legal/payment authorization purpose, it can be neutral or minor_issue. Use major_issue only when it repeats the same already-completed action, contradicts the completed step, blocks action, or creates material confusion.
 
 When a customer says they do not have a contract, do not automatically mark a later payment-plan or renewal explanation as wrong_info just because it mentions "contract" or "payment plan." If the agent gives concrete amounts, due dates, and what the customer should pay now versus later, treat the wording as helped or minor unclear_guidance unless the visible context proves the payment basis is false or the customer remains confused.
 
 For Emirates ID status, "issued", "under processing", "physical card not received", and "handed to courier" can refer to different stages of the same document workflow. Do not mark wrong_info solely because one message says the EID is issued and another says the physical card is under processing or with courier. Use minor unclear_guidance only when the wording may confuse the digital-vs-physical status. Use wrong_info only when the visible transcript proves the later status is impossible or contradicts a completed final delivery.
 
-For document/photo processing, distinguish "uploaded to contract/profile/system" from "accepted/approved by the government." A later government rejection of a photo/document is not wrong_info solely because an earlier message said the replacement was uploaded. Use wrong_info only if the earlier message said the government accepted/approved it or the later rejection clearly contradicts a completed approval. A rejection notice with an unclear label like "null" but a clear reason such as face-photo quality is minor unclear_guidance at most if the requested replacement action is clear.
+For document/photo processing, distinguish "uploaded to contract/profile/system" from "accepted/approved by the government." A later government rejection of a photo/document is not wrong_info solely because an earlier message said the replacement was uploaded. Upload or continued processing does not mean government approval. A rejection notice is helped when it names the rejected document, gives a clear rejection reason such as light reflection or face-photo quality, and explains the replacement/resubmission next step. Use wrong_info only if the earlier message said the government accepted/approved it or the later rejection clearly contradicts a completed approval. A rejection notice with an unclear label like "null" but a clear reason and requested replacement action is minor unclear_guidance at most.
 
 For sales or booking qualification flows, relevant questions about address, timing, preferences, childcare needs, pets, cooking, payment method, or start date can be helped when they move booking forward. A single repeated qualification question or a sales-adjacent offer is usually minor_issue at most unless it blocks the customer's requested service, repeats already-provided critical details multiple times, or derails the booking.
 
@@ -481,6 +492,36 @@ Agent says the company can process a Lebanon or embassy visa on the customer's b
 ## Minor or major issue: unexplained signature/payment request
 Agent says the bank rejected a signature, VAT/payment is needed, or a refund/payment confirmation is required, but does not clearly connect the request to the customer's current process or next step.
 → minor_issue or major_issue depending on impact, issue_type: unclear_guidance or missing_next_step, not wrong_info unless visibly contradicted
+
+## Helped: proactive passport renewal with future expiry
+First visible/proactive message says the maid's passport expires on a future date, offers a home visit to apply for renewal, says the customer will not need to visit the embassy, states the cost, and asks for payment or a copy if already renewed.
+-> helped, frustration_level_after_message: none, issue_origin: none, issue_type: none
+Do not mark wrong_info solely because the expiry date is in the future. Only mark wrong_info if visible context proves the passport was already renewed, the expiry date is false, the customer declined, or renewal/payment is requested under a false premise.
+
+## Minor issue: partial multi-question answer
+Customer asks to reschedule a visit, asks how payment should be paid, and asks how many days renewal will take. Agent answers online payment and one-to-two-month duration but does not answer the rescheduling request.
+-> minor_issue, frustration_level_after_message: low, issue_origin: our_side, issue_type: missing_next_step
+The answer is useful but incomplete; do not use major_issue unless the missed item blocks an urgent or high-risk need.
+
+## Minor issue: expired link answered with pending approval
+Customer says a signing/direct-debit/payment-form link expired and asks for a new link. Agent says the signature/form is pending approval and there is no need to sign again, but does not explain why the expired link no longer matters.
+-> minor_issue, issue_origin: our_side, issue_type: unclear_guidance
+Use helped only if the message explicitly reconciles the expired link with the current approval state.
+
+## Helped: government document rejection with clear reason
+Agent says the government rejected a passport/photo/document, names the rejected document, gives a clear reason such as light reflections on the passport photo, and says resending it will allow resubmission or the next process step.
+-> helped, issue_origin: none, issue_type: none
+Do not mark wrong_info only because the document was previously uploaded or the process had continued. Upload does not equal government approval.
+
+## Minor issue: unexplained new salary deduction broadcast
+Broadcast says July salary will be deducted on July 1 and transferred on August 5, but visible context does not already explain this advance deduction/payment cycle.
+-> minor_issue, issue_origin: our_side, issue_type: unclear_guidance
+It gives useful dates, so do not use major_issue or wrong_info unless the visible context proves the payment basis is false or contradictory. Use neutral if the cycle was already clearly explained or established as recurring.
+
+## Recovery: payment-cycle clarification
+Agent acknowledges the customer's concern that the payment message felt misleading, explains the updated salary flow, states the deduction month and transfer date, explains any direct cash payment for a partial month, and gives the reason for advance deduction.
+-> recovered_issue, frustration_change: decreased, clarity_level: clear, context_handling: good
+Use issue_origin: none and issue_type: none when the recovery message itself clearly resolves the confusion.
 
 ---
 

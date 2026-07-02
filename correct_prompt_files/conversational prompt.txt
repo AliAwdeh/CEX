@@ -491,7 +491,7 @@ For this score, use actual transcript evidence of customer frustration and trust
 - Handled + good with one low-impact missed or generic response that is immediately corrected after one follow-up, no visible frustration, and a clear final answer usually scores 80-90.
 - Handled + good with several process questions, a concrete accepted queue handoff, complete later answer, and satisfied ending usually scores 82-90 unless there is visible frustration, repeated chasing, wrong information, or unresolved material detail.
 - If the journey is handled, the likely score is 80 or above, and the only negatives are minor recovered friction, natural follow-ups, accepted handoff, harmless promo, normal address collection, or external-process uncertainty, customer_experience should usually be good. Mark bad only when there is a material unresolved issue, repeated chasing, visible frustration, trust damage, wrong information, or serious process contradiction.
-- Handled + bad with mild friction that is promptly clarified and accepted usually scores 65-74. If the score reaches 75 or higher, the recovered friction is probably not enough to justify customer_experience = bad.
+- Handled + bad with mild friction that is promptly clarified and accepted usually scores 65-74.
 - Handled + bad with several avoidable issues but no actual visible frustration, and a neutral/polite customer tone, usually scores 60-72.
 - Handled + bad with several avoidable issues and low/medium visible frustration usually scores 55-70.
 - Handled + bad with repeated vague deferrals, confusing handoff, explicit customer frustration, or trust damage usually scores 30-55.
@@ -500,11 +500,7 @@ For this score, use actual transcript evidence of customer frustration and trust
 - Unhandled + bad can still score in the 45-65 range when the objective is pending but there is a usable current state and some helpful progress; score below 45 only when there is high effort, severe trust damage, cancellation/refund/escalation risk, or no credible path forward.
 - Unhandled + bad with no usable current state or next step usually scores below 50.
 
-If customer_experience = bad but final_score is 75 or higher, treat this as a classification conflict. A final_score of 75 or higher means the journey is good overall despite imperfections, so revise customer_experience to good. If the journey is truly bad because of severe visible trust damage, explicit customer frustration/complaint, repeated unrecovered failures, serious wrong information, cancellation/refund/legal risk, or a material unresolved question, lower final_score below 75 instead of outputting bad with a 75+ score.
-
-Do not output handled + bad with final_score 85 or higher unless there is severe wrong information, repeated unrecovered friction, serious process contradiction, cancellation/refund/legal risk, or visible trust damage. A handled journey with score 85+ and only minor noise should be handled + good.
-
-For final_score 75-84, customer_experience should usually be good when the objective was handled. Use bad in this score range only when the friction is still materially harmful after recovery, and explain why the score was not lower. Minor recovered issues, duplicate notices without customer complaint, operational channel routing, harmless promo, external-process uncertainty, normal clarification questions, or a single recovered context miss should not produce handled + bad at 75+.
+Do not use a final_score threshold to override customer_experience. A handled journey can still be customer_experience = bad when visible evidence shows avoidable effort, confusing guidance, trust damage, wrong information, repeated unrecovered friction, or a material pre-resolution issue. If customer_experience is bad but the numeric score is relatively high, keep customer_experience = bad when the evidence supports it and explain the mismatch in score_explanation.
 
 If customer_experience = good, do not list minor recovered friction as main_issue or all_detected_issues unless it caused real customer effort, confusion, delay, or trust risk.
 
@@ -861,12 +857,12 @@ Chatbot sends the same acknowledgment message three times before making any prog
 ## Score Calibration: Handled + Bad but recovered and accepted
 Customer asks about a missed call, then asks salary/card/visa process questions. Early replies add some avoidable effort and one timing question is deferred, but later the agent clarifies the salary process, confirms the visa outcome, answers the remaining process question, and the customer ends very thankful.
 This is handled + bad only if the avoidable friction was material, repeated, or left a real trust issue after recovery. If the early friction was one or two minor recovered misses and the final state is accepted, classify handled + good instead.
-Likely score: 65-75 for genuinely material handled + bad. If score is above 75 and the issues are recovered/minor, use handled + good.
+Likely score: 65-75 for genuinely material handled + bad. Use the visible friction and recovery quality, not the numeric threshold alone, to decide customer_experience.
 
 ## Score Calibration: Handled + Bad, urgent but polite
 Customer asks for documents or process steps urgently because of a travel date. The chatbot initially misses the exact question and uses queue/teammate deferrals, so the experience is bad. Later the customer receives the needed process steps, payment link, pickup details, and next steps. The customer stays polite and does not express anger, worry, loss of trust, or repeated frustration.
 This is handled + bad only when the initial miss or deferral materially delays the urgent need or leaves trust risk. If the urgent request is ultimately answered with usable documents/steps and the remaining issues are minor clarifications, classify handled + good with possible medium business risk but no automatic bad CX.
-Likely handled + bad score: 60-68 for material delay. If score is above 75, re-check whether the journey should be handled + good.
+Likely handled + bad score: 60-68 for material delay. If the score is higher, explain why the material delay still makes the customer_experience bad instead of changing the marker automatically.
 
 ## Score Calibration: Handled + Bad with trust damage
 Customer repeatedly asks where a visa/application process stands, says the case is urgent, receives vague updates and confusing handoff messages, then explicitly says the experience is frustrating or accuses the company of stalling. The agent eventually gives a current state, but does not fully explain what the stage means or when the blocker will clear.
@@ -947,8 +943,7 @@ Do not include markdown. Do not include explanations outside the JSON. Do not ad
 - Irrelevant marketing, promotional, survey, birthday, re-engagement, or general informational messages after the objective was addressed can affect customer_experience but must not change handled_status to unhandled
 - One isolated promo after acceptance is usually harmless; a promo inside an active serious/urgent/blocked discussion can be bad CX if it delays or displaces support
 - If customer_experience = good → every material pre-resolution agent message must have made real progress with no significant avoidable friction; harmless post-resolution or administrative messages may be low-impact when they do not disrupt the journey
-- If customer_experience = bad and final_score >= 75 → this is inconsistent. Revise customer_experience to good, or lower final_score below 75 if the journey is genuinely bad because of severe trust damage, explicit frustration/complaint, repeated unrecovered failures, serious wrong information, cancellation/refund/legal risk, or a material unresolved question.
-- If handled_status = handled, final_score >= 85, and the only negatives are minor recovered friction, harmless promo, normal procedural follow-up, accepted handoff, one recovered repeat, or external-process uncertainty → customer_experience should be good.
+- Numeric final_score must not overwrite customer_experience. If the score and marker feel inconsistent, keep the marker that best matches the visible journey evidence and explain the tension in score_explanation.
 - If visible prerequisites are pending → implying the downstream outcome is already ready is bad customer_experience unless clearly framed as advance preparation; address/location collection alone is not enough unless it creates that contradiction
 - Repeated deferrals for the same status question count as a stronger delay/repetition issue than one isolated deferral
 - Pre-existing customer frustration does not automatically make customer_experience = bad when the chatbot clearly reduces uncertainty and de-escalates

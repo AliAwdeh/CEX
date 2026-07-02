@@ -436,17 +436,6 @@ def _rating_from_score(score: Any) -> str:
     return "Critical"
 
 
-def _final_score_value(score: Any) -> float | None:
-    """Return a numeric final score when the conversation score is present."""
-    if not isinstance(score, dict):
-        return None
-    raw = score.get("final_score", score.get("raw_total_score"))
-    try:
-        return float(raw)
-    except (TypeError, ValueError):
-        return None
-
-
 def _normalize_conversation_score(value: Any) -> dict:
     if not isinstance(value, dict):
         return {}
@@ -634,10 +623,6 @@ def validate_conversation_level_result(data: dict) -> dict:
     conversation_score = _normalize_conversation_score(data.get("conversation_score"))
     if conversation_score:
         out["conversation_score"] = conversation_score
-        final_score = _final_score_value(conversation_score)
-        if final_score is not None and final_score >= 75 and customer_experience == "bad":
-            customer_experience = "good"
-            out["customer_experience"] = customer_experience
 
     if not main_out["issue_exists"]:
         main_out["issue_origin"] = "none"

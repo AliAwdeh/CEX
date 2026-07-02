@@ -537,9 +537,6 @@ def _normalize_conversation_dataframe_markers(df: pd.DataFrame) -> pd.DataFrame:
     experience = experience.where(valid_experience, None)
     experience = experience.mask(experience.isna() & legacy_bad_experience, "bad")
     experience = experience.mask(experience.isna() & legacy_good_experience, "good")
-    if "score_final" in out.columns:
-        final_score = pd.to_numeric(out["score_final"], errors="coerce")
-        experience = experience.mask(final_score >= 75, "good")
     out["customer_experience"] = experience
 
     if "frustration_detected" in out.columns:
@@ -3136,6 +3133,176 @@ def _overview_journey_table(node_df: pd.DataFrame) -> pd.DataFrame:
     return view
 
 
+def _stats_summary_rows(conv_df: pd.DataFrame) -> list[dict[str, Any]]:
+    """Build the management stats table rows from normalized conversation markers."""
+    total = int(len(conv_df))
+    handled = _norm_marker_series(conv_df, "handled_status")
+    experience = _norm_marker_series(conv_df, "customer_experience")
+    experience = experience.replace({"many": "bad", "zero_minimal": "good", "minimal": "good"})
+    subtype = _norm_marker_series(conv_df, "unhandled_resolution_subtype", "not_applicable")
+
+    handled_mask = handled == "handled"
+    unhandled_mask = handled == "unhandled"
+    good_mask = experience == "good"
+    bad_mask = experience == "bad"
+    pending_mask = subtype == "pending_unresolved"
+    totally_mask = subtype == "totally_unresolved"
+
+    pending_good = int((unhandled_mask & pending_mask & good_mask).sum())
+    totally_good = int((unhandled_mask & totally_mask & good_mask).sum())
+
+    def row(metric: str, count: int, kind: str, depth: int = 0) -> dict[str, Any]:
+        return {
+            "Metric": metric,
+            "Count": int(count),
+            "Percentage": f"{_pct(count, total):.1f}%",
+            "_kind": kind,
+            "_depth": depth,
+        }
+
+    rows = [
+        row("Total Journeys", total, "total"),
+        row("Handled", int(handled_mask.sum()), "section"),
+        row("Handled / Good", int((handled_mask & good_mask).sum()), "child", 1),
+        row("Handled / Bad", int((handled_mask & bad_mask).sum()), "child", 1),
+        row("Not Handled", int(unhandled_mask.sum()), "section"),
+        row("Pending Unresolved / Bad", int((unhandled_mask & pending_mask & bad_mask).sum()), "child", 1),
+        row("Totally Unresolved / Bad", int((unhandled_mask & totally_mask & bad_mask).sum()), "child", 1),
+    ]
+
+    rows.extend(
+        [
+            row("Pending Unresolved / Good", pending_good, "child", 1),
+            row("Totally Unresolved / Good", totally_good, "child", 1),
+        ]
+    )
+
+    captured_unhandled_bad = int((unhandled_mask & (pending_mask | totally_mask) & bad_mask).sum())
+    other_unhandled_bad = int((unhandled_mask & bad_mask).sum()) - captured_unhandled_bad
+    if other_unhandled_bad > 0:
+        rows.append(row("Other Unhandled / Bad", other_unhandled_bad, "child", 1))
+
+    captured_unhandled_good = pending_good + totally_good
+    other_unhandled_good = int((unhandled_mask & good_mask).sum()) - captured_unhandled_good
+    if other_unhandled_good > 0:
+        rows.append(row("Other Unhandled / Good", other_unhandled_good, "child", 1))
+
+    rows.extend(
+        [
+            row("Overall Customer Experience - Good", int(good_mask.sum()), "section"),
+            row("Overall Customer Experience - Bad", int(bad_mask.sum()), "section"),
+        ]
+    )
+    return rows
+
+
+def _render_stats_summary_table(rows: list[dict[str, Any]]) -> None:
+    """Render the Stats tab table with the app dashboard palette."""
+    header_bg = _DASH_COLORS["panel_top"]
+    total_bg = _DASH_COLORS["panel_bg"]
+    section_bg = "#14273a"
+    child_bg = "#0f172a"
+    border = _DASH_COLORS["panel_border"]
+    text = _DASH_COLORS["text"]
+    muted = _DASH_COLORS["muted"]
+
+    body = []
+    for row in rows:
+        kind = row["_kind"]
+        bg = total_bg if kind == "total" else section_bg if kind == "section" else child_bg
+        weight = "600" if kind in {"total", "section"} else "400"
+        metric = html_lib.escape(str(row["Metric"]))
+        metric_text = str(row["Metric"])
+        align = "left" if row["_depth"] == 0 or len(metric_text) > 42 else "center"
+        value_color = text if kind in {"total", "section"} else muted
+        body.append(
+            "<tr>"
+            f'<td style="background:{bg};border:1px solid {border};padding:8px 10px;'
+            f'text-align:{align};font-weight:{weight};color:{text};">{metric}</td>'
+            f'<td style="background:{bg};border:1px solid {border};padding:8px 10px;'
+            f'text-align:left;font-weight:{weight};color:{value_color};">{int(row["Count"]):,}</td>'
+            f'<td style="background:{bg};border:1px solid {border};padding:8px 10px;'
+            f'text-align:left;font-weight:{weight};color:{value_color};">{html_lib.escape(str(row["Percentage"]))}</td>'
+            "</tr>"
+        )
+
+    st.markdown(
+        f"""
+        <style>
+        .stats-summary-table {{
+            width: min(820px, 100%);
+            border-collapse: collapse;
+            color: {text};
+            font-size: 1rem;
+            line-height: 1.25;
+            border: 1px solid {border};
+            background: {child_bg};
+        }}
+        .stats-summary-table th {{
+            background: {header_bg};
+            border: 1px solid {border};
+            padding: 10px;
+            text-align: left;
+            font-weight: 800;
+            color: {text};
+        }}
+        .stats-summary-table td:nth-child(1) {{
+            width: 65%;
+        }}
+        .stats-summary-table td:nth-child(2),
+        .stats-summary-table td:nth-child(3) {{
+            width: 17.5%;
+            white-space: nowrap;
+        }}
+        </style>
+        <table class="stats-summary-table">
+            <thead>
+                <tr>
+                    <th>Metric</th>
+                    <th>Count</th>
+                    <th>Percentage</th>
+                </tr>
+            </thead>
+            <tbody>
+                {''.join(body)}
+            </tbody>
+        </table>
+        """,
+        unsafe_allow_html=True,
+    )
+
+
+def tab_stats() -> None:
+    st.subheader("Stats")
+    st.caption(
+        "Handled, not-handled, unresolved subtype, and overall customer experience counts "
+        "for the current evaluated journeys."
+    )
+    if not _has_results():
+        st.info("Run an evaluation first.")
+        return
+
+    conv_df = _conv_dataframe_from_results()
+    if conv_df.empty:
+        st.info("No journeys to summarize.")
+        return
+
+    rows = _stats_summary_rows(conv_df)
+    _render_stats_summary_table(rows)
+
+    stats_df = pd.DataFrame(
+        [
+            {k: v for k, v in row.items() if not k.startswith("_")}
+            for row in rows
+        ]
+    )
+    st.download_button(
+        "Download stats CSV",
+        data=stats_df.to_csv(index=False).encode("utf-8-sig"),
+        file_name="cx_stats_summary.csv",
+        mime="text/csv",
+    )
+
 
 def tab_overview() -> None:
     st.subheader("Overview")
@@ -3537,6 +3704,30 @@ def tab_review() -> None:
                 mask = mask | filtered_df[col].fillna("").astype(str).str.lower().str.contains(search_text, regex=False)
         filtered_df = filtered_df[mask]
 
+    order_choice = st.radio(
+        "Journey order",
+        ["Current order", "Worst score first", "Best score first"],
+        horizontal=True,
+        key="review_score_order",
+        help="Use the final conversation score to browse from worst to best, or best to worst.",
+    )
+    if order_choice != "Current order":
+        if "score_final" not in filtered_df.columns:
+            st.caption("No final conversation score is available for this run.")
+        else:
+            filtered_df = (
+                filtered_df.assign(
+                    _score_sort=pd.to_numeric(filtered_df["score_final"], errors="coerce")
+                )
+                .sort_values(
+                    "_score_sort",
+                    ascending=(order_choice == "Worst score first"),
+                    na_position="last",
+                    kind="stable",
+                )
+                .drop(columns=["_score_sort"])
+            )
+
     if filtered_df.empty:
         st.warning("No customer journeys match the current filters.")
         return
@@ -3571,7 +3762,10 @@ def tab_review() -> None:
         phone = row.get("customer_phone") or cid
         source_count = row.get("source_conversation_count") or "—"
         result = f"{humanize_label(row.get('handled_status')) or 'Unknown'} / {humanize_label(row.get('customer_experience')) or 'Unknown'}"
+        score = pd.to_numeric(pd.Series([row.get("score_final")]), errors="coerce").iloc[0]
+        score_label = f"Score {score:.0f}" if pd.notna(score) else "No score"
         label = f"{phone} • {cust} • {source_count} source convs • {result}"
+        label = f"{score_label} - {label}"
         if label in label_to_id:
             label = f"{label} - {cid[:8]}"
         options.append(label)
@@ -4013,6 +4207,7 @@ def main() -> None:
             "Prompts",
             "Run Evaluation",
             "Overview",
+            "Stats",
             "Dashboard",
             "Journey Review",
             "Exports",
@@ -4028,12 +4223,14 @@ def main() -> None:
     with tabs[3]:
         tab_overview()
     with tabs[4]:
-        tab_dashboard()
+        tab_stats()
     with tabs[5]:
-        tab_review()
+        tab_dashboard()
     with tabs[6]:
-        tab_exports()
+        tab_review()
     with tabs[7]:
+        tab_exports()
+    with tabs[8]:
         tab_debug()
 
 
