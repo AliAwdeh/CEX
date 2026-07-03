@@ -150,13 +150,23 @@ def _score_color(value: Any, rating: str | None = None) -> str:
         num = float(value)
     except (TypeError, ValueError):
         return "#6b7280"
-    if num >= 90:
+    if num > 10:
+        if num >= 90:
+            return "#16a34a"
+        if num >= 75:
+            return "#65a30d"
+        if num >= 60:
+            return "#d97706"
+        if num >= 40:
+            return "#dc2626"
+        return "#7f1d1d"
+    if num >= 9:
         return "#16a34a"
-    if num >= 75:
+    if num >= 7.5:
         return "#65a30d"
-    if num >= 60:
+    if num >= 6:
         return "#d97706"
-    if num >= 40:
+    if num >= 4:
         return "#dc2626"
     return "#7f1d1d"
 
@@ -167,8 +177,11 @@ def _has_real_conversation_score(score: dict) -> bool:
         score.get("context_understanding_score"),
         score.get("customer_effort_score"),
         score.get("trust_frustration_risk_score", score.get("frustration_risk_score")),
+        score.get("ai_judgment_score"),
+        score.get("message_signal_score"),
         score.get("raw_total_score"),
         score.get("final_score"),
+        score.get("final_score_100"),
     ]
     if not any(v not in (None, "", "none", "None") for v in values):
         return False
@@ -183,7 +196,45 @@ def _has_real_conversation_score(score: dict) -> bool:
         except (TypeError, ValueError):
             all_zero = False
             break
-    return not (all_zero and not str(score.get("score_explanation", "") or "").strip())
+    is_new_score = any(
+        key in score
+        for key in ("ai_judgment_score", "message_signal_score", "final_score_100", "score_version")
+    )
+    return not (all_zero and not is_new_score and not str(score.get("score_explanation", "") or "").strip())
+
+
+def _format_score_number(value: Any) -> str:
+    try:
+        num = float(value)
+    except (TypeError, ValueError):
+        return "-"
+    if num.is_integer():
+        return str(int(num))
+    return f"{num:.1f}"
+
+
+def _format_rate(value: Any) -> str:
+    try:
+        num = float(value)
+    except (TypeError, ValueError):
+        return "-"
+    return f"{num:.0%}" if num in {0.0, 1.0} else f"{num:.1%}"
+
+
+def _render_score_trace_box(title: str, body_html: str, border_color: str = "#334155") -> None:
+    st.markdown(
+        f"""
+        <div style="margin:10px 0; padding:14px 16px; border-radius:10px; background:#111827; border:1px solid {border_color};">
+          <div style="font-size:0.82rem; color:#cbd5e1; font-weight:800; text-transform:uppercase; letter-spacing:0.04em; margin-bottom:8px;">
+            {html.escape(title)}
+          </div>
+          <div style="font-size:0.92rem; color:#e5e7eb; line-height:1.5;">
+            {body_html}
+          </div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
 
 
 def metric_row(metrics: list[tuple[str, Any, str | None]]) -> None:
@@ -576,7 +627,6 @@ def render_message_evaluation_panel(message_result: dict) -> None:
         badges.append(_badge("Issue", humanize_label(pj["issue_type"]), "#b91c1c"))
     if pj.get("issue_origin") and pj["issue_origin"] != "none":
         badges.append(_badge("Origin", humanize_label(pj["issue_origin"]), "#475569"))
-
     st.markdown("".join(badges), unsafe_allow_html=True)
 
     if idx is not None:
@@ -626,6 +676,10 @@ def render_conversation_summary_card(
     subtype = pj.get("unhandled_resolution_subtype", "")
     sentiment = pj.get("final_customer_sentiment", "unknown")
     max_fl = pj.get("max_frustration_level", "none")
+    culprits = pj.get("culprits") or []
+    if not isinstance(culprits, list):
+        culprits = []
+    culprit_reason = pj.get("culprit_reason") or ""
     main = pj.get("main_issue") or {}
     score = pj.get("conversation_score") or {}
     if not isinstance(score, dict):
@@ -677,6 +731,8 @@ def render_conversation_summary_card(
         badges.append(_badge("Unresolved status", subtype_display, "#475569"))
     badges.append(_badge("Customer feeling at end", humanize_label(sentiment), _SENTIMENT_COLORS.get(sentiment, "#6b7280")))
     badges.append(_badge("Highest frustration level", humanize_label(max_fl), _FRUSTRATION_COLORS.get(max_fl, "#6b7280")))
+    if culprits:
+        badges.append(_badge("Culprits", ", ".join(humanize_label(c) for c in culprits), "#7c3aed"))
     if pj.get("manual_review_required"):
         badges.append(_badge("Needs human review", "yes", "#dc2626"))
     badges.append(_badge("Confidence", pj.get("confidence", "—"), "#475569"))
@@ -684,9 +740,13 @@ def render_conversation_summary_card(
 
     if score:
         final_score = score.get("final_score")
+        final_score_100 = score.get("final_score_100")
         raw_total = score.get("raw_total_score")
+        ai_judgment_score = score.get("ai_judgment_score")
+        message_signal_score = score.get("message_signal_score")
         rating = score.get("score_rating") or "-"
         score_color = _score_color(final_score, rating)
+        score_version = str(score.get("score_version") or "")
         st.markdown(
             f"""
             <div style="margin:14px 0 10px 0; padding:14px 18px; border-radius:10px;
@@ -695,32 +755,141 @@ def render_conversation_summary_card(
                 Conversation score
               </div>
               <div style="display:flex; align-items:baseline; gap:10px; margin-top:4px;">
-                <span style="font-size:2.1rem; font-weight:900; color:{score_color};">{html.escape(_format_score(final_score, 100))}</span>
+                <span style="font-size:2.1rem; font-weight:900; color:{score_color};">{html.escape(_format_score(final_score, 10))}</span>
                 <span style="font-size:1rem; color:#e5e7eb; font-weight:800;">{html.escape(str(rating))}</span>
+              </div>
+              <div style="font-size:0.82rem; color:#cbd5e1; margin-top:4px;">
+                100-scale view: {html.escape(_format_score(final_score_100, 100))}
               </div>
             </div>
             """,
             unsafe_allow_html=True,
         )
-        metric_row(
-            [
-                ("Resolution", _format_score(score.get("resolution_score"), 20), None),
-                ("Context & Understanding", _format_score(score.get("context_understanding_score"), 20), None),
-                ("Customer Effort", _format_score(score.get("customer_effort_score"), 20), None),
-                (
-                    "Frustration & Risk",
-                    _format_score(
-                        score.get("trust_frustration_risk_score", score.get("frustration_risk_score")),
-                        40,
+        if score_version == "v2":
+            with st.expander("See full score breakdown", expanded=False):
+                left_col, right_col = st.columns(2)
+                with left_col:
+                    metric_row(
+                        [
+                            ("Resolution", _format_score(score.get("resolution_score"), 10), None),
+                            ("Context & Understanding", _format_score(score.get("context_understanding_score"), 10), None),
+                            ("Customer Effort", _format_score(score.get("customer_effort_score"), 10), None),
+                            (
+                                "Trust & Risk",
+                                _format_score(
+                                    score.get("trust_frustration_risk_score", score.get("frustration_risk_score")),
+                                    10,
+                                ),
+                                None,
+                            ),
+                        ]
+                    )
+                    _render_score_trace_box(
+                        "Conversation-Level AI Branch",
+                        (
+                            f"<div>AI judgment score = "
+                            f"({html.escape(_format_score_number(score.get('resolution_score')))} + "
+                            f"{html.escape(_format_score_number(score.get('context_understanding_score')))} + "
+                            f"{html.escape(_format_score_number(score.get('customer_effort_score')))} + "
+                            f"{html.escape(_format_score_number(score.get('trust_frustration_risk_score', score.get('frustration_risk_score'))))}) / 4"
+                            f"</div>"
+                            f"<div style=\"margin-top:6px; font-weight:800; color:#f8fafc;\">"
+                            f"AI judgment score = {html.escape(_format_score(ai_judgment_score, 10))}"
+                            f"</div>"
+                        ),
+                        "#2563eb",
+                    )
+                with right_col:
+                    summary = cm.get("message_level_summary") or {}
+                    signal_trace = summary.get("message_signal_trace") or {}
+                    rates = signal_trace.get("rates") or {}
+                    weights = signal_trace.get("weights") or {}
+                    weighted_components = signal_trace.get("weighted_components") or {}
+                    burden = signal_trace.get("burden")
+                    rate_rows = [
+                        ("Major issue rate", "major_issue_rate", False),
+                        ("Minor issue rate", "minor_issue_rate", False),
+                        ("Unresolved rate", "unresolved_rate", False),
+                        ("Repetition rate", "repetition_rate", False),
+                        ("Recovery rate", "recovery_rate", True),
+                    ]
+                    rate_lines = []
+                    for label, key, is_positive in rate_rows:
+                        rate_value = rates.get(key, 0)
+                        weight_value = weights.get(key, 0)
+                        component_key = f"{key}_credit" if key == "recovery_rate" else key
+                        component_value = weighted_components.get(component_key, 0)
+                        prefix = "+" if is_positive else "-"
+                        color_style = "color:#86efac;" if is_positive else ""
+                        rate_lines.append(
+                            f"<div style=\"{color_style}\">"
+                            f"{prefix} {html.escape(label)}: "
+                            f"{html.escape(_format_rate(rate_value))} "
+                            f"(weight {html.escape(_format_score_number(weight_value))}, "
+                            f"impact {html.escape(_format_score_number(component_value))})"
+                            f"</div>"
+                        )
+                    _render_score_trace_box(
+                        "Message-Level Code Branch",
+                        (
+                            f"<div>Message-level scoring uses rates, not raw counts.</div>"
+                            f"<div style=\"margin-top:8px;\">Evaluated messages: {html.escape(str(summary.get('evaluated_message_count', 0)))}</div>"
+                            f"<div>Red flags: {html.escape(str(summary.get('issue_count', 0)))} "
+                            f"(major {html.escape(str(summary.get('major_issue_count', 0)))}, minor {html.escape(str(summary.get('minor_issue_count', 0)))})</div>"
+                            f"<div>Recovered: {html.escape(str(summary.get('recovered_issue_count', 0)))}, unresolved: {html.escape(str(summary.get('unresolved_issue_count', 0)))}</div>"
+                            f"<div style=\"margin-top:8px;\">{''.join(rate_lines)}</div>"
+                            f"<div style=\"margin-top:8px;\">Burden = major + minor + unresolved + repetition - recovery</div>"
+                            f"<div>Burden = {html.escape(_format_score_number(burden))}</div>"
+                            f"<div>Message signal score = 10 × (1 - burden)</div>"
+                            f"<div style=\"margin-top:6px; font-weight:800; color:#f8fafc;\">"
+                            f"Message signal score = {html.escape(_format_score(message_signal_score, 10))}"
+                            f"</div>"
+                        ),
+                        "#7c3aed",
+                    )
+                    _render_score_trace_box(
+                        "Final Combination",
+                        (
+                            f"<div>Final score = "
+                            f"({html.escape(_format_score(ai_judgment_score, 10))} + "
+                            f"{html.escape(_format_score(message_signal_score, 10))}) / 2"
+                            f"</div>"
+                            f"<div style=\"margin-top:6px; font-weight:800; color:#f8fafc;\">"
+                            f"Final score = {html.escape(_format_score(final_score, 10))}"
+                            f" = {html.escape(_format_score(final_score_100, 100))}"
+                            f"</div>"
+                        ),
+                        score_color,
+                    )
+                st.caption(
+                    "The four subscores belong to the conversation-level AI branch. "
+                    "`AI judgment score` is their average. `Message signal score` is a separate code-based branch."
+                )
+        else:
+            metric_row(
+                [
+                    ("Resolution", _format_score(score.get("resolution_score"), 20), None),
+                    ("Context & Understanding", _format_score(score.get("context_understanding_score"), 20), None),
+                    ("Customer Effort", _format_score(score.get("customer_effort_score"), 20), None),
+                    (
+                        "Frustration & Risk",
+                        _format_score(
+                            score.get("trust_frustration_risk_score", score.get("frustration_risk_score")),
+                            40,
+                        ),
+                        None,
                     ),
-                    None,
-                ),
-                ("Raw total", _format_score(raw_total, 100), None),
-            ]
-        )
-        if score.get("score_explanation"):
-            st.markdown("**Why this score was assigned**")
-            st.write(score.get("score_explanation"))
+                    ("Raw total", _format_score(raw_total, 100), None),
+                ]
+            )
+        if score.get("score_explanation") or culprit_reason:
+            with st.expander("Score and culprit note", expanded=False):
+                if score.get("score_explanation"):
+                    st.markdown("**Why this score was assigned**")
+                    st.write(score.get("score_explanation"))
+                if culprit_reason:
+                    st.markdown("**Culprit reasoning**")
+                    st.write(culprit_reason)
 
     cols = st.columns([1, 1, 1])
     with cols[0]:

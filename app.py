@@ -33,7 +33,13 @@ from data_loader import (
     validate_csv,
 )
 from db import DEFAULT_DB_PATH, Database
-from evaluator import RunConfig, RunResults, run_evaluation, validate_conversation_level_result
+from evaluator import (
+    RunConfig,
+    RunResults,
+    run_conversation_level_only,
+    run_evaluation,
+    validate_conversation_level_result,
+)
 from prompts import (
     DEFAULT_CONVERSATION_LEVEL_PROMPT,
     DEFAULT_MESSAGE_LEVEL_PROMPT,
@@ -468,6 +474,237 @@ def _normalize_run_results_for_display(rr: RunResults) -> RunResults:
     return rr
 
 
+def _render_last_run_summary() -> None:
+    if not _has_results():
+        return
+    rr = st.session_state.run_results
+    st.markdown("### Last run")
+    metric_row(
+        [
+            ("Customer journeys", f"{len(rr.conversation_results):,}", None),
+            ("Message calls", f"{len(rr.message_level_results):,}", None),
+            ("Errors", f"{len(rr.errors):,}", None),
+            ("Duration (s)", f"{(rr.finished_at or 0) - (rr.started_at or 0):.1f}", None),
+        ]
+    )
+
+    if rr.errors:
+        with st.expander(f"View {len(rr.errors)} non-fatal errors"):
+            st.dataframe(pd.DataFrame(rr.errors), use_container_width=True)
+
+
+def _execute_conversation_only_run(
+    df: pd.DataFrame | None,
+    progress_box,
+    bar,
+    counter_box,
+    current_box,
+) -> None:
+    source_results = st.session_state.run_results
+    source_message_results = list(getattr(source_results, "message_level_results", []) or [])
+    source_conversation_results = list(getattr(source_results, "conversation_results", []) or [])
+    if not source_message_results:
+        progress_box.error("Conversation-only run needs loaded message-level results first.")
+        return
+
+    st.session_state.run_in_progress = True
+    st.session_state.cancel_flag = False
+    st.session_state.progress_log = []
+
+    config, _, cl_prompt_id = _build_run_config()
+    client = build_client(config.api.base_url, config.api.api_key)
+    source_run_id = st.session_state.current_run_id
+
+    db = get_active_db()
+    source_run = db.get_run(source_run_id) if source_run_id else None
+    run_config_serializable = {
+        "api_base_url": config.api.base_url,
+        "model": config.api.model,
+        "temperature": config.api.temperature,
+        "top_p": config.api.top_p,
+        "max_tokens": config.api.max_tokens,
+        "timeout": config.api.timeout,
+        "retries": config.api.retries,
+        "concurrency": config.api.concurrency,
+        "run_all_conversations": bool(st.session_state.get("run_all_conversations")),
+        "max_conversations": config.max_conversations,
+        "max_target_messages_per_journey": config.max_agent_messages_per_conv,
+        "truncate_messages": config.truncate_messages,
+        "max_chars_per_message": config.max_chars_per_message,
+        "include_unknown_in_history": config.include_unknown_in_history,
+        "stop_on_error": config.stop_on_error,
+        "save_raw_responses": config.save_raw_responses,
+        "message_target_role": config.message_target_role,
+        "selected_conversation_ids": config.selected_conversation_ids,
+        "selected_conversation_count": len(config.selected_conversation_ids or []),
+        "run_name": (st.session_state.run_name or "").strip(),
+        "conversation_level_only": True,
+        "message_level_source_run_id": source_run_id,
+        "reused_message_level_results": len(source_message_results),
+        "used_loaded_run_without_csv": bool(df is None or df.empty),
+    }
+    run_name = (st.session_state.run_name or "").strip() or None
+    run_id = db.start_run(
+        csv_name=st.session_state.csv_name or (source_run or {}).get("csv_name"),
+        run_config=run_config_serializable,
+        message_prompt_id=None,
+        conversation_prompt_id=cl_prompt_id,
+        name=run_name,
+    )
+    st.session_state.current_run_id = run_id
+    st.session_state.loaded_run_label = None
+
+    selected_ids_set = set(map(str, config.selected_conversation_ids or []))
+    if df is not None and not df.empty:
+        if selected_ids_set:
+            df_for_estimate = df[df[JOURNEY_ID_COLUMN].astype(str).isin(selected_ids_set)]
+            total_conv = int(df_for_estimate[JOURNEY_ID_COLUMN].astype(str).nunique())
+        else:
+            total_conv = (
+                int(df[JOURNEY_ID_COLUMN].astype(str).nunique())
+                if config.max_conversations is None
+                else min(int(config.max_conversations), int(df[JOURNEY_ID_COLUMN].astype(str).nunique()))
+            )
+    else:
+        loaded_ids = [
+            str(cr.get("conversation_id") or cr.get("thread_id") or "")
+            for cr in source_conversation_results
+            if str(cr.get("conversation_id") or cr.get("thread_id") or "").strip()
+        ]
+        if selected_ids_set:
+            total_conv = sum(1 for conversation_id in loaded_ids if conversation_id in selected_ids_set)
+        else:
+            total_conv = len(loaded_ids)
+            if config.max_conversations is not None:
+                total_conv = min(total_conv, int(config.max_conversations))
+
+    total_calls = total_conv
+    progress_state = {"convs_done": 0, "calls_done": 0, "successes": 0, "failures": 0}
+
+    def on_progress(evt: dict) -> None:
+        nonlocal total_conv, total_calls
+        phase = evt.get("phase")
+        if phase == "start":
+            total_conv = int(evt.get("total_conversations") or total_conv or 0)
+            total_calls = total_conv
+        elif phase == "conversation_start":
+            current_box.info(
+                f"Journey {evt.get('conversation_index')}/{evt.get('total_conversations')} â€” "
+                f"Customer `{evt.get('conversation_id')}` â€” "
+                f"{evt.get('target_messages', 0)} reused message evals"
+            )
+        elif phase == "conversation_done":
+            progress_state["convs_done"] += 1
+            progress_state["calls_done"] += 1
+            if evt.get("status") == "ok":
+                progress_state["successes"] += 1
+            else:
+                progress_state["failures"] += 1
+
+        frac = min(progress_state["calls_done"] / max(total_calls, 1), 1.0) if total_calls > 0 else 0.0
+        bar.progress(
+            frac,
+            text=f"Journeys {progress_state['convs_done']}/{total_conv} â€¢ Calls {progress_state['calls_done']}/{total_calls}",
+        )
+        counter_box.markdown(
+            f"**Successes:** {progress_state['successes']}  |  **Failures:** {progress_state['failures']}"
+        )
+        st.session_state.progress_log.append(evt)
+
+    def cancel_requested() -> bool:
+        return bool(st.session_state.cancel_flag)
+
+    persistence_errors: list[str] = []
+
+    def save_message(mr: dict) -> None:
+        try:
+            mr["run_id"] = run_id
+            db.save_message_result(run_id, mr)
+        except Exception as e:
+            persistence_errors.append(f"message result: {e}")
+
+    def save_conversation(cr: dict) -> None:
+        try:
+            cr["run_id"] = run_id
+            db.save_conversation_result(run_id, cr)
+        except Exception as e:
+            persistence_errors.append(f"conversation result: {e}")
+
+    def save_err(err: dict) -> None:
+        try:
+            db.save_error(run_id, err)
+        except Exception as e:
+            persistence_errors.append(f"run error: {e}")
+
+    def persist_completed_results() -> None:
+        if results is None:
+            return
+        counts = _run_result_counts(db, run_id)
+        expected_convs = len(results.conversation_results)
+        expected_msgs = len(results.message_level_results)
+        expected_errors = len(results.errors)
+        if (
+            counts["conversation_results"] == expected_convs
+            and counts["message_results"] == expected_msgs
+            and counts["run_errors"] == expected_errors
+        ):
+            return
+        _clear_run_results(db, run_id)
+        for mr in results.message_level_results:
+            mr["run_id"] = run_id
+            db.save_message_result(run_id, mr)
+        for cr in results.conversation_results:
+            cr["run_id"] = run_id
+            db.save_conversation_result(run_id, cr)
+        for err in results.errors:
+            db.save_error(run_id, err)
+
+    results = None
+    try:
+        progress_box.info("Starting conversation-level-only evaluation...")
+        results = run_conversation_level_only(
+            df=df,
+            existing_message_level_results=source_message_results,
+            existing_conversation_results=source_conversation_results,
+            client=client,
+            config=config,
+            on_progress=on_progress,
+            cancel_requested=cancel_requested,
+            on_message_result=save_message,
+            on_conversation_result=save_conversation,
+            on_error=save_err,
+        )
+        st.session_state.run_results = results
+        persist_completed_results()
+        progress_box.success(
+            f"Conversation-only evaluation finished. {len(results.conversation_results)} customer journeys processed, "
+            f"{len(results.message_level_results)} reused message results, "
+            f"{len(results.errors)} errors. Saved as run #{run_id}."
+        )
+        if persistence_errors:
+            st.warning(
+                "Some live DB saves failed during the run, but the completed results were saved again at the end. "
+                f"First error: {persistence_errors[0]}"
+            )
+    except Exception as e:
+        progress_box.error(f"Conversation-only evaluation failed: {e}")
+    finally:
+        try:
+            status = "completed"
+            if st.session_state.cancel_flag:
+                status = "cancelled"
+            elif results is None:
+                status = "failed"
+            n_convs = len(results.conversation_results) if results else 0
+            n_msgs = len(results.message_level_results) if results else 0
+            n_err = len(results.errors) if results else 0
+            db.finish_run(run_id, status, n_convs, n_msgs, n_err)
+        except Exception:
+            pass
+        st.session_state.run_in_progress = False
+        st.session_state.cancel_flag = False
+
+
 def _conv_dataframe_from_results() -> pd.DataFrame:
     rr = st.session_state.run_results
     if not rr:
@@ -772,10 +1009,15 @@ def _display_column_name(column: str) -> str:
         "score_context_understanding": "Context & Understanding score",
         "score_customer_effort": "Customer Effort score",
         "score_frustration_risk": "Frustration & Risk score",
+        "score_ai_judgment": "AI judgment score",
+        "score_message_signals": "Message signal score",
         "score_raw_total": "Raw conversation score",
         "score_final": "Final conversation score",
+        "score_final_100": "Final conversation score (100 view)",
         "score_rating": "Score rating",
         "score_explanation": "Score explanation",
+        "culprits": "Culprits",
+        "culprit_reason": "Culprit reasoning",
         "main_issue_type": "Main problem type",
         "main_issue_origin": "Where the main problem came from",
         "main_issue_summary": "Main problem summary",
@@ -1852,8 +2094,65 @@ def tab_run() -> None:
                         st.error(f"Could not delete run: {e}")
 
     df = st.session_state.df_norm
+    conversation_only_available = bool(
+        st.session_state.run_results
+        and getattr(st.session_state.run_results, "message_level_results", [])
+    )
     if df is None or df.empty:
-        st.info("Upload a valid CSV in the Upload & Settings tab first.")
+        if not conversation_only_available:
+            st.info("Upload a valid CSV in the Upload & Settings tab first.")
+            return
+
+        st.info("No CSV is loaded. Full CX evaluation is unavailable, but you can rerun conversation-level from the loaded run.")
+
+        if not st.session_state.selected_model:
+            st.warning(
+                "Select a model from the sidebar before running. "
+                "Click 'Load available models' to populate the list."
+            )
+
+        st.text_input(
+            "Run name",
+            key="run_name",
+            placeholder="e.g., June renewal journeys - conversation-only rerun",
+            help="Saved with this run and shown in Past runs.",
+        )
+
+        run_col, convo_only_col, cancel_col, _ = st.columns([1, 1, 1, 3])
+        with run_col:
+            st.button(
+                "Run CX Evaluation",
+                disabled=True,
+                use_container_width=True,
+                help="Upload a CSV first to run the full message-level + conversation-level pipeline.",
+            )
+        with convo_only_col:
+            convo_only_clicked = st.button(
+                "Run Conversation Only",
+                disabled=st.session_state.run_in_progress or not st.session_state.selected_model,
+                use_container_width=True,
+            )
+        with cancel_col:
+            if st.session_state.run_in_progress:
+                if st.button("Cancel run", use_container_width=True):
+                    st.session_state.cancel_flag = True
+                    st.toast("Cancelling after current call finishes...")
+
+        progress_box = st.empty()
+        bar = st.progress(0, text="Idle")
+        counter_box = st.empty()
+        current_box = st.empty()
+
+        if convo_only_clicked:
+            _execute_conversation_only_run(
+                df=None,
+                progress_box=progress_box,
+                bar=bar,
+                counter_box=counter_box,
+                current_box=current_box,
+            )
+
+        _render_last_run_summary()
         return
 
     if not st.session_state.selected_model:
@@ -2209,7 +2508,7 @@ def tab_run() -> None:
             + scope_hint
         )
 
-    run_col, cancel_col, _ = st.columns([1, 1, 4])
+    run_col, convo_only_col, cancel_col, _ = st.columns([1, 1, 1, 3])
     with run_col:
         run_clicked = st.button(
             "Run CX Evaluation",
@@ -2217,11 +2516,23 @@ def tab_run() -> None:
             disabled=st.session_state.run_in_progress or not st.session_state.selected_model,
             use_container_width=True,
         )
+    with convo_only_col:
+        convo_only_clicked = st.button(
+            "Run Conversation Only",
+            disabled=(
+                st.session_state.run_in_progress
+                or not st.session_state.selected_model
+                or not conversation_only_available
+            ),
+            use_container_width=True,
+        )
     with cancel_col:
         if st.session_state.run_in_progress:
             if st.button("Cancel run", use_container_width=True):
                 st.session_state.cancel_flag = True
                 st.toast("Cancelling after current call finishes...")
+    if not conversation_only_available:
+        st.caption("Load or run message-level results first to enable conversation-only reruns.")
 
     progress_box = st.empty()
     bar = st.progress(0, text="Idle")
@@ -2403,21 +2714,16 @@ def tab_run() -> None:
             st.session_state.run_in_progress = False
             st.session_state.cancel_flag = False
 
-    if _has_results():
-        rr = st.session_state.run_results
-        st.markdown("### Last run")
-        metric_row(
-            [
-                ("Customer journeys", f"{len(rr.conversation_results):,}", None),
-                ("Message calls", f"{len(rr.message_level_results):,}", None),
-                ("Errors", f"{len(rr.errors):,}", None),
-                ("Duration (s)", f"{(rr.finished_at or 0) - (rr.started_at or 0):.1f}", None),
-            ]
+    if convo_only_clicked:
+        _execute_conversation_only_run(
+            df=df,
+            progress_box=progress_box,
+            bar=bar,
+            counter_box=counter_box,
+            current_box=current_box,
         )
 
-        if rr.errors:
-            with st.expander(f"View {len(rr.errors)} non-fatal errors"):
-                st.dataframe(pd.DataFrame(rr.errors), use_container_width=True)
+    _render_last_run_summary()
 
 
 # --------- Tab: Dashboard ---------
@@ -3766,7 +4072,10 @@ def tab_review() -> None:
         source_count = row.get("source_conversation_count") or "—"
         result = f"{humanize_label(row.get('handled_status')) or 'Unknown'} / {humanize_label(row.get('customer_experience')) or 'Unknown'}"
         score = pd.to_numeric(pd.Series([row.get("score_final")]), errors="coerce").iloc[0]
-        score_label = f"Score {score:.0f}" if pd.notna(score) else "No score"
+        score_label = (
+            f"Score {score:.1f}" if pd.notna(score) and float(score) <= 10 else
+            (f"Score {score:.0f}" if pd.notna(score) else "No score")
+        )
         label = f"{phone} • {cust} • {source_count} source convs • {result}"
         label = f"{score_label} - {label}"
         if label in label_to_id:

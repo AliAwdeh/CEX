@@ -44,8 +44,11 @@ def _flatten_conversation_score(score: Any) -> dict[str, Any]:
         score.get("context_understanding_score"),
         score.get("customer_effort_score"),
         score.get("trust_frustration_risk_score", score.get("frustration_risk_score")),
+        score.get("ai_judgment_score"),
+        score.get("message_signal_score"),
         score.get("raw_total_score"),
         score.get("final_score"),
+        score.get("final_score_100"),
     ]
     has_real_score = any(v not in (None, "", "none", "None") for v in score_values)
     if not has_real_score:
@@ -62,7 +65,11 @@ def _flatten_conversation_score(score: Any) -> dict[str, Any]:
         except (TypeError, ValueError):
             all_zero = False
             break
-    if all_zero and not str(score.get("score_explanation", "") or "").strip():
+    is_new_score = any(
+        key in score
+        for key in ("ai_judgment_score", "message_signal_score", "final_score_100", "score_version")
+    )
+    if all_zero and not is_new_score and not str(score.get("score_explanation", "") or "").strip():
         return {}
 
     return {
@@ -73,8 +80,11 @@ def _flatten_conversation_score(score: Any) -> dict[str, Any]:
             "trust_frustration_risk_score",
             score.get("frustration_risk_score"),
         ),
+        "score_ai_judgment": score.get("ai_judgment_score"),
+        "score_message_signals": score.get("message_signal_score"),
         "score_raw_total": score.get("raw_total_score"),
         "score_final": score.get("final_score"),
+        "score_final_100": score.get("final_score_100"),
         "score_rating": score.get("score_rating"),
         "score_explanation": score.get("score_explanation"),
     }
@@ -82,6 +92,131 @@ def _flatten_conversation_score(score: Any) -> dict[str, Any]:
 
 def _norm_text(value: Any) -> str:
     return str(value or "").strip().lower().replace(" ", "_").replace("-", "_")
+
+
+def _sender_entity(record: dict | None) -> str:
+    if not isinstance(record, dict):
+        return "unknown"
+    raw_role = _norm_text(record.get("raw_sender_role"))
+    if raw_role == "system":
+        return "broadcast"
+    if raw_role in {"bot", "assistant"}:
+        return "bot"
+    if raw_role == "agent":
+        return "agent"
+    sender_role = _norm_text(record.get("sender_role"))
+    if sender_role in {"customer", "agent"}:
+        return sender_role
+    return "unknown"
+
+
+def _build_message_level_summary(message_evaluations: list[dict], message_records: list[dict]) -> dict:
+    records_by_idx: dict[Any, dict] = {}
+    for record in message_records or []:
+        idx = record.get("message_index")
+        if idx is not None:
+            records_by_idx[idx] = record
+
+    valid_evals = [e for e in message_evaluations if e.get("parse_status") == "ok" and e.get("parsed_json")]
+    parsed = [e["parsed_json"] for e in valid_evals]
+
+    effect_counter = Counter(p.get("message_level_effect", "neutral") for p in parsed)
+    type_counter = Counter(p.get("issue_type", "none") for p in parsed)
+    origin_counter = Counter(p.get("issue_origin", "none") for p in parsed)
+    entity_counter: Counter[str] = Counter()
+    issue_entity_counter: Counter[str] = Counter()
+    major_entity_counter: Counter[str] = Counter()
+
+    for evaluation in valid_evals:
+        parsed_json = evaluation["parsed_json"]
+        idx = parsed_json.get("message_index", evaluation.get("message_index"))
+        record = records_by_idx.get(idx)
+        entity = _sender_entity(record)
+        entity_counter[entity] += 1
+        if parsed_json.get("message_level_effect") in {"minor_issue", "major_issue"}:
+            issue_entity_counter[entity] += 1
+        if parsed_json.get("message_level_effect") == "major_issue":
+            major_entity_counter[entity] += 1
+
+    issue_count = int(effect_counter.get("minor_issue", 0) + effect_counter.get("major_issue", 0))
+    major_issue_count = int(effect_counter.get("major_issue", 0))
+    minor_issue_count = int(effect_counter.get("minor_issue", 0))
+    recovered_issue_count = int(effect_counter.get("recovered_issue", 0))
+    unresolved_issue_count = max(issue_count - recovered_issue_count, 0)
+    evaluated_message_count = int(len(valid_evals))
+    denominator = max(evaluated_message_count, 1)
+    repetition_count = int(type_counter.get("repetition", 0))
+
+    rates = {
+        "major_issue_rate": round(major_issue_count / denominator, 4),
+        "minor_issue_rate": round(minor_issue_count / denominator, 4),
+        "unresolved_rate": round(unresolved_issue_count / denominator, 4),
+        "repetition_rate": round(repetition_count / denominator, 4),
+        "recovery_rate": round(recovered_issue_count / denominator, 4),
+    }
+    weights = {
+        "major_issue_rate": 0.35,
+        "minor_issue_rate": 0.20,
+        "unresolved_rate": 0.25,
+        "repetition_rate": 0.10,
+        "recovery_rate": 0.10,
+    }
+    weighted_components = {
+        "major_issue_rate": round(weights["major_issue_rate"] * rates["major_issue_rate"], 4),
+        "minor_issue_rate": round(weights["minor_issue_rate"] * rates["minor_issue_rate"], 4),
+        "unresolved_rate": round(weights["unresolved_rate"] * rates["unresolved_rate"], 4),
+        "repetition_rate": round(weights["repetition_rate"] * rates["repetition_rate"], 4),
+        "recovery_rate_credit": round(weights["recovery_rate"] * rates["recovery_rate"], 4),
+    }
+    burden = (
+        weighted_components["major_issue_rate"]
+        + weighted_components["minor_issue_rate"]
+        + weighted_components["unresolved_rate"]
+        + weighted_components["repetition_rate"]
+        - weighted_components["recovery_rate_credit"]
+    )
+    burden = round(max(0.0, burden), 4)
+    concrete_score = round(max(0.0, min(10.0, 10.0 * (1.0 - burden))), 1)
+
+    summary_parts = [
+        f"{issue_count} red flags",
+        f"{major_issue_count} major",
+        f"{minor_issue_count} minor",
+        f"{recovered_issue_count} recovered",
+        f"{unresolved_issue_count} still unresolved",
+    ]
+    top_issue_types = [
+        issue_type
+        for issue_type, count in type_counter.most_common()
+        if issue_type not in {"none", ""} and count > 0
+    ][:3]
+    if top_issue_types:
+        summary_parts.append(f"top issue types: {', '.join(top_issue_types)}")
+
+    return {
+        "evaluated_message_count": evaluated_message_count,
+        "issue_count": issue_count,
+        "major_issue_count": major_issue_count,
+        "minor_issue_count": minor_issue_count,
+        "recovered_issue_count": recovered_issue_count,
+        "unresolved_issue_count": int(unresolved_issue_count),
+        "effect_counts": dict(effect_counter),
+        "issue_type_counts": dict(type_counter),
+        "issue_origin_counts": dict(origin_counter),
+        "evaluated_sender_entity_counts": dict(entity_counter),
+        "issue_sender_entity_counts": dict(issue_entity_counter),
+        "major_issue_sender_entity_counts": dict(major_entity_counter),
+        "message_signal_score": concrete_score,
+        "message_signal_trace": {
+            "formula_type": "rate_based_v1",
+            "rates": rates,
+            "weights": weights,
+            "weighted_components": weighted_components,
+            "burden": burden,
+            "final_score": concrete_score,
+        },
+        "summary_text": "; ".join(summary_parts),
+    }
 
 
 def _message_result_is_red(message_result: dict) -> bool:
@@ -233,6 +368,7 @@ def compute_metadata(
 
     type_counter = Counter(issue_types)
     origin_counter = Counter(issue_origins)
+    message_summary = _build_message_level_summary(message_evaluations, message_records)
 
     first_frustration_idx: Any = None
     first_major_idx: Any = None
@@ -276,6 +412,8 @@ def compute_metadata(
         "first_major_issue_message_index": first_major_idx,
         "cancellation_risk_detected": bool(cancellation),
         "broadcast_only_red_issue": bool(broadcast_only_red_issue),
+        "message_level_summary": message_summary,
+        "message_signal_score": message_summary.get("message_signal_score"),
     }
 
 
@@ -300,6 +438,9 @@ def flatten_conversation_row(
     main_issue_type = main_issue.get("issue_type", cl.get("main_issue_type"))
     main_issue_summary = main_issue.get("issue_summary", cl.get("main_issue_summary"))
     customer_impact = main_issue.get("customer_impact", cl.get("customer_impact"))
+    culprits = cl.get("culprits") or []
+    if not isinstance(culprits, list):
+        culprits = []
 
     def get_md(*keys: str) -> Any:
         for k in keys:
@@ -363,6 +504,8 @@ def flatten_conversation_row(
         "negative_signals": " | ".join(cl.get("negative_signals", []) or []),
         "classification_reason": cl.get("classification_reason"),
         "management_summary": cl.get("management_summary"),
+        "culprits": " | ".join(str(c) for c in culprits if c),
+        "culprit_reason": cl.get("culprit_reason"),
         "recommended_actions": " | ".join(cl.get("recommended_actions", []) or []),
         "manual_review_required": cl.get("manual_review_required"),
         "manual_review_reason": cl.get("manual_review_reason"),
@@ -390,6 +533,7 @@ def flatten_conversation_row(
         "shared_issue_count",
         "cancellation_risk_detected",
         "broadcast_only_red_issue",
+        "message_signal_score",
     ]
     for f in cm_fields:
         row[f] = computed_metadata.get(f)

@@ -1052,6 +1052,19 @@ def build_conversation_level_payload(
             return text[:truncate_chars] + "...[truncated]"
         return text
 
+    def sender_entity(message: dict) -> str:
+        raw_role = str(message.get("raw_sender_role", "") or "").strip().lower()
+        if raw_role == "system":
+            return "broadcast"
+        if raw_role in {"bot", "assistant"}:
+            return "bot"
+        if raw_role == "agent":
+            return "agent"
+        role = str(message.get("sender_role", "") or "").strip().lower()
+        if role in {"customer", "agent"}:
+            return role
+        return "unknown"
+
     # Index evals by message_index so we can attach them inline.
     eval_by_idx: dict[Any, dict] = {}
     for ev in message_level_evaluations or []:
@@ -1077,6 +1090,8 @@ def build_conversation_level_payload(
             "source_conversation_id": m.get("source_conversation_id"),
             "message_time": str(m.get("message_time", "")),
             "sender_role": m.get("sender_role", ""),
+            "raw_sender_role": m.get("raw_sender_role"),
+            "sender_entity": sender_entity(m),
             "message_text": trim(m.get("message_text", "")),
         }
         if msg_idx in eval_by_idx:
@@ -1089,6 +1104,7 @@ def build_conversation_level_payload(
         "full_transcript": transcript_clean,
         "message_level_evaluations": message_level_evaluations,
         "computed_metadata": computed_metadata,
+        "message_level_summary": (computed_metadata or {}).get("message_level_summary", {}),
     }
 
 
@@ -1108,4 +1124,3 @@ def build_conversation_level_user_prompt(
     """Build the user prompt for a conversation-level call."""
     tpl = template or DEFAULT_CONVERSATION_LEVEL_PROMPT
     return tpl.build_user(payload)
-
