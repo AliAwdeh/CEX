@@ -397,6 +397,8 @@ def _render_auth_gate() -> bool:
                     st.session_state.auth_role = "master"
                     st.session_state.auth_reviewer_key_id = None
                     st.session_state.auth_db_path = active_db_path
+                    st.session_state.run_results = None
+                    st.session_state._run_results_db_path = None
                     st.rerun()
         return False
 
@@ -411,6 +413,11 @@ def _render_auth_gate() -> bool:
                 st.session_state.auth_role = "master"
                 st.session_state.auth_reviewer_key_id = None
                 st.session_state.auth_db_path = active_db_path
+                # Force a fresh "load the latest run by date" on every login,
+                # rather than keeping whatever run_results a prior session on
+                # this browser tab happened to leave behind.
+                st.session_state.run_results = None
+                st.session_state._run_results_db_path = None
                 st.rerun()
             else:
                 reviewer_db = db
