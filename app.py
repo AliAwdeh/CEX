@@ -641,8 +641,15 @@ def _fill_saved_run_counts(db: Database, df_runs: pd.DataFrame) -> pd.DataFrame:
     if not needs_counts.any():
         return df_runs
 
+    missing_ids = [int(x) for x in df_runs.loc[needs_counts, "id"].tolist()]
+    if hasattr(db, "get_run_result_counts_bulk"):
+        counts_by_id = db.get_run_result_counts_bulk(missing_ids)
+    else:
+        counts_by_id = {rid: _run_result_counts(db, rid) for rid in missing_ids}
+
+    default_counts = {"conversation_results": 0, "message_results": 0, "run_errors": 0}
     for index, row in df_runs[needs_counts].iterrows():
-        counts = _run_result_counts(db, int(row["id"]))
+        counts = counts_by_id.get(int(row["id"]), default_counts)
         df_runs.at[index, "saved_conversations"] = counts["conversation_results"]
         df_runs.at[index, "saved_message_results"] = counts["message_results"]
         df_runs.at[index, "saved_errors"] = counts["run_errors"]
@@ -830,6 +837,15 @@ def _conv_dataframe_from_results() -> pd.DataFrame:
     rr = st.session_state.run_results
     if not rr:
         return pd.DataFrame()
+    # Rebuilding this table re-validates and flattens every conversation result,
+    # which is expensive for large runs. Streamlit reruns the whole script on
+    # every widget interaction, so cache the result per run object/size and only
+    # recompute when the underlying results actually change (new run loaded, or
+    # more conversations appended during a live run).
+    cache_key = len(rr.conversation_results)
+    cached = st.session_state.get("_conv_df_cache")
+    if cached is not None and cached[0] is rr and cached[1] == cache_key:
+        return cached[2]
     rows = []
     for idx, cr in enumerate(rr.conversation_results):
         cr = _normalize_conversation_result_for_display(cr)
@@ -840,15 +856,23 @@ def _conv_dataframe_from_results() -> pd.DataFrame:
         )
         row["__run_order"] = idx
         rows.append(row)
-    return _normalize_conversation_dataframe_markers(build_conversation_table(rows))
+    df = _normalize_conversation_dataframe_markers(build_conversation_table(rows))
+    st.session_state["_conv_df_cache"] = (rr, cache_key, df)
+    return df
 
 
 def _msg_dataframe_from_results() -> pd.DataFrame:
     rr = st.session_state.run_results
     if not rr:
         return pd.DataFrame()
+    cache_key = len(rr.message_level_results)
+    cached = st.session_state.get("_msg_df_cache")
+    if cached is not None and cached[0] is rr and cached[1] == cache_key:
+        return cached[2]
     rows = [flatten_message_row(m) for m in rr.message_level_results]
-    return build_message_table(rows)
+    df = build_message_table(rows)
+    st.session_state["_msg_df_cache"] = (rr, cache_key, df)
+    return df
 
 
 def _normalize_conversation_dataframe_markers(df: pd.DataFrame) -> pd.DataFrame:
@@ -988,17 +1012,23 @@ def _customer_ids_from_saved_run(db: Database, run_id: int) -> tuple[list[str], 
     if selected_ids:
         return selected_ids, "pinned selection"
 
-    loaded = db.load_run_results(int(run_id))
-    result_ids = [
-        str(c.get("conversation_id") or c.get("thread_id") or "")
-        for c in loaded.get("conversation_results", [])
-    ]
-    result_ids = [x for x in result_ids if x]
+    result_ids = [x for x in db.list_run_conversation_ids(int(run_id)) if x]
     return result_ids, "saved run results"
 
 
 def _journey_selector_rows(df: pd.DataFrame) -> pd.DataFrame:
-    """Build one searchable row per customer journey for run scoping."""
+    """Build one searchable row per customer journey for run scoping.
+
+    Grouping/sorting the full CSV and extracting per-journey metadata is
+    expensive and was previously redone on every rerun of the Run tab (i.e.
+    every widget interaction) even though the uploaded CSV doesn't change in
+    between. Cache by the dataframe's identity + row count so it only
+    recomputes when a new CSV is uploaded.
+    """
+    cache_key = len(df)
+    cached = st.session_state.get("_journey_selector_cache")
+    if cached is not None and cached[0] is df and cached[1] == cache_key:
+        return cached[2]
     rows: list[dict[str, Any]] = []
     for journey_id, group in get_conversation_groups(df):
         md = conversation_metadata_from_group(group)
@@ -1052,7 +1082,9 @@ def _journey_selector_rows(df: pd.DataFrame) -> pd.DataFrame:
                 "search_text": search_text,
             }
         )
-    return pd.DataFrame(rows)
+    result = pd.DataFrame(rows)
+    st.session_state["_journey_selector_cache"] = (df, cache_key, result)
+    return result
 
 
 def _conversation_filters_with_keys(
@@ -5012,7 +5044,8 @@ def tab_review() -> None:
     st.markdown("<div id='review-conversation-start'></div>", unsafe_allow_html=True)
     transcript = target_cr.get("transcript") or []
     msgs = target_cr.get("message_level_results") or []
-    _render_flagged_message_checker(transcript, msgs, target_id)
+    if show_review_details:
+        _render_flagged_message_checker(transcript, msgs, target_id)
     _, chat_col, _ = st.columns([0.15, 9.7, 0.15])
     with chat_col:
         render_conversation_transcript_with_evals(

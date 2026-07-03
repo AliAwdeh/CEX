@@ -845,12 +845,52 @@ class Database:
             "run_errors": int(err["n"] if err else 0),
         }
 
+    def get_run_result_counts_bulk(self, run_ids: Iterable[int]) -> dict[int, dict[str, int]]:
+        """Batched version of :meth:`get_run_result_counts` for many runs at once.
+
+        Avoids issuing 3 queries per run (N+1) when rendering a list of runs.
+        """
+        ids = sorted({int(x) for x in run_ids})
+        result = {
+            rid: {"conversation_results": 0, "message_results": 0, "run_errors": 0}
+            for rid in ids
+        }
+        if not ids:
+            return result
+        placeholders = ",".join("?" * len(ids))
+        for table, key in (
+            ("conversation_results", "conversation_results"),
+            ("message_results", "message_results"),
+            ("run_errors", "run_errors"),
+        ):
+            rows = self._fetchall(
+                f"SELECT run_id, COUNT(*) AS n FROM {table} WHERE run_id IN ({placeholders}) GROUP BY run_id",
+                ids,
+            )
+            for r in rows:
+                result[int(r["run_id"])][key] = int(r["n"])
+        return result
+
     def clear_run_results(self, run_id: int) -> None:
         run_id = int(run_id)
         with self._tx() as c:
             c.execute("DELETE FROM message_results WHERE run_id=?", (run_id,))
             c.execute("DELETE FROM conversation_results WHERE run_id=?", (run_id,))
             c.execute("DELETE FROM run_errors WHERE run_id=?", (run_id,))
+
+    def list_run_conversation_ids(self, run_id: int) -> list[str]:
+        """Return conversation IDs saved for a run without decoding result blobs.
+
+        Used when callers only need the journey scope (e.g. reusing a previous
+        run's selection) and would otherwise pay to JSON-decode every saved
+        transcript/response/debug blob via :meth:`load_run_results` just to
+        throw the decoded content away.
+        """
+        rows = self._fetchall(
+            "SELECT conversation_id FROM conversation_results WHERE run_id=? ORDER BY id ASC",
+            (int(run_id),),
+        )
+        return [str(r["conversation_id"]) for r in rows]
 
     def load_run_results(self, run_id: int) -> dict:
         """Reconstruct the structures the rest of the app uses for a saved run.

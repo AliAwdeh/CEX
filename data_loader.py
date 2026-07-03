@@ -292,8 +292,14 @@ def conversation_metadata_from_group(group: pd.DataFrame) -> dict:
 
 def message_records_from_group(group: pd.DataFrame, conversation_id: str) -> list[dict]:
     """Return message dicts for a customer journey, in appended order."""
+    has_conv_id = "CONVERSATION_ID" in group.columns
+    has_raw_role = "RAW_SENDER_ROLE" in group.columns
+    has_agent_name = "MESSAGE_AGENT_FULL_NAME" in group.columns
     records: list[dict] = []
-    for _, row in group.iterrows():
+    # to_dict("records") avoids the per-row Series construction that makes
+    # iterrows() slow on wide frames, which matters here since this runs once
+    # per customer journey.
+    for row in group.to_dict("records"):
         msg_index = row.get(MESSAGE_ORDER_COLUMN, row.get(LEGACY_MESSAGE_ORDER_COLUMN))
         records.append(
             {
@@ -302,20 +308,20 @@ def message_records_from_group(group: pd.DataFrame, conversation_id: str) -> lis
                 "appended_message_index": int(msg_index) if pd.notna(msg_index) else None,
                 "source_conversation_id": (
                     str(row.get("CONVERSATION_ID"))
-                    if "CONVERSATION_ID" in group.columns and pd.notna(row.get("CONVERSATION_ID"))
+                    if has_conv_id and pd.notna(row.get("CONVERSATION_ID"))
                     else None
                 ),
                 "message_time": str(row.get("MESSAGE_TIME", "")) if pd.notna(row.get("MESSAGE_TIME")) else "",
                 "sender_role": str(row.get("SENDER_ROLE", "unknown")),
                 "raw_sender_role": (
                     str(row.get("RAW_SENDER_ROLE"))
-                    if "RAW_SENDER_ROLE" in group.columns and pd.notna(row.get("RAW_SENDER_ROLE"))
+                    if has_raw_role and pd.notna(row.get("RAW_SENDER_ROLE"))
                     else None
                 ),
                 "message_text": str(row.get("MESSAGE_TEXT", "") or ""),
                 "agent_full_name": (
                     str(row.get("MESSAGE_AGENT_FULL_NAME"))
-                    if "MESSAGE_AGENT_FULL_NAME" in group.columns and pd.notna(row.get("MESSAGE_AGENT_FULL_NAME"))
+                    if has_agent_name and pd.notna(row.get("MESSAGE_AGENT_FULL_NAME"))
                     else None
                 ),
             }
