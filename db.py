@@ -14,12 +14,15 @@ from Streamlit callbacks without worrying about thread affinity.
 
 from __future__ import annotations
 
+import hashlib
+import hmac
 import json
+import secrets
 import sqlite3
 import threading
 import time
 from contextlib import contextmanager
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any, Iterable, Optional
 
@@ -126,11 +129,66 @@ CREATE TABLE IF NOT EXISTS run_errors (
     created_at TEXT NOT NULL,
     FOREIGN KEY (run_id) REFERENCES runs(id) ON DELETE CASCADE
 );
+
+CREATE TABLE IF NOT EXISTS reviewer_keys (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    reviewer_name TEXT NOT NULL,
+    key_hash TEXT NOT NULL,
+    key_prefix TEXT NOT NULL,
+    is_active INTEGER NOT NULL DEFAULT 1,
+    created_by TEXT,
+    created_at TEXT NOT NULL,
+    revoked_at TEXT,
+    last_used_at TEXT
+);
+
+CREATE INDEX IF NOT EXISTS idx_reviewer_keys_active ON reviewer_keys(is_active);
+
+CREATE TABLE IF NOT EXISTS journey_reviews (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    run_id INTEGER NOT NULL,
+    conversation_id TEXT NOT NULL,
+    reviewer_key_id INTEGER,
+    reviewer_name TEXT NOT NULL,
+    reviewed_at TEXT NOT NULL,
+    review_comment TEXT,
+    FOREIGN KEY (run_id) REFERENCES runs(id) ON DELETE CASCADE,
+    FOREIGN KEY (reviewer_key_id) REFERENCES reviewer_keys(id),
+    UNIQUE(run_id, conversation_id, reviewer_name)
+);
+
+CREATE INDEX IF NOT EXISTS idx_journey_reviews_lookup ON journey_reviews(run_id, conversation_id);
+
+CREATE TABLE IF NOT EXISTS journey_review_history (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    run_id INTEGER NOT NULL,
+    conversation_id TEXT NOT NULL,
+    reviewer_key_id INTEGER,
+    reviewer_name TEXT NOT NULL,
+    reviewed_at TEXT NOT NULL,
+    review_comment TEXT,
+    FOREIGN KEY (run_id) REFERENCES runs(id) ON DELETE CASCADE,
+    FOREIGN KEY (reviewer_key_id) REFERENCES reviewer_keys(id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_journey_review_history_lookup ON journey_review_history(run_id, conversation_id, reviewer_name, reviewed_at);
 """
 
 
+_SECRET_HASH_ALGO = "pbkdf2_sha256"
+_SECRET_HASH_ITERATIONS = 260_000
+_NOW_LOCK = threading.Lock()
+_LAST_NOW: datetime | None = None
+
+
 def _now_iso() -> str:
-    return datetime.utcnow().isoformat(timespec="seconds") + "Z"
+    global _LAST_NOW
+    with _NOW_LOCK:
+        now = datetime.utcnow()
+        if _LAST_NOW is not None and now <= _LAST_NOW:
+            now = _LAST_NOW + timedelta(microseconds=1)
+        _LAST_NOW = now
+        return now.isoformat(timespec="microseconds") + "Z"
 
 
 def _json_dump(obj: Any) -> str:
@@ -144,6 +202,30 @@ def _json_load(s: Optional[str]) -> Any:
         return json.loads(s)
     except Exception:
         return None
+
+
+def _hash_secret(secret: str, salt_hex: str | None = None) -> str:
+    """Return a salted PBKDF2 hash suitable for storing auth secrets."""
+    if salt_hex is None:
+        salt_hex = secrets.token_hex(16)
+    digest = hashlib.pbkdf2_hmac(
+        "sha256",
+        secret.encode("utf-8"),
+        bytes.fromhex(salt_hex),
+        _SECRET_HASH_ITERATIONS,
+    ).hex()
+    return f"{_SECRET_HASH_ALGO}${_SECRET_HASH_ITERATIONS}${salt_hex}${digest}"
+
+
+def _verify_secret(secret: str, encoded: str) -> bool:
+    try:
+        algo, iterations, salt_hex, digest = str(encoded or "").split("$", 3)
+        if algo != _SECRET_HASH_ALGO or int(iterations) != _SECRET_HASH_ITERATIONS:
+            return False
+        candidate = _hash_secret(secret, salt_hex).rsplit("$", 1)[-1]
+        return hmac.compare_digest(candidate, digest)
+    except Exception:
+        return False
 
 
 def _backfill_conversation_parsed_json(pj: Any) -> None:
@@ -258,6 +340,62 @@ class Database:
             if "source_conversation_id" not in cols:
                 self._conn.execute("ALTER TABLE message_results ADD COLUMN source_conversation_id TEXT")
 
+            review_cols = {
+                row["name"]
+                for row in self._conn.execute("PRAGMA table_info(journey_reviews)").fetchall()
+            }
+            if "review_comment" not in review_cols:
+                self._conn.execute("ALTER TABLE journey_reviews ADD COLUMN review_comment TEXT")
+
+            self._conn.execute(
+                "CREATE TABLE IF NOT EXISTS journey_review_history ("
+                "id INTEGER PRIMARY KEY AUTOINCREMENT, "
+                "run_id INTEGER NOT NULL, "
+                "conversation_id TEXT NOT NULL, "
+                "reviewer_key_id INTEGER, "
+                "reviewer_name TEXT NOT NULL, "
+                "reviewed_at TEXT NOT NULL, "
+                "review_comment TEXT, "
+                "FOREIGN KEY (run_id) REFERENCES runs(id) ON DELETE CASCADE, "
+                "FOREIGN KEY (reviewer_key_id) REFERENCES reviewer_keys(id))"
+            )
+            history_schema = self._conn.execute(
+                "SELECT sql FROM sqlite_master WHERE type='table' AND name='journey_review_history'"
+            ).fetchone()
+            if history_schema and "UNIQUE(run_id, conversation_id, reviewer_name, reviewed_at)" in str(history_schema["sql"]):
+                self._conn.execute(
+                    "CREATE TABLE journey_review_history_new ("
+                    "id INTEGER PRIMARY KEY AUTOINCREMENT, "
+                    "run_id INTEGER NOT NULL, "
+                    "conversation_id TEXT NOT NULL, "
+                    "reviewer_key_id INTEGER, "
+                    "reviewer_name TEXT NOT NULL, "
+                    "reviewed_at TEXT NOT NULL, "
+                    "review_comment TEXT, "
+                    "FOREIGN KEY (run_id) REFERENCES runs(id) ON DELETE CASCADE, "
+                    "FOREIGN KEY (reviewer_key_id) REFERENCES reviewer_keys(id))"
+                )
+                self._conn.execute(
+                    "INSERT INTO journey_review_history_new"
+                    "(id, run_id, conversation_id, reviewer_key_id, reviewer_name, reviewed_at, review_comment) "
+                    "SELECT id, run_id, conversation_id, reviewer_key_id, reviewer_name, reviewed_at, review_comment "
+                    "FROM journey_review_history"
+                )
+                self._conn.execute("DROP TABLE journey_review_history")
+                self._conn.execute("ALTER TABLE journey_review_history_new RENAME TO journey_review_history")
+            self._conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_journey_review_history_lookup "
+                "ON journey_review_history(run_id, conversation_id, reviewer_name, reviewed_at)"
+            )
+            self._conn.execute(
+                "INSERT OR IGNORE INTO journey_review_history"
+                "(run_id, conversation_id, reviewer_key_id, reviewer_name, reviewed_at, review_comment) "
+                "SELECT run_id, conversation_id, reviewer_key_id, reviewer_name, reviewed_at, review_comment "
+                "FROM journey_reviews"
+            )
+
+            self._conn.execute("DELETE FROM settings WHERE key='auth_master_hash'")
+
     # -------- settings (free-form key/value) --------
 
     def set_setting(self, key: str, value: Any) -> None:
@@ -273,6 +411,110 @@ class Database:
         if not row:
             return default
         return _json_load(row["value"])
+
+    # -------- authentication / reviewer tracking --------
+
+    def has_master_key(self) -> bool:
+        return False
+
+    def set_master_key(self, master_key: str) -> None:
+        return None
+
+    def verify_master_key(self, master_key: str) -> bool:
+        return False
+
+    def create_reviewer_key(self, reviewer_name: str, created_by: str = "master") -> dict:
+        name = str(reviewer_name or "").strip()
+        if not name:
+            raise ValueError("Reviewer name is required")
+        plain_key = f"rvw_{secrets.token_urlsafe(24)}"
+        now = _now_iso()
+        cur = self._exec(
+            "INSERT INTO reviewer_keys"
+            "(reviewer_name, key_hash, key_prefix, is_active, created_by, created_at)"
+            " VALUES(?, ?, ?, 1, ?, ?)",
+            (name, _hash_secret(plain_key), plain_key[:12], created_by, now),
+        )
+        return {
+            "id": int(cur.lastrowid),
+            "reviewer_name": name,
+            "reviewer_key": plain_key,
+            "key_prefix": plain_key[:12],
+            "created_at": now,
+        }
+
+    def list_reviewer_keys(self) -> list[dict]:
+        rows = self._fetchall(
+            "SELECT id, reviewer_name, key_prefix, is_active, created_by, created_at, revoked_at, last_used_at "
+            "FROM reviewer_keys ORDER BY is_active DESC, reviewer_name ASC, created_at DESC"
+        )
+        return [dict(row) for row in rows]
+
+    def verify_reviewer_key(self, reviewer_key: str) -> Optional[dict]:
+        key = str(reviewer_key or "").strip()
+        if not key:
+            return None
+        rows = self._fetchall(
+            "SELECT id, reviewer_name, key_hash, key_prefix, is_active FROM reviewer_keys WHERE is_active=1"
+        )
+        for row in rows:
+            if _verify_secret(key, row["key_hash"]):
+                self._exec(
+                    "UPDATE reviewer_keys SET last_used_at=? WHERE id=?",
+                    (_now_iso(), int(row["id"])),
+                )
+                return {
+                    "id": int(row["id"]),
+                    "reviewer_name": row["reviewer_name"],
+                    "key_prefix": row["key_prefix"],
+                }
+        return None
+
+    def revoke_reviewer_key(self, key_id: int) -> None:
+        self._exec(
+            "UPDATE reviewer_keys SET is_active=0, revoked_at=? WHERE id=?",
+            (_now_iso(), int(key_id)),
+        )
+
+    def record_journey_review(
+        self,
+        run_id: int,
+        conversation_id: str,
+        reviewer_name: str,
+        reviewer_key_id: int | None = None,
+        review_comment: str | None = None,
+    ) -> None:
+        now = _now_iso()
+        params = (
+            int(run_id),
+            str(conversation_id),
+            int(reviewer_key_id) if reviewer_key_id is not None else None,
+            str(reviewer_name),
+            now,
+            str(review_comment or "").strip() or None,
+        )
+        self._exec(
+            "INSERT INTO journey_review_history"
+            "(run_id, conversation_id, reviewer_key_id, reviewer_name, reviewed_at, review_comment) "
+            "VALUES(?, ?, ?, ?, ?, ?)",
+            params,
+        )
+        self._exec(
+            "INSERT INTO journey_reviews(run_id, conversation_id, reviewer_key_id, reviewer_name, reviewed_at, review_comment) "
+            "VALUES(?, ?, ?, ?, ?, ?) "
+            "ON CONFLICT(run_id, conversation_id, reviewer_name) DO UPDATE SET "
+            "reviewer_key_id=excluded.reviewer_key_id, reviewed_at=excluded.reviewed_at, "
+            "review_comment=excluded.review_comment",
+            params,
+        )
+
+    def list_journey_reviews(self, run_id: int, conversation_id: str) -> list[dict]:
+        rows = self._fetchall(
+            "SELECT id, reviewer_name, reviewed_at, review_comment FROM journey_review_history "
+            "WHERE run_id=? AND conversation_id=? ORDER BY reviewed_at ASC, id ASC",
+            (int(run_id), str(conversation_id)),
+        )
+        return [dict(row) for row in rows]
 
     # -------- prompt templates --------
 

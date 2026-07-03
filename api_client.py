@@ -14,17 +14,18 @@ from openai import OpenAI
 
 
 DEFAULT_BASE_URL = "https://langcc.maidstech.ai/v1"
+DEFAULT_MODEL = "openai/gpt-5.4-mini"
 MAX_CONCURRENCY = 100
 
 @dataclass
 class APIConfig:
     base_url: str = DEFAULT_BASE_URL
     api_key: str = ""
-    model: str = ""
+    model: str = DEFAULT_MODEL
     temperature: float = 0.1
     top_p: float = 1.0
     max_tokens: int = 100000
-    timeout: float = 60.0
+    timeout: float = 300.0
     retries: int = 2
     concurrency: int = 60
 

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import html as html_lib
+import hmac
 import importlib
 import os
 import sqlite3
@@ -79,6 +80,30 @@ st.set_page_config(
 
 
 REVIEW_DB_PATH = Path("cx_evaluator_review_runs_59_57_55.db")
+DEFAULT_SELECTED_MODEL = "openai/gpt-5.4-mini"
+DEFAULT_EVALUATION_SETTINGS = {
+    "api_base_url": DEFAULT_BASE_URL,
+    "selected_model": DEFAULT_SELECTED_MODEL,
+    "temperature": 0.1,
+    "top_p": 1.0,
+    "max_tokens": 100000,
+    "timeout": 300.0,
+    "retries": 2,
+    "concurrency": 60,
+    "message_target_role": "agent",
+}
+DEFAULT_RUN_SETTINGS = {
+    "run_all_conversations": False,
+    "max_conversations": 50,
+    "max_agent_messages_per_conv": 500,
+    "truncate_messages": False,
+    "max_chars_per_message": 1500,
+    "include_unknown_in_history": True,
+    "stop_on_error": False,
+    "save_raw_responses": True,
+}
+DEFAULT_CHOICES_VERSION = 5
+DEFAULT_DB_SELECTION_VERSION = 2
 
 
 # --------- Session state defaults ---------
@@ -94,25 +119,25 @@ def _init_state() -> None:
         "available_models": [],
         "models_loaded_at": None,
         "model_load_error": None,
-        "api_base_url": DEFAULT_BASE_URL,
+        "api_base_url": DEFAULT_EVALUATION_SETTINGS["api_base_url"],
         "api_key": "",
-        "selected_model": "",
-        "temperature": 0.1,
-        "top_p": 1.0,
-        "max_tokens": 100000,
-        "timeout": 300.0,
-        "retries": 2,
-        "concurrency": 60,
-        "run_all_conversations": False,
-        "max_conversations": 50,
-        "max_agent_messages_per_conv": 500,
-        "truncate_messages": False,
-        "max_chars_per_message": 1500,
-        "include_unknown_in_history": True,
-        "stop_on_error": False,
-        "save_raw_responses": True,
+        "selected_model": DEFAULT_EVALUATION_SETTINGS["selected_model"],
+        "temperature": DEFAULT_EVALUATION_SETTINGS["temperature"],
+        "top_p": DEFAULT_EVALUATION_SETTINGS["top_p"],
+        "max_tokens": DEFAULT_EVALUATION_SETTINGS["max_tokens"],
+        "timeout": DEFAULT_EVALUATION_SETTINGS["timeout"],
+        "retries": DEFAULT_EVALUATION_SETTINGS["retries"],
+        "concurrency": DEFAULT_EVALUATION_SETTINGS["concurrency"],
+        "run_all_conversations": DEFAULT_RUN_SETTINGS["run_all_conversations"],
+        "max_conversations": DEFAULT_RUN_SETTINGS["max_conversations"],
+        "max_agent_messages_per_conv": DEFAULT_RUN_SETTINGS["max_agent_messages_per_conv"],
+        "truncate_messages": DEFAULT_RUN_SETTINGS["truncate_messages"],
+        "max_chars_per_message": DEFAULT_RUN_SETTINGS["max_chars_per_message"],
+        "include_unknown_in_history": DEFAULT_RUN_SETTINGS["include_unknown_in_history"],
+        "stop_on_error": DEFAULT_RUN_SETTINGS["stop_on_error"],
+        "save_raw_responses": DEFAULT_RUN_SETTINGS["save_raw_responses"],
         # Which side the message-level judge inspects per turn.
-        "message_target_role": "agent",
+        "message_target_role": DEFAULT_EVALUATION_SETTINGS["message_target_role"],
         # When set, the run evaluates ONLY these IDs (random sampler).
         "selected_conversation_ids": None,
         "selection_import_feedback": None,
@@ -121,19 +146,35 @@ def _init_state() -> None:
         "progress_log": [],
         "cancel_flag": False,
         # DB integration
-        "db_path": str(
-            REVIEW_DB_PATH
-            if REVIEW_DB_PATH.exists() and not Path(DEFAULT_DB_PATH).exists()
-            else DEFAULT_DB_PATH
-        ),
+        "db_path": str(REVIEW_DB_PATH if REVIEW_DB_PATH.exists() else DEFAULT_DB_PATH),
         "current_run_id": None,        # id of the run we're writing to (or loaded from)
         "loaded_run_label": None,
         "review_selected_conversation_id": None,
         "theme_mode": "Dark",
+        "auth_user": None,
+        "auth_role": None,
+        "auth_reviewer_key_id": None,
+        "auth_db_path": None,
+        "generated_reviewer_key": None,
+        "_run_results_db_path": None,
     }
     for k, v in defaults.items():
         if k not in st.session_state:
             st.session_state[k] = v
+    if st.session_state.get("_default_db_selection_version") != DEFAULT_DB_SELECTION_VERSION:
+        if REVIEW_DB_PATH.exists() and st.session_state.get("db_path") in {None, "", str(DEFAULT_DB_PATH)}:
+            st.session_state.db_path = str(REVIEW_DB_PATH)
+        st.session_state["_default_db_selection_version"] = DEFAULT_DB_SELECTION_VERSION
+    if st.session_state.get("_default_choices_version") != DEFAULT_CHOICES_VERSION:
+        for key, value in DEFAULT_EVALUATION_SETTINGS.items():
+            st.session_state[key] = value
+        for key, value in DEFAULT_RUN_SETTINGS.items():
+            st.session_state[key] = value
+        st.session_state["_default_choices_version"] = DEFAULT_CHOICES_VERSION
+    if not st.session_state.get("selected_model"):
+        st.session_state.selected_model = DEFAULT_SELECTED_MODEL
+    if not st.session_state.get("api_base_url"):
+        st.session_state.api_base_url = DEFAULT_BASE_URL
 
 
 _init_state()
@@ -161,6 +202,237 @@ def get_active_db() -> Database:
     return get_db(_active_db_path())
 
 
+def _clear_auth_state(*, clear_sensitive_data: bool = False) -> None:
+    st.session_state.auth_user = None
+    st.session_state.auth_role = None
+    st.session_state.auth_reviewer_key_id = None
+    st.session_state.auth_db_path = None
+    st.session_state.generated_reviewer_key = None
+    if clear_sensitive_data:
+        st.session_state.df_raw = None
+        st.session_state.df_norm = None
+        st.session_state.csv_summary = None
+        st.session_state.csv_name = None
+        st.session_state.run_results = None
+        st.session_state.current_run_id = None
+        st.session_state.loaded_run_label = None
+        st.session_state.review_selected_conversation_id = None
+        st.session_state._run_results_db_path = None
+
+
+def _reset_default_choices() -> None:
+    for key, value in DEFAULT_EVALUATION_SETTINGS.items():
+        st.session_state[key] = value
+    for key, value in DEFAULT_RUN_SETTINGS.items():
+        st.session_state[key] = value
+    st.session_state["_default_choices_version"] = DEFAULT_CHOICES_VERSION
+    st.session_state.selected_conversation_ids = None
+    st.session_state.selection_import_feedback = None
+
+
+def _ensure_parameter_defaults_exist() -> None:
+    for key, value in DEFAULT_EVALUATION_SETTINGS.items():
+        if st.session_state.get(key) in (None, ""):
+            st.session_state[key] = value
+    for key, value in DEFAULT_RUN_SETTINGS.items():
+        if st.session_state.get(key) is None:
+            st.session_state[key] = value
+
+
+def _local_secrets_path() -> Path:
+    return Path(".streamlit") / "secrets.toml"
+
+
+def _read_local_master_key() -> str:
+    path = _local_secrets_path()
+    if not path.exists():
+        return ""
+    try:
+        for line in path.read_text(encoding="utf-8").splitlines():
+            stripped = line.strip()
+            if not stripped or stripped.startswith("#") or not stripped.startswith("CEX_MASTER_KEY"):
+                continue
+            _, raw_value = stripped.split("=", 1)
+            raw_value = raw_value.strip()
+            try:
+                return str(json.loads(raw_value) or "")
+            except Exception:
+                return raw_value.strip().strip('"').strip("'")
+    except Exception:
+        return ""
+    return ""
+
+
+def _write_local_master_key(master_key: str) -> None:
+    path = _local_secrets_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    secret_line = f"CEX_MASTER_KEY = {json.dumps(str(master_key))}"
+    if not path.exists():
+        path.write_text(
+            "# Local Streamlit secrets. This file is ignored by git.\n"
+            f"{secret_line}\n",
+            encoding="utf-8",
+        )
+        return
+
+    lines = path.read_text(encoding="utf-8").splitlines()
+    updated: list[str] = []
+    replaced = False
+    for line in lines:
+        if line.strip().startswith("CEX_MASTER_KEY"):
+            updated.append(secret_line)
+            replaced = True
+        else:
+            updated.append(line)
+    if not replaced:
+        if updated and updated[-1].strip():
+            updated.append("")
+        updated.append(secret_line)
+    path.write_text("\n".join(updated).rstrip() + "\n", encoding="utf-8")
+
+
+def _configured_master_key() -> str:
+    env_value = os.environ.get("CEX_MASTER_KEY", "")
+    if env_value:
+        return env_value
+    try:
+        secret_value = str(st.secrets.get("CEX_MASTER_KEY", "") or "")
+        if secret_value:
+            return secret_value
+    except Exception:
+        pass
+    return _read_local_master_key()
+
+
+def _session_master_key() -> str:
+    return str(st.session_state.get("session_master_key") or "")
+
+
+def _verify_master_key_input(value: str) -> bool:
+    configured = _configured_master_key()
+    if configured:
+        return hmac.compare_digest(str(value or ""), configured)
+    session_master_key = _session_master_key()
+    return bool(session_master_key) and hmac.compare_digest(str(value or ""), session_master_key)
+
+
+def _render_auth_intro() -> None:
+    st.markdown(
+        """
+        <div class="cx-auth-header">
+          <div class="cx-brand cx-brand-large">
+            <span class="cx-brand-mark">m</span>
+            <span class="cx-brand-word">maids.cc</span>
+          </div>
+          <div class="cx-app-kicker">Secure access</div>
+          <h1>CX Review Platform</h1>
+          <p>Enter your access key once to open the workspace.</p>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+
+def _render_workspace_header() -> None:
+    db_name = html_lib.escape(Path(_active_db_path()).name)
+    run_id = st.session_state.get("current_run_id")
+    run_label = f"Run #{int(run_id)}" if run_id is not None else "No run loaded"
+    run_label = html_lib.escape(run_label)
+    st.markdown(
+        f"""
+        <div class="cx-app-header">
+          <div class="cx-title-wrap">
+            <div class="cx-brand">
+              <span class="cx-brand-mark">m</span>
+              <span class="cx-brand-word">maids.cc</span>
+            </div>
+            <div>
+              <div class="cx-app-kicker">Review workspace</div>
+              <h1>CX Journey Review</h1>
+              <div class="cx-app-subtitle">Evaluate, analyze, and mark customer journeys from one place.</div>
+            </div>
+          </div>
+          <div class="cx-header-meta">
+            <span class="cx-pill">{db_name}</span>
+            <span class="cx-pill">{run_label}</span>
+          </div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+
+def _render_auth_gate() -> bool:
+    active_db_path = _active_db_path()
+    if st.session_state.get("auth_user"):
+        return True
+
+    db = get_active_db()
+    has_configured_master = bool(_configured_master_key())
+    has_session_master = bool(_session_master_key())
+
+    _render_auth_intro()
+    _, auth_col, _ = st.columns([1, 1.1, 1])
+
+    if not has_configured_master and not has_session_master:
+        with auth_col:
+            st.subheader("Master key setup")
+            with st.form("master_setup_form"):
+                master_key = st.text_input("Master key", type="password")
+                confirm_key = st.text_input("Confirm master key", type="password")
+                submitted = st.form_submit_button("Continue", type="primary")
+            if submitted:
+                if len(master_key or "") < 12:
+                    st.error("Use at least 12 characters for the master key.")
+                elif master_key != confirm_key:
+                    st.error("Master keys do not match.")
+                else:
+                    try:
+                        _write_local_master_key(master_key)
+                    except Exception as e:
+                        st.error(f"Could not save the master key locally: {e}")
+                        return False
+                    st.session_state.session_master_key = master_key
+                    st.session_state.auth_user = "Master admin"
+                    st.session_state.auth_role = "master"
+                    st.session_state.auth_reviewer_key_id = None
+                    st.session_state.auth_db_path = active_db_path
+                    st.rerun()
+        return False
+
+    with auth_col:
+        with st.form("auth_login_form"):
+            secret = st.text_input("Access key", type="password")
+            submitted = st.form_submit_button("Sign in", type="primary")
+
+        if submitted:
+            if _verify_master_key_input(secret):
+                st.session_state.auth_user = "Master admin"
+                st.session_state.auth_role = "master"
+                st.session_state.auth_reviewer_key_id = None
+                st.session_state.auth_db_path = active_db_path
+                st.rerun()
+            else:
+                reviewer_db = db
+                reviewer_db_path = active_db_path
+                if REVIEW_DB_PATH.exists():
+                    reviewer_db_path = str(REVIEW_DB_PATH)
+                    reviewer_db = get_db(reviewer_db_path)
+                reviewer = reviewer_db.verify_reviewer_key(secret)
+                if reviewer:
+                    st.session_state.db_path = reviewer_db_path
+                    st.session_state.auth_user = reviewer["reviewer_name"]
+                    st.session_state.auth_role = "reviewer"
+                    st.session_state.auth_reviewer_key_id = reviewer["id"]
+                    st.session_state.auth_db_path = reviewer_db_path
+                    st.session_state.run_results = None
+                    st.session_state._run_results_db_path = None
+                    st.rerun()
+                else:
+                    st.error("Invalid or revoked access key.")
+    return False
+
+
 def _available_database_options() -> tuple[list[str], dict[str, str]]:
     options: list[str] = []
     labels: dict[str, str] = {}
@@ -172,9 +444,9 @@ def _available_database_options() -> tuple[list[str], dict[str, str]]:
         options.append(value)
         labels[value] = label
 
-    add_option(DEFAULT_DB_PATH, "Local working DB - cx_evaluator.db")
     if REVIEW_DB_PATH.exists():
         add_option(REVIEW_DB_PATH, "Review DB - runs 5, 59, 57, 55")
+    add_option(DEFAULT_DB_PATH, "Local working DB - cx_evaluator.db")
 
     known = {Path(str(DEFAULT_DB_PATH)).name, REVIEW_DB_PATH.name}
     for path in sorted(Path.cwd().glob("*.db")):
@@ -196,18 +468,26 @@ def _on_database_source_changed() -> None:
     st.session_state.review_selected_conversation_id = None
     st.session_state.selection_import_feedback = None
     st.session_state.progress_log = []
+    st.session_state.generated_reviewer_key = None
+    st.session_state.auth_db_path = _active_db_path()
+    st.session_state._run_results_db_path = None
+    if st.session_state.get("auth_role") == "reviewer":
+        st.session_state.auth_reviewer_key_id = None
     try:
         get_db.clear()
     except Exception:
         pass
 
 
-def render_database_selector() -> None:
+def render_database_selector(*, in_sidebar: bool = False) -> None:
     options, labels = _available_database_options()
     if st.session_state.get("db_path") not in labels:
         st.session_state.db_path = options[0]
 
-    st.markdown("### Database source")
+    if in_sidebar:
+        st.markdown("## Data")
+    else:
+        st.markdown("### Data source")
     selected = st.selectbox(
         "Load runs from",
         options=options,
@@ -225,10 +505,32 @@ def render_database_selector() -> None:
         st.warning(f"`{selected}` does not exist yet. The app will create it when needed.")
 
     if Path(selected).name == REVIEW_DB_PATH.name:
-        st.info(
-            "Review DB selected. It contains runs 5, 59, 57, and 55 "
-            "(200, 150, 71, and 49 journeys)."
-        )
+        st.caption("Review DB: runs 5, 59, 57, and 55.")
+
+
+def _prompt_status_label(row: sqlite3.Row | None) -> str:
+    if not row:
+        return "Not found"
+    prompt_id = row["id"]
+    prompt_name = str(row["name"] or "Untitled")
+    prompt_type = "default" if row["is_default"] else "custom"
+    return f"#{prompt_id} {prompt_name} ({prompt_type})"
+
+
+def render_active_prompt_status() -> None:
+    st.markdown("## Active prompts")
+    try:
+        db = get_active_db()
+        message_prompt = db.get_active_prompt("message_level")
+        conversation_prompt = db.get_active_prompt("conversation_level")
+    except Exception as exc:
+        st.warning(f"Could not read active prompts: {exc}")
+        return
+
+    st.caption(f"Database: `{Path(_active_db_path()).name}`")
+    st.markdown(f"**Message:** `{_prompt_status_label(message_prompt)}`")
+    st.markdown(f"**Conversation:** `{_prompt_status_label(conversation_prompt)}`")
+    st.caption("Used for the next evaluation run.")
 
 
 def _db_path(db: Database) -> str:
@@ -466,6 +768,62 @@ def _normalize_run_results_for_display(rr: RunResults) -> RunResults:
         for cr in rr.conversation_results
     ]
     return rr
+
+
+def _saved_run_label(row: dict) -> str:
+    return (
+        f"#{row.get('id')} • {row.get('name') or 'Untitled run'} • "
+        f"{row.get('csv_name') or '—'} • {row.get('status') or 'unknown'} • "
+        f"{row.get('started_at') or '—'}"
+    )
+
+
+def _saved_run_is_loadable(row: dict) -> bool:
+    n_conversations = int(row.get("n_conversations") or 0)
+    saved_conversations = int(row.get("saved_conversations") or 0)
+    return not (n_conversations > 0 and saved_conversations == 0)
+
+
+def _load_saved_run_into_session(db: Database, run_id: int, *, label: str | None = None) -> None:
+    loaded = db.load_run_results(int(run_id))
+    run = loaded.get("run") or db.get_run(int(run_id)) or {}
+    if not loaded["conversation_results"] and int(run.get("n_conversations") or 0) > 0:
+        raise ValueError(
+            "This run has summary metadata but no saved result rows. "
+            "It cannot be reconstructed from the database."
+        )
+    rr = RunResults(
+        conversation_results=loaded["conversation_results"],
+        message_level_results=loaded["message_level_results"],
+        errors=loaded["errors"],
+        started_at=loaded["started_at"],
+        finished_at=loaded["finished_at"],
+    )
+    st.session_state.run_results = _normalize_run_results_for_display(rr)
+    st.session_state.current_run_id = int(run_id)
+    st.session_state.loaded_run_label = label or _saved_run_label(run)
+    st.session_state.review_selected_conversation_id = None
+    st.session_state._run_results_db_path = _active_db_path()
+
+
+def _auto_load_latest_run(db: Database) -> None:
+    active_db_path = _active_db_path()
+    if _has_results() and st.session_state.get("_run_results_db_path") == active_db_path:
+        return
+    try:
+        runs = db.list_runs(limit=50)
+    except Exception:
+        return
+    for row in runs:
+        if not _saved_run_is_loadable(row):
+            continue
+        try:
+            _load_saved_run_into_session(db, int(row["id"]), label=_saved_run_label(row))
+            st.session_state.latest_run_autoloaded = True
+            return
+        except Exception:
+            continue
+    st.session_state.latest_run_autoloaded = False
 
 
 def _conv_dataframe_from_results() -> pd.DataFrame:
@@ -801,16 +1159,21 @@ def _prepare_display_table(df: pd.DataFrame, enum_columns: list[str] | None = No
 def _theme_colors() -> dict[str, str]:
     dark = str(st.session_state.get("theme_mode") or "Light") == "Dark"
     return {
-        "bg": "#0a0e27" if dark else "#ffffff",
-        "panel": "#111827" if dark else "#f8fafc",
-        "panel_2": "#1a202c" if dark else "#ffffff",
-        "text": "#f0f4f8" if dark else "#0f172a",
-        "muted": "#a0aec0" if dark else "#64748b",
-        "border": "#2d3748" if dark else "#e5e7eb",
-        "accent": "#3b82f6" if dark else "#2563eb",
-        "accent_2": "#f59e0b" if dark else "#ef4444",
-        "track": "#2d3748" if dark else "#e5e7eb",
-        "grid": "#2d3748" if dark else "#e5e7eb",
+        "bg": "#101113" if dark else "#f7f8f6",
+        "app_bg": (
+            "linear-gradient(135deg, #101113 0%, #12161a 52%, #151218 100%)"
+            if dark
+            else "linear-gradient(135deg, #f7f8f6 0%, #edfdf9 52%, #fff7ed 100%)"
+        ),
+        "panel": "#17191d" if dark else "#ffffff",
+        "panel_2": "#202329" if dark else "#ffffff",
+        "text": "#f5f2ea" if dark else "#16181d",
+        "muted": "#a6aaa3" if dark else "#66716b",
+        "border": "#333840" if dark else "#dce2de",
+        "accent": "#14b8a6" if dark else "#0f766e",
+        "accent_2": "#f59e0b" if dark else "#b45309",
+        "track": "#2a2e35" if dark else "#e5ebe7",
+        "grid": "#343941" if dark else "#dce2de",
     }
 
 
@@ -1066,24 +1429,44 @@ def _apply_theme() -> None:
     dark = mode == "Dark"
     if HAS_PLOTLY:
         px.defaults.template = "plotly_dark" if dark else "plotly_white"
-        px.defaults.color_continuous_scale = "Blues" if not dark else "Viridis"
+        px.defaults.color_continuous_scale = "Teal" if not dark else "Viridis"
 
     colors = {
-        "bg": "#0a0e27" if dark else "#ffffff",
-        "panel": "#111827" if dark else "#f8fafc",
-        "panel_2": "#1a202c" if dark else "#ffffff",
-        "text": "#f0f4f8" if dark else "#0f172a",
-        "muted": "#a0aec0" if dark else "#64748b",
-        "border": "#2d3748" if dark else "#e5e7eb",
-        "input": "#0a0e27" if dark else "#ffffff",
-        "input_text": "#f0f4f8" if dark else "#111827",
-        "accent": "#3b82f6" if dark else "#ef4444",
-        "button": "#2563eb" if dark else "#2563eb",
+        "bg": "#101113" if dark else "#f7f8f6",
+        "app_bg": (
+            "linear-gradient(135deg, #101113 0%, #12161a 52%, #151218 100%)"
+            if dark
+            else "linear-gradient(135deg, #f7f8f6 0%, #edfdf9 52%, #fff7ed 100%)"
+        ),
+        "panel": "#17191d" if dark else "#ffffff",
+        "panel_2": "#202329" if dark else "#ffffff",
+        "panel_3": "#252932" if dark else "#f1f5f2",
+        "text": "#f5f2ea" if dark else "#16181d",
+        "muted": "#a6aaa3" if dark else "#66716b",
+        "border": "#333840" if dark else "#dce2de",
+        "border_soft": "#2a2e35" if dark else "#edf1ee",
+        "input": "#121417" if dark else "#ffffff",
+        "input_text": "#f5f2ea" if dark else "#16181d",
+        "accent": "#14b8a6" if dark else "#0f766e",
+        "accent_soft": "#0f766e33" if dark else "#ccfbf1",
+        "accent_sky": "#38bdf8" if dark else "#0284c7",
+        "accent_violet": "#a78bfa" if dark else "#7c3aed",
+        "accent_rose": "#fb7185" if dark else "#e11d48",
+        "accent_amber": "#f59e0b" if dark else "#d97706",
+        "success": "#22c55e" if dark else "#16a34a",
+        "header_bg": (
+            "linear-gradient(135deg, #202329 0%, #15332f 48%, #2a2035 100%)"
+            if dark
+            else "linear-gradient(135deg, #ffffff 0%, #e7fffb 48%, #fff4de 100%)"
+        ),
+        "button": "#0d9488" if dark else "#0f766e",
+        "button_hover": "#14b8a6" if dark else "#115e59",
         "button_text": "#ffffff",
-        "disabled": "#2d3748" if dark else "#e5e7eb",
-        "disabled_text": "#a0aec0" if dark else "#94a3b8",
-        "plot_bg": "#1a202c" if dark else "#ffffff",
-        "grid": "#2d3748" if dark else "#e5e7eb",
+        "disabled": "#2a2e35" if dark else "#e5ebe7",
+        "disabled_text": "#828781" if dark else "#94a39c",
+        "plot_bg": "#202329" if dark else "#ffffff",
+        "grid": "#343941" if dark else "#dce2de",
+        "shadow": "0 18px 46px rgba(0, 0, 0, 0.28)" if dark else "0 16px 38px rgba(21, 38, 32, 0.08)",
     }
     color_scheme = "dark" if dark else "light"
     st.markdown(
@@ -1092,20 +1475,55 @@ def _apply_theme() -> None:
         :root {{
           color-scheme: {color_scheme};
         }}
+        html, body, [class*="css"] {{
+          font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+          letter-spacing: 0;
+        }}
         .stApp {{
-          background: {colors["bg"]};
+          background: {colors["app_bg"]};
           color: {colors["text"]};
+        }}
+        .main .block-container,
+        [data-testid="stMainBlockContainer"] {{
+          max-width: 1480px;
+          padding-top: 2.15rem;
+          padding-bottom: 2.4rem;
         }}
         [data-testid="stSidebar"], [data-testid="stSidebarContent"] {{
           background: {colors["panel"]} !important;
           color: {colors["text"]} !important;
         }}
+        [data-testid="stSidebarContent"] {{
+          border-right: 1px solid {colors["border_soft"]};
+          padding-top: 0.75rem;
+        }}
         [data-testid="stHeader"], [data-testid="stDecoration"] {{
           background: {colors["bg"]} !important;
+        }}
+        [data-testid="stToolbar"] {{
+          right: 0.8rem;
         }}
         .stApp h1, .stApp h2, .stApp h3, .stApp h4, .stApp h5, .stApp h6,
         .stApp p, .stApp label, .stApp span, .stApp div {{
           color: {colors["text"]};
+        }}
+        .stApp h1 {{
+          font-size: clamp(1.65rem, 2.4vw, 2.15rem);
+          line-height: 1.08;
+          font-weight: 780;
+          margin: 0;
+          letter-spacing: 0;
+        }}
+        .stApp h2 {{
+          font-size: 1.35rem;
+          margin-top: 0.25rem;
+          margin-bottom: 0.65rem;
+        }}
+        .stApp h3 {{
+          font-size: 1.05rem;
+          font-weight: 740;
+          margin-top: 0.75rem;
+          margin-bottom: 0.45rem;
         }}
         [data-testid="stCaptionContainer"], [data-testid="stCaptionContainer"] *,
         small {{
@@ -1116,6 +1534,36 @@ def _apply_theme() -> None:
           background-color: {colors["panel_2"]} !important;
           border-color: {colors["border"]} !important;
         }}
+        div[data-testid="stMetric"] {{
+          border: 1px solid {colors["border"]};
+          border-radius: 8px;
+          padding: 0.78rem 0.9rem;
+          box-shadow: inset 0 1px 0 rgba(255,255,255,0.03);
+        }}
+        div[data-testid="stMetric"] label,
+        div[data-testid="stMetric"] label * {{
+          color: {colors["muted"]} !important;
+          font-size: 0.76rem !important;
+          font-weight: 690 !important;
+          text-transform: uppercase;
+          letter-spacing: 0.02em;
+        }}
+        div[data-testid="stMetric"] [data-testid="stMetricValue"] {{
+          color: {colors["text"]} !important;
+          font-size: 1.65rem !important;
+          font-weight: 760 !important;
+          line-height: 1.15;
+        }}
+        details[data-testid="stExpander"] {{
+          border: 1px solid {colors["border"]} !important;
+          border-radius: 8px !important;
+          overflow: hidden;
+          box-shadow: none;
+        }}
+        details[data-testid="stExpander"] summary {{
+          background: {colors["panel_3"]};
+          border-bottom: 1px solid {colors["border_soft"]};
+        }}
         .cx-table-wrap {{
           width: 100%;
           overflow: auto;
@@ -1123,6 +1571,7 @@ def _apply_theme() -> None:
           border-radius: 8px;
           background: {colors["panel_2"]};
           margin: 0.35rem 0 1rem;
+          box-shadow: inset 0 1px 0 rgba(255,255,255,0.03);
         }}
         table.cx-data-table {{
           width: 100%;
@@ -1169,9 +1618,13 @@ def _apply_theme() -> None:
           background-color: {colors["input"]} !important;
           color: {colors["input_text"]} !important;
           border-color: {colors["border"]} !important;
+          border-radius: 8px !important;
         }}
         input, textarea {{
           -webkit-text-fill-color: {colors["input_text"]} !important;
+        }}
+        textarea {{
+          line-height: 1.45 !important;
         }}
         input::placeholder, textarea::placeholder {{
           color: {colors["muted"]} !important;
@@ -1190,12 +1643,22 @@ def _apply_theme() -> None:
           border-color: {colors["accent"]} !important;
         }}
         .stButton > button, button[kind="primary"], button[kind="secondary"] {{
-          background-color: {colors["button"]} !important;
+          background: linear-gradient(135deg, #0f766e 0%, #0ea5e9 100%) !important;
           color: {colors["button_text"]} !important;
-          border-color: {colors["button"]} !important;
+          border-color: transparent !important;
+          border-radius: 8px !important;
+          min-height: 2.35rem;
+          font-weight: 720 !important;
+          box-shadow: 0 8px 18px rgba(20, 184, 166, 0.16) !important;
+          transition: background-color 120ms ease, border-color 120ms ease, transform 120ms ease;
+        }}
+        .stButton > button:hover, button[kind="primary"]:hover, button[kind="secondary"]:hover {{
+          background: linear-gradient(135deg, #14b8a6 0%, #8b5cf6 100%) !important;
+          border-color: transparent !important;
+          transform: translateY(-1px);
         }}
         .stButton > button:disabled, button:disabled {{
-          background-color: {colors["disabled"]} !important;
+          background: {colors["disabled"]} !important;
           color: {colors["disabled_text"]} !important;
           border-color: {colors["border"]} !important;
           opacity: 1 !important;
@@ -1207,28 +1670,228 @@ def _apply_theme() -> None:
         section[data-testid="stFileUploaderDropzone"] * {{
           color: {colors["text"]} !important;
         }}
+        div[data-testid="stFileUploader"] {{
+          background: {colors["panel_2"]};
+          border: 1px solid {colors["border"]};
+          border-radius: 8px;
+          padding: 0.75rem;
+        }}
         section[data-testid="stFileUploaderDropzone"] button {{
           background-color: {colors["input"]} !important;
           color: {colors["input_text"]} !important;
           border-color: {colors["border"]} !important;
         }}
+        div[data-testid="stTabs"] {{
+          margin-top: 0.35rem;
+        }}
+        div[data-testid="stTabs"] div[role="tablist"] {{
+          gap: 0.3rem;
+          border-bottom: 1px solid {colors["border"]};
+          padding-bottom: 0;
+          overflow-x: auto;
+        }}
+        button[data-baseweb="tab"] {{
+          background: {colors["panel"]} !important;
+          border: 1px solid transparent !important;
+          border-radius: 8px 8px 0 0;
+          padding: 0.55rem 0.78rem;
+          margin-bottom: -1px;
+        }}
         button[data-baseweb="tab"] p {{
-          color: {colors["muted"]} !important;
+          color: #d8d4c9 !important;
+          font-weight: 720;
         }}
         button[data-baseweb="tab"][aria-selected="true"] p {{
-          color: {colors["accent"]} !important;
+          color: #ffffff !important;
         }}
         button[data-baseweb="tab"][aria-selected="true"] {{
-          border-bottom-color: {colors["accent"]} !important;
+          background: linear-gradient(135deg, #123f3c 0%, #2b2443 100%) !important;
+          border: 1px solid #22d3ee !important;
+          box-shadow: inset 0 3px 0 {colors["accent_amber"]}, 0 8px 18px rgba(34, 211, 238, 0.12);
+          border-bottom-color: #123f3c !important;
         }}
         [data-testid="stAlert"] {{
           color: {colors["text"]} !important;
+          border-radius: 8px !important;
+          border: 1px solid {colors["border"]} !important;
         }}
         [data-testid="stAlert"] * {{
           color: inherit !important;
         }}
         [data-testid="stSidebar"] hr {{
           border-color: {colors["border"]} !important;
+        }}
+        .cx-app-header {{
+          display: flex;
+          justify-content: space-between;
+          align-items: center;
+          gap: 0.8rem;
+          padding: 1.35rem 1rem 1rem;
+          margin: 0.65rem 0 0.75rem;
+          border: 1px solid {colors["border"]};
+          border-left: 4px solid {colors["accent"]};
+          border-radius: 8px;
+          background: {colors["header_bg"]};
+          box-shadow: {colors["shadow"]};
+          overflow: visible;
+        }}
+        .cx-title-wrap {{
+          display: flex;
+          flex-direction: column;
+          gap: 0.36rem;
+          min-width: 0;
+        }}
+        .cx-brand {{
+          display: inline-flex;
+          align-items: center;
+          gap: 0.42rem;
+          line-height: 1.25;
+          min-height: 2.25rem;
+          overflow: visible;
+        }}
+        .cx-brand-mark {{
+          display: none;
+        }}
+        .cx-brand-word {{
+          display: inline-block;
+          color: #6fa0ee !important;
+          font-size: 1.04rem;
+          font-weight: 860;
+          letter-spacing: 0;
+          line-height: 1.25;
+          padding: 0.12rem 0;
+          text-shadow: 0 10px 28px rgba(95, 143, 216, 0.22);
+        }}
+        .cx-brand-large .cx-brand-mark {{
+          display: none;
+        }}
+        .cx-brand-large .cx-brand-word {{
+          font-size: 1.42rem;
+        }}
+        .cx-app-kicker {{
+          color: {colors["accent_amber"]};
+          font-size: 0.76rem;
+          font-weight: 780;
+          text-transform: uppercase;
+          letter-spacing: 0.05em;
+          margin-bottom: 0.16rem;
+        }}
+        .cx-app-subtitle {{
+          color: {colors["muted"]};
+          margin-top: 0.22rem;
+          font-size: 0.94rem;
+        }}
+        .cx-header-meta {{
+          display: flex;
+          align-items: center;
+          justify-content: flex-end;
+          gap: 0.45rem;
+          flex-wrap: wrap;
+          min-width: 280px;
+        }}
+        .cx-pill {{
+          display: inline-flex;
+          align-items: center;
+          min-height: 1.9rem;
+          padding: 0.28rem 0.62rem;
+          border-radius: 999px;
+          border: 1px solid {colors["accent"]};
+          background: linear-gradient(135deg, {colors["panel_3"]} 0%, {colors["accent_soft"]} 100%);
+          color: {colors["text"]};
+          font-size: 0.78rem;
+          font-weight: 720;
+          white-space: nowrap;
+        }}
+        .cx-pill strong {{
+          color: {colors["accent"]};
+          font-weight: 800;
+        }}
+        .cx-auth-header {{
+          max-width: 620px;
+          margin: 2.2rem auto 0.85rem;
+          padding: 0.95rem 1.05rem;
+          border: 1px solid {colors["border"]};
+          border-left: 4px solid {colors["accent_amber"]};
+          border-radius: 8px;
+          background: {colors["header_bg"]};
+          box-shadow: {colors["shadow"]};
+        }}
+        .cx-auth-header h1 {{
+          margin: 0;
+        }}
+        .cx-auth-header p {{
+          margin: 0.32rem 0 0;
+          color: {colors["muted"]};
+        }}
+        .cx-review-status {{
+          border: 1px solid {colors["border"]};
+          border-radius: 8px;
+          padding: 0.9rem 1rem;
+          margin: 0.2rem 0 0.9rem;
+          background: {colors["panel_2"]};
+        }}
+        .cx-review-status-title {{
+          display: flex;
+          align-items: center;
+          justify-content: space-between;
+          gap: 0.75rem;
+          margin-bottom: 0.55rem;
+          font-weight: 760;
+        }}
+        .cx-review-list {{
+          color: {colors["muted"]};
+          font-size: 0.9rem;
+          line-height: 1.45;
+        }}
+        .cx-sidebar-mini {{
+          border: 1px solid {colors["border"]};
+          border-left: 4px solid {colors["accent"]};
+          border-radius: 8px;
+          background: {colors["panel_2"]};
+          padding: 0.7rem 0.8rem;
+          margin: 0.45rem 0 0.75rem;
+        }}
+        .cx-sidebar-brand {{
+          display: flex;
+          align-items: center;
+          gap: 0.46rem;
+          padding: 0.72rem 0.75rem;
+          margin: 0 0 0.75rem;
+          border: 1px solid {colors["border"]};
+          border-radius: 8px;
+          background: {colors["header_bg"]};
+        }}
+        .cx-sidebar-mini div:first-child {{
+          color: {colors["muted"]};
+          font-size: 0.74rem;
+          font-weight: 780;
+          text-transform: uppercase;
+          letter-spacing: 0.04em;
+        }}
+        .cx-sidebar-mini div:last-child {{
+          margin-top: 0.18rem;
+          color: {colors["text"]};
+          font-weight: 760;
+          word-break: break-word;
+        }}
+        @media (max-width: 780px) {{
+          .main .block-container,
+          [data-testid="stMainBlockContainer"] {{
+            padding-left: 0.9rem;
+            padding-right: 0.9rem;
+            padding-top: 1.8rem;
+          }}
+          .cx-app-header {{
+            align-items: flex-start;
+            flex-direction: column;
+          }}
+          .cx-header-meta {{
+            justify-content: flex-start;
+            min-width: 0;
+          }}
+          .cx-auth-header {{
+            margin-top: 1.2rem;
+          }}
         }}
         </style>
         """,
@@ -1239,10 +1902,10 @@ def _apply_theme() -> None:
 def _plotly_layout(fig, height: int | None = None, **layout):
     """Apply app theme colors to Plotly figures."""
     dark = str(st.session_state.get("theme_mode") or "Light") == "Dark"
-    bg = "#0a0e27" if dark else "#ffffff"
-    panel = "#1a202c" if dark else "#ffffff"
-    text = "#f0f4f8" if dark else "#0f172a"
-    grid = "#2d3748" if dark else "#e5e7eb"
+    bg = "#101113" if dark else "#f7f8f6"
+    panel = "#202329" if dark else "#ffffff"
+    text = "#f5f2ea" if dark else "#16181d"
+    grid = "#343941" if dark else "#dce2de"
     base = {
         "template": "plotly_dark" if dark else "plotly_white",
         "paper_bgcolor": bg,
@@ -1341,12 +2004,10 @@ def _comparison_matrix(
 
 
 def render_sidebar() -> None:
+    _ensure_parameter_defaults_exist()
+    st.session_state.theme_mode = "Dark"
     with st.sidebar:
-        st.markdown("## Display")
-        # Dark mode only
-        st.session_state.theme_mode = "Dark"
         st.markdown("---")
-
         st.markdown("## API Settings")
         st.text_input(
             "Base URL",
@@ -1382,22 +2043,72 @@ def render_sidebar() -> None:
         models = st.session_state.available_models or []
         if models:
             current = st.session_state.selected_model
+            if current not in models and DEFAULT_SELECTED_MODEL in models:
+                st.session_state.selected_model = DEFAULT_SELECTED_MODEL
+                current = DEFAULT_SELECTED_MODEL
             default_index = models.index(current) if current in models else 0
-            st.selectbox("Model", models, index=default_index, key="selected_model")
+            st.selectbox(
+                "Model",
+                models,
+                index=default_index,
+                key="selected_model",
+                help=f"Default: {DEFAULT_EVALUATION_SETTINGS['selected_model']}",
+            )
         else:
             st.text_input(
                 "Model",
                 key="selected_model",
-                help="Click 'Load available models' to populate this dropdown.",
+                help=(
+                    "Default: "
+                    f"{DEFAULT_EVALUATION_SETTINGS['selected_model']}. "
+                    "Click 'Load available models' to populate this dropdown."
+                ),
             )
 
         st.markdown("---")
         st.markdown("### Generation parameters")
-        st.slider("Temperature", min_value=0.0, max_value=2.0, step=0.05, key="temperature")
-        st.slider("Top P", min_value=0.0, max_value=1.0, step=0.05, key="top_p")
-        st.number_input("Max tokens", min_value=128, step=64, key="max_tokens")
-        st.number_input("Timeout (seconds)", min_value=5.0, step=5.0, key="timeout")
-        st.number_input("Retry count", min_value=0, step=1, key="retries")
+        st.button(
+            "Reset parameters to defaults",
+            use_container_width=True,
+            on_click=_reset_default_choices,
+        )
+        st.slider(
+            "Temperature",
+            min_value=0.0,
+            max_value=2.0,
+            step=0.05,
+            key="temperature",
+            help=f"Default: {DEFAULT_EVALUATION_SETTINGS['temperature']}",
+        )
+        st.slider(
+            "Top P",
+            min_value=0.0,
+            max_value=1.0,
+            step=0.05,
+            key="top_p",
+            help=f"Default: {DEFAULT_EVALUATION_SETTINGS['top_p']}",
+        )
+        st.number_input(
+            "Max tokens",
+            min_value=128,
+            step=64,
+            key="max_tokens",
+            help=f"Default: {DEFAULT_EVALUATION_SETTINGS['max_tokens']:,}",
+        )
+        st.number_input(
+            "Timeout (seconds)",
+            min_value=5.0,
+            step=5.0,
+            key="timeout",
+            help=f"Default: {DEFAULT_EVALUATION_SETTINGS['timeout']:.0f}",
+        )
+        st.number_input(
+            "Retry count",
+            min_value=0,
+            step=1,
+            key="retries",
+            help=f"Default: {DEFAULT_EVALUATION_SETTINGS['retries']}",
+        )
         st.session_state.concurrency = min(100, max(1, int(st.session_state.concurrency)))
         st.number_input(
             "Concurrency",
@@ -1406,6 +2117,7 @@ def render_sidebar() -> None:
             step=1,
             key="concurrency",
             help=(
+                f"Default: {DEFAULT_EVALUATION_SETTINGS['concurrency']}. "
                 "Number of message-level API calls dispatched in parallel. "
                 "Lower this if the API returns 503s, rate limits, or timeouts."
             ),
@@ -1430,7 +2142,10 @@ def render_sidebar() -> None:
             "Run all uploaded journeys",
             key="run_all_conversations",
             disabled=not total_journeys,
-            help="When enabled, the run processes every customer journey in the uploaded CSV.",
+            help=(
+                f"Default: {'On' if DEFAULT_RUN_SETTINGS['run_all_conversations'] else 'Off'}. "
+                "When enabled, the run processes every customer journey in the uploaded CSV."
+            ),
         )
         if total_journeys and st.session_state.run_all_conversations:
             st.session_state.max_conversations = total_journeys
@@ -1441,16 +2156,20 @@ def render_sidebar() -> None:
             step=1,
             key="max_conversations",
             disabled=bool(total_journeys and st.session_state.run_all_conversations),
-            help="When 'Run all uploaded journeys' is off, this many journeys are processed from the CSV order.",
+            help=(
+                f"Default: {DEFAULT_RUN_SETTINGS['max_conversations']}. "
+                "When 'Run all uploaded journeys' is off, this many journeys are processed from the CSV order."
+            ),
         )
         st.number_input(
             "Max target messages per journey",
             min_value=1,
             step=1,
             key="max_agent_messages_per_conv",
+            help=f"Default: {DEFAULT_RUN_SETTINGS['max_agent_messages_per_conv']}",
         )
         st.radio(
-            "Evaluate which side?",
+            "Evaluate which side? (default: Assistant messages)",
             options=["agent", "customer"],
             key="message_target_role",
             horizontal=True,
@@ -1465,21 +2184,124 @@ def render_sidebar() -> None:
                 "state / frustration BEFORE the assistant answers."
             ),
         )
-        st.toggle("Truncate message text", key="truncate_messages")
+        st.toggle(
+            "Truncate message text",
+            key="truncate_messages",
+            help=f"Default: {'On' if DEFAULT_RUN_SETTINGS['truncate_messages'] else 'Off'}",
+        )
         if st.session_state.truncate_messages:
             st.number_input(
                 "Max characters per message",
                 min_value=200,
                 step=100,
                 key="max_chars_per_message",
+                help=f"Default: {DEFAULT_RUN_SETTINGS['max_chars_per_message']}",
             )
-        st.toggle("Include unknown sender messages in history", key="include_unknown_in_history")
-        st.toggle("Stop on API error", key="stop_on_error")
-        st.toggle("Save raw model responses", key="save_raw_responses")
+        st.toggle(
+            "Include unknown sender messages in history",
+            key="include_unknown_in_history",
+            help=f"Default: {'On' if DEFAULT_RUN_SETTINGS['include_unknown_in_history'] else 'Off'}",
+        )
+        st.toggle(
+            "Stop on API error",
+            key="stop_on_error",
+            help=f"Default: {'On' if DEFAULT_RUN_SETTINGS['stop_on_error'] else 'Off'}",
+        )
+        st.toggle(
+            "Save raw model responses",
+            key="save_raw_responses",
+            help=f"Default: {'On' if DEFAULT_RUN_SETTINGS['save_raw_responses'] else 'Off'}",
+        )
 
         st.markdown("---")
         if st.session_state.current_run_id is not None:
             st.caption(f"Current run id: **#{st.session_state.current_run_id}**")
+
+
+def render_auth_sidebar() -> None:
+    auth_name = st.session_state.get("auth_user") or "Unknown"
+    auth_role = st.session_state.get("auth_role") or "reviewer"
+    auth_role_label = humanize_label(auth_role)
+
+    with st.sidebar:
+        st.markdown(
+            """
+            <div class="cx-sidebar-brand">
+              <span class="cx-brand-mark">m</span>
+              <span class="cx-brand-word">maids.cc</span>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+        st.markdown("## Access")
+        st.markdown(
+            f"""
+            <div class="cx-sidebar-mini">
+              <div>Signed in</div>
+              <div>{html_lib.escape(str(auth_name))} - {html_lib.escape(str(auth_role_label))}</div>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+        if st.button("Log out", use_container_width=True):
+            _clear_auth_state(clear_sensitive_data=True)
+            st.rerun()
+
+
+def tab_reviewer_admin() -> None:
+    if st.session_state.get("auth_role") != "master":
+        st.warning("Only master admins can manage reviewer access.")
+        return
+
+    db = get_active_db()
+    auth_name = st.session_state.get("auth_user") or "Master admin"
+
+    st.subheader("Reviewer Access")
+    st.caption("Generate reviewer keys and revoke access from the workspace.")
+
+    create_col, keys_col = st.columns([1, 1.4])
+    with create_col:
+        st.markdown("### Add reviewer")
+        with st.form("create_reviewer_key_form"):
+            reviewer_name = st.text_input("Reviewer name")
+            created = st.form_submit_button("Generate reviewer key", type="primary")
+        if created:
+            try:
+                st.session_state.generated_reviewer_key = db.create_reviewer_key(
+                    reviewer_name,
+                    created_by=auth_name,
+                )
+            except Exception as exc:
+                st.error(str(exc))
+
+        generated = st.session_state.get("generated_reviewer_key")
+        if generated:
+            st.success(
+                f"Key generated for {generated['reviewer_name']}. "
+                "Copy it now; it will not be shown again."
+            )
+            st.code(generated["reviewer_key"], language="text")
+            if st.button("Hide generated key", use_container_width=True):
+                st.session_state.generated_reviewer_key = None
+                st.rerun()
+
+    with keys_col:
+        st.markdown("### Existing reviewers")
+        keys = db.list_reviewer_keys()
+        if not keys:
+            st.info("No reviewer keys yet.")
+            return
+
+        for key in keys:
+            status = "Active" if key["is_active"] else "Revoked"
+            cols = st.columns([3, 1])
+            with cols[0]:
+                st.markdown(f"**{key['reviewer_name']}**")
+                st.caption(f"{key['key_prefix']}... - {status}")
+            with cols[1]:
+                if key["is_active"] and st.button("Revoke", key=f"revoke_reviewer_{key['id']}"):
+                    db.revoke_reviewer_key(int(key["id"]))
+                    st.rerun()
 
 
 # --------- Tab: Upload & Settings ---------
@@ -1752,12 +2574,8 @@ def tab_run() -> None:
                 & (saved_conversations == 0)
             )
             df_runs["label"] = df_runs.apply(
-                lambda r: (
-                    f"#{r['id']} • {r.get('name') or 'Untitled run'} • "
-                    f"{r.get('csv_name') or '—'} • {r['status']}"
-                    f"{' • incomplete: no saved results' if r.get('is_incomplete') else ''} • "
-                    f"{r['started_at']}"
-                ),
+                lambda r: _saved_run_label(r.to_dict())
+                + (" • incomplete: no saved results" if r.get("is_incomplete") else ""),
                 axis=1,
             )
             st.caption(f"Newest saved run in this database: #{int(df_runs.iloc[0]['id'])}")
@@ -1809,26 +2627,7 @@ def tab_run() -> None:
                     st.caption("This run has no saved result rows, so it cannot be loaded.")
                 if st.button("Load this run", use_container_width=True, disabled=is_incomplete_run):
                     try:
-                        loaded = db.load_run_results(sel_id)
-                        if (
-                            not loaded["conversation_results"]
-                            and int(selected_run.get("n_conversations") or 0) > 0
-                        ):
-                            raise ValueError(
-                                "This run has summary metadata but no saved result rows. "
-                                "It cannot be reconstructed from the database."
-                            )
-                        rr = RunResults(
-                            conversation_results=loaded["conversation_results"],
-                            message_level_results=loaded["message_level_results"],
-                            errors=loaded["errors"],
-                            started_at=loaded["started_at"],
-                            finished_at=loaded["finished_at"],
-                        )
-                        rr = _normalize_run_results_for_display(rr)
-                        st.session_state.run_results = rr
-                        st.session_state.current_run_id = sel_id
-                        st.session_state.loaded_run_label = sel
+                        _load_saved_run_into_session(db, sel_id, label=sel)
                         st.success(f"Loaded run #{sel_id}.")
                     except Exception as e:
                         st.error(f"Could not load run: {e}")
@@ -1847,6 +2646,7 @@ def tab_run() -> None:
                         if st.session_state.current_run_id == sel_id:
                             st.session_state.current_run_id = None
                             st.session_state.run_results = None
+                            st.session_state._run_results_db_path = None
                         st.success(f"Deleted run #{sel_id}.")
                     except Exception as e:
                         st.error(f"Could not delete run: {e}")
@@ -2271,6 +3071,7 @@ def tab_run() -> None:
         )
         st.session_state.current_run_id = run_id
         st.session_state.loaded_run_label = None
+        st.session_state._run_results_db_path = _active_db_path()
 
         total_conv = estimate["conversations"]
         total_msg = estimate["message_level_calls"] + estimate["conversation_level_calls"]
@@ -2373,6 +3174,7 @@ def tab_run() -> None:
                 on_error=save_err,
             )
             st.session_state.run_results = results
+            st.session_state._run_results_db_path = _active_db_path()
             persist_completed_results()
             progress_box.success(
                 f"Evaluation finished. {len(results.conversation_results)} customer journeys processed, "
@@ -2424,27 +3226,27 @@ def tab_run() -> None:
 
 # Color palette used across the dashboard (tuned for the dark theme).
 _DASH_COLORS = {
-    "panel_bg": "#11172a",
-    "panel_top": "#0c1224",
-    "panel_border": "#1f2a44",
-    "text": "#f1f5f9",
-    "muted": "#94a3b8",
-    "dim": "#64748b",
-    "track": "#1f2937",
+    "panel_bg": "#202329",
+    "panel_top": "#17191d",
+    "panel_border": "#333840",
+    "text": "#f5f2ea",
+    "muted": "#a6aaa3",
+    "dim": "#777d76",
+    "track": "#2a2e35",
     "handled": "#10b981",
     "unhandled": "#ef4444",
     "many": "#f97316",
     "minimal": "#22c55e",
     "frustrated": "#f59e0b",
-    "calm": "#38bdf8",
+    "calm": "#14b8a6",
     "our_side": "#fb923c",
-    "customer": "#60a5fa",
+    "customer": "#2dd4bf",
     "shared": "#c084fc",
-    "none": "#64748b",
-    "unclear": "#475569",
+    "none": "#777d76",
+    "unclear": "#525861",
     "review_yes": "#a78bfa",
-    "review_no": "#334155",
-    "heat_low": "#1e293b",
+    "review_no": "#333840",
+    "heat_low": "#252932",
     "heat_mid": "#7c2d12",
     "heat_high": "#ef4444",
 }
@@ -3198,31 +4000,46 @@ def _stats_summary_rows(conv_df: pd.DataFrame) -> list[dict[str, Any]]:
 
 def _render_stats_summary_table(rows: list[dict[str, Any]]) -> None:
     """Render the Stats tab table with the app dashboard palette."""
-    header_bg = _DASH_COLORS["panel_top"]
-    total_bg = _DASH_COLORS["panel_bg"]
-    section_bg = "#14273a"
-    child_bg = "#0f172a"
+    header_bg = "#24272d"
+    total_bg = "#202329"
+    section_bg = "#1b2024"
+    child_bg = "#17191d"
     border = _DASH_COLORS["panel_border"]
     text = _DASH_COLORS["text"]
     muted = _DASH_COLORS["muted"]
 
+    def row_colors(metric: str, kind: str) -> tuple[str, str]:
+        marker = metric.lower()
+        if kind == "total":
+            return total_bg, _DASH_COLORS["calm"]
+        if "not handled" in marker or "unhandled" in marker or "totally" in marker:
+            return "#24191b", _DASH_COLORS["unhandled"]
+        if "bad" in marker:
+            return "#261d18", _DASH_COLORS["many"]
+        if "good" in marker:
+            return "#17231b", _DASH_COLORS["minimal"]
+        if "handled" in marker:
+            return "#16221d", _DASH_COLORS["handled"]
+        return section_bg if kind == "section" else child_bg, _DASH_COLORS["dim"]
+
     body = []
     for row in rows:
         kind = row["_kind"]
-        bg = total_bg if kind == "total" else section_bg if kind == "section" else child_bg
+        bg, accent = row_colors(str(row["Metric"]), kind)
         weight = "600" if kind in {"total", "section"} else "400"
         metric = html_lib.escape(str(row["Metric"]))
         metric_text = str(row["Metric"])
         align = "left" if row["_depth"] == 0 or len(metric_text) > 42 else "center"
         value_color = text if kind in {"total", "section"} else muted
+        metric_pad = 10 + int(row["_depth"]) * 18
         body.append(
             "<tr>"
-            f'<td style="background:{bg};border:1px solid {border};padding:8px 10px;'
+            f'<td style="background:{bg};border:1px solid {border};border-left:4px solid {accent};padding:8px 10px 8px {metric_pad}px;'
             f'text-align:{align};font-weight:{weight};color:{text};">{metric}</td>'
             f'<td style="background:{bg};border:1px solid {border};padding:8px 10px;'
             f'text-align:left;font-weight:{weight};color:{value_color};">{int(row["Count"]):,}</td>'
             f'<td style="background:{bg};border:1px solid {border};padding:8px 10px;'
-            f'text-align:left;font-weight:{weight};color:{value_color};">{html_lib.escape(str(row["Percentage"]))}</td>'
+            f'text-align:left;font-weight:{weight};color:{accent if kind in {"total", "section"} else value_color};">{html_lib.escape(str(row["Percentage"]))}</td>'
             "</tr>"
         )
 
@@ -3231,12 +4048,15 @@ def _render_stats_summary_table(rows: list[dict[str, Any]]) -> None:
         <style>
         .stats-summary-table {{
             width: min(820px, 100%);
-            border-collapse: collapse;
+            border-collapse: separate;
+            border-spacing: 0;
             color: {text};
             font-size: 1rem;
             line-height: 1.25;
             border: 1px solid {border};
-            background: {child_bg};
+            border-radius: 10px;
+            overflow: hidden;
+            background: {total_bg};
         }}
         .stats-summary-table th {{
             background: {header_bg};
@@ -3652,6 +4472,293 @@ def tab_dashboard() -> None:
 # --------- Tab: Customer Journey Review ---------
 
 
+def _ensure_journey_review_comment_column(db: Database) -> None:
+    try:
+        with db._lock:
+            columns = {
+                row["name"]
+                for row in db._conn.execute("PRAGMA table_info(journey_reviews)").fetchall()
+            }
+            if "review_comment" not in columns:
+                db._conn.execute("ALTER TABLE journey_reviews ADD COLUMN review_comment TEXT")
+    except Exception:
+        pass
+
+
+def _list_journey_reviews_with_comments(db: Database, run_id: int, conversation_id: str) -> list[dict]:
+    _ensure_journey_review_comment_column(db)
+    try:
+        rows = db._fetchall(
+            "SELECT id, reviewer_name, reviewed_at, review_comment FROM journey_review_history "
+            "WHERE run_id=? AND conversation_id=? ORDER BY reviewed_at ASC, id ASC",
+            (int(run_id), str(conversation_id)),
+        )
+        reviews = [dict(row) for row in rows]
+        if reviews:
+            return reviews
+    except Exception:
+        pass
+
+    try:
+        reviews = db.list_journey_reviews(int(run_id), conversation_id)
+        for row in reviews:
+            row.setdefault("review_comment", None)
+        return reviews
+    except Exception:
+        rows = db._fetchall(
+            "SELECT id, reviewer_name, reviewed_at, review_comment FROM journey_reviews "
+            "WHERE run_id=? AND conversation_id=? ORDER BY reviewed_at ASC",
+            (int(run_id), str(conversation_id)),
+        )
+        return [dict(row) for row in rows]
+
+
+def _record_journey_review_with_comment(
+    db: Database,
+    run_id: int,
+    conversation_id: str,
+    reviewer_name: str,
+    reviewer_key_id: int | None,
+    review_comment: str | None,
+) -> None:
+    _ensure_journey_review_comment_column(db)
+    try:
+        db.record_journey_review(
+            int(run_id),
+            conversation_id,
+            reviewer_name,
+            reviewer_key_id,
+            review_comment,
+        )
+        return
+    except TypeError:
+        pass
+
+    now = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+    with db._lock:
+        db._conn.execute(
+            "CREATE TABLE IF NOT EXISTS journey_review_history ("
+            "id INTEGER PRIMARY KEY AUTOINCREMENT, "
+            "run_id INTEGER NOT NULL, "
+            "conversation_id TEXT NOT NULL, "
+            "reviewer_key_id INTEGER, "
+            "reviewer_name TEXT NOT NULL, "
+            "reviewed_at TEXT NOT NULL, "
+            "review_comment TEXT)"
+        )
+        db._conn.execute(
+            "INSERT INTO journey_review_history"
+            "(run_id, conversation_id, reviewer_key_id, reviewer_name, reviewed_at, review_comment) "
+            "VALUES(?, ?, ?, ?, ?, ?)",
+            (
+                int(run_id),
+                str(conversation_id),
+                int(reviewer_key_id) if reviewer_key_id is not None else None,
+                str(reviewer_name),
+                now,
+                str(review_comment or "").strip() or None,
+            ),
+        )
+        db._conn.execute(
+            "INSERT INTO journey_reviews(run_id, conversation_id, reviewer_key_id, reviewer_name, reviewed_at, review_comment) "
+            "VALUES(?, ?, ?, ?, ?, ?) "
+            "ON CONFLICT(run_id, conversation_id, reviewer_name) DO UPDATE SET "
+            "reviewer_key_id=excluded.reviewer_key_id, reviewed_at=excluded.reviewed_at, "
+            "review_comment=excluded.review_comment",
+            (
+                int(run_id),
+                str(conversation_id),
+                int(reviewer_key_id) if reviewer_key_id is not None else None,
+                str(reviewer_name),
+                now,
+                str(review_comment or "").strip() or None,
+            ),
+        )
+
+
+def _render_journey_review_tracking(run_id: int | None, conversation_id: str) -> None:
+    if not run_id:
+        st.caption("Review tracking is available after this journey is attached to a saved run.")
+        return
+
+    db = get_active_db()
+    reviews = _list_journey_reviews_with_comments(db, int(run_id), conversation_id)
+    reviewer_name = st.session_state.get("auth_user") or "Unknown"
+    reviewer_key_id = st.session_state.get("auth_reviewer_key_id")
+
+    def format_review_time(value: Any) -> str:
+        parsed = pd.to_datetime(value, errors="coerce", utc=True)
+        if pd.isna(parsed):
+            return str(value or "")
+        return parsed.strftime("%Y-%m-%d %H:%M:%S.%f UTC")
+
+    if reviews:
+        reviewer_history: dict[str, list[dict]] = {}
+        for row in reviews:
+            reviewer_history.setdefault(str(row.get("reviewer_name") or "Unknown"), []).append(row)
+        reviewer_count = len(reviewer_history)
+    else:
+        reviewer_history = {}
+        reviewer_count = 0
+
+    st.markdown(
+        f"""
+        <div class="cx-review-status">
+          <div class="cx-review-status-title">
+            <span>Review status</span>
+            <span class="cx-pill">{reviewer_count:,} reviewer{"s" if reviewer_count != 1 else ""}</span>
+            <span class="cx-pill">{len(reviews):,} review{"s" if len(reviews) != 1 else ""}</span>
+          </div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+    if reviewer_history:
+        for reviewer, history in reviewer_history.items():
+            latest = history[-1]
+            latest_time = format_review_time(latest.get("reviewed_at"))
+            with st.expander(f"{reviewer} - {len(history):,} review{'s' if len(history) != 1 else ''} - latest {latest_time}"):
+                newest_first = list(reversed(history))
+                for history_index, row in enumerate(newest_first, start=1):
+                    comment = str(row.get("review_comment") or "").strip()
+                    st.markdown(f"**History {history_index}**")
+                    st.caption(format_review_time(row.get("reviewed_at")))
+                    st.write(comment or "No comment added.")
+                    if history_index < len(newest_first):
+                        st.markdown("---")
+    else:
+        st.caption("No reviewer has marked this journey as reviewed yet.")
+
+    current_review = next(
+        (row for row in reversed(reviews) if str(row.get("reviewer_name") or "") == str(reviewer_name)),
+        None,
+    )
+    with st.form(f"journey_review_comment_{run_id}_{conversation_id}"):
+        comment = st.text_area(
+            "Your review comment",
+            value=str((current_review or {}).get("review_comment") or ""),
+            key=f"journey_review_comment_text_{run_id}_{conversation_id}_{reviewer_name}",
+            height=90,
+            placeholder="Add what you checked, agreed with, or want another reviewer to revisit.",
+        )
+        saved = st.form_submit_button("Mark as reviewed", type="primary")
+    if saved:
+        _record_journey_review_with_comment(
+            db,
+            int(run_id),
+            conversation_id,
+            reviewer_name,
+            int(reviewer_key_id) if reviewer_key_id is not None else None,
+            comment,
+        )
+        st.rerun()
+
+
+def _flagged_message_level(message_result: dict | None) -> str | None:
+    if not message_result:
+        return None
+    if message_result.get("parse_status") != "ok":
+        return "Red"
+    parsed = message_result.get("parsed_json") or {}
+    effect = parsed.get("message_level_effect")
+    frustration = parsed.get("frustration_level_after_message")
+    change = parsed.get("frustration_change")
+    issue_type = parsed.get("issue_type") or "none"
+    issue_origin = parsed.get("issue_origin") or "none"
+    has_issue = effect in {"minor_issue", "major_issue"} or issue_type != "none" or issue_origin != "none"
+    if effect == "major_issue" or frustration in {"high", "cancellation_risk"}:
+        return "Red"
+    if change == "created" and has_issue:
+        return "Red"
+    if effect == "minor_issue" or (has_issue and frustration in {"medium", "low"}) or change == "increased":
+        return "Orange"
+    return None
+
+
+def _flagged_sender_type(message: dict) -> str | None:
+    raw_role = str(message.get("raw_sender_role") or "").strip().lower()
+    sender_role = str(message.get("sender_role") or "").strip().lower()
+    if raw_role == "system":
+        return "Broadcast"
+    if raw_role == "bot":
+        return "Bot"
+    if raw_role == "agent" or sender_role == "agent":
+        return "Agent"
+    return None
+
+
+def _flagged_messages_by_sender(transcript: list[dict], message_results: list[dict]) -> list[dict[str, Any]]:
+    eval_by_idx = {result.get("message_index"): result for result in (message_results or [])}
+    rows: list[dict[str, Any]] = []
+    for message in transcript or []:
+        msg_index = message.get("message_index")
+        result = eval_by_idx.get(msg_index)
+        flag_level = _flagged_message_level(result)
+        sender_type = _flagged_sender_type(message)
+        if not flag_level or not sender_type:
+            continue
+        parsed = result.get("parsed_json") or {}
+        rows.append(
+            {
+                "Type": sender_type,
+                "Flag": flag_level,
+                "Message #": msg_index,
+                "Source conversation": message.get("source_conversation_id") or result.get("source_conversation_id") or "",
+                "Effect": humanize_label(parsed.get("message_level_effect")),
+                "Issue type": humanize_label(parsed.get("issue_type")),
+                "Frustration": humanize_label(parsed.get("frustration_level_after_message")),
+                "Message": message.get("message_text") or result.get("target_message_text") or "",
+            }
+        )
+    return rows
+
+
+def _render_flagged_message_checker(transcript: list[dict], message_results: list[dict], conversation_id: str) -> None:
+    flagged_rows = _flagged_messages_by_sender(transcript, message_results)
+    counts = {kind: sum(1 for row in flagged_rows if row["Type"] == kind) for kind in ("Agent", "Bot", "Broadcast")}
+    total = len(flagged_rows)
+
+    st.markdown("### Flagged message check")
+    st.caption("Check whether flagged evaluated messages came from an agent, bot, or broadcast/system message.")
+
+    state_key = f"review_flagged_sender_{conversation_id}"
+    if state_key not in st.session_state:
+        st.session_state[state_key] = "All"
+    button_cols = st.columns(4)
+    choices = [
+        ("All", total),
+        ("Agent", counts["Agent"]),
+        ("Bot", counts["Bot"]),
+        ("Broadcast", counts["Broadcast"]),
+    ]
+    for col, (choice, count) in zip(button_cols, choices):
+        with col:
+            button_type = "primary" if st.session_state[state_key] == choice else "secondary"
+            if st.button(f"{choice} ({count})", key=f"review_flagged_{choice}_{conversation_id}", type=button_type, use_container_width=True):
+                st.session_state[state_key] = choice
+
+    selected = st.session_state[state_key]
+    shown = flagged_rows if selected == "All" else [row for row in flagged_rows if row["Type"] == selected]
+    severity_counts = {
+        "Red": sum(1 for row in shown if row.get("Flag") == "Red"),
+        "Orange": sum(1 for row in shown if row.get("Flag") == "Orange"),
+    }
+    if not flagged_rows:
+        st.success("No evaluated agent, bot, or broadcast messages were flagged for this journey.")
+        return
+    if not shown:
+        st.info(f"No {selected.lower()} messages were flagged for this journey.")
+        return
+
+    metric_row(
+        [
+            ("Flagged red", f"{severity_counts['Red']:,}", None),
+            ("Flagged orange", f"{severity_counts['Orange']:,}", None),
+        ]
+    )
+    st.dataframe(pd.DataFrame(shown), use_container_width=True, hide_index=True, height=min(360, 88 + len(shown) * 54))
+
+
 def tab_review() -> None:
     st.subheader("Customer Journey Review")
     if not _has_results():
@@ -3891,6 +4998,8 @@ def tab_review() -> None:
         return
 
     target_cr = _normalize_conversation_result_for_display(target_cr)
+    run_id_for_review = st.session_state.get("current_run_id") or target_cr.get("run_id")
+    _render_journey_review_tracking(run_id_for_review, target_id)
     _render_conversation_summary_card_fresh(
         target_cr,
         show_details=show_review_details,
@@ -3903,6 +5012,7 @@ def tab_review() -> None:
     st.markdown("<div id='review-conversation-start'></div>", unsafe_allow_html=True)
     transcript = target_cr.get("transcript") or []
     msgs = target_cr.get("message_level_results") or []
+    _render_flagged_message_checker(transcript, msgs, target_id)
     _, chat_col, _ = st.columns([0.15, 9.7, 0.15])
     with chat_col:
         render_conversation_transcript_with_evals(
@@ -4195,50 +5305,67 @@ def tab_debug() -> None:
 
 def main() -> None:
     _apply_theme()
+    if not _render_auth_gate():
+        return
+
+    # Force DB initialization at app start so the seeded defaults exist before
+    # the sidebar status or any tab tries to read them.
+    db = get_active_db()
+    _refresh_default_prompts(db)
+    _auto_load_latest_run(db)
+
+    render_auth_sidebar()
+    with st.sidebar:
+        render_database_selector(in_sidebar=True)
+        st.markdown("---")
+        render_active_prompt_status()
     render_sidebar()
 
-    st.title("CX Customer Journey Evaluator")
-    st.caption(
+    _render_workspace_header()
+
+    _ = (
         "AI-as-a-Judge evaluation of appended customer journeys across one or more source conversations. "
         "Built for management review — focused on outcomes, frustration, and root cause."
     )
 
-    render_database_selector()
+    tab_labels = [
+        "Upload & Settings",
+        "Prompts",
+        "Run Evaluation",
+        "Overview",
+        "Stats",
+        "Dashboard",
+        "Journey Review",
+        "Exports",
+        "Debug",
+    ]
+    if st.session_state.get("auth_role") == "master":
+        tab_labels.insert(0, "Reviewer Admin")
 
-    # Force DB initialization at app start so the seeded defaults exist before
-    # any tab tries to read them.
-    _refresh_default_prompts(get_active_db())
+    tabs = st.tabs(tab_labels)
+    tab_offset = 1 if st.session_state.get("auth_role") == "master" else 0
 
-    tabs = st.tabs(
-        [
-            "Upload & Settings",
-            "Prompts",
-            "Run Evaluation",
-            "Overview",
-            "Stats",
-            "Dashboard",
-            "Journey Review",
-            "Exports",
-            "Debug",
-        ]
-    )
-    with tabs[0]:
+    if tab_offset:
+        with tabs[0]:
+            tab_reviewer_admin()
+
+    with tabs[0 + tab_offset]:
         tab_upload()
-    with tabs[1]:
+    with tabs[1 + tab_offset]:
         tab_prompts()
-    with tabs[2]:
+    with tabs[2 + tab_offset]:
         tab_run()
-    with tabs[3]:
+    with tabs[3 + tab_offset]:
         tab_overview()
-    with tabs[4]:
+    with tabs[4 + tab_offset]:
         tab_stats()
-    with tabs[5]:
+    with tabs[5 + tab_offset]:
         tab_dashboard()
-    with tabs[6]:
+    with tabs[6 + tab_offset]:
         tab_review()
-    with tabs[7]:
+    with tabs[7 + tab_offset]:
         tab_exports()
-    with tabs[8]:
+    with tabs[8 + tab_offset]:
         tab_debug()
 
 
