@@ -33,6 +33,9 @@ htmlcov/
 *.db-shm
 *.db-wal
 
+# Shared review DB is tracked deliberately via Git LFS (see .gitattributes)
+!cx_evaluator_review_runs_59_57_55.db
+
 # Secrets / env
 .env
 .env.*
