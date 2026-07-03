@@ -307,6 +307,19 @@ class Database:
             except Exception:
                 pass
 
+    def vacuum(self) -> None:
+        """Reclaim disk space freed by deleted rows.
+
+        SQLite's DELETE only marks pages as free for reuse; it never shrinks
+        the file on disk. VACUUM rewrites the whole database file compactly,
+        which is the only way to actually reclaim that space after deleting
+        runs. This requires no other pending transaction on the connection,
+        so it's run outside of ``_tx``/autocommit statement batching.
+        """
+        with self._lock:
+            self._conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+            self._conn.execute("VACUUM")
+
     # -------- internal --------
 
     @contextmanager

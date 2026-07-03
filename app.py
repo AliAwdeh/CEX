@@ -2295,6 +2295,31 @@ def tab_reviewer_admin() -> None:
     db = get_active_db()
     auth_name = st.session_state.get("auth_user") or "Master admin"
 
+    st.subheader("Database Maintenance")
+    db_path = Path(_active_db_path())
+    if db_path.exists():
+        size_before_mb = db_path.stat().st_size / (1024 * 1024)
+        st.caption(
+            f"`{db_path.name}` is currently {size_before_mb:.2f} MB. "
+            "Deleting runs frees space inside the file but doesn't shrink it on disk "
+            "until it's compacted."
+        )
+        if st.button("Compact database (reclaim space)", use_container_width=True):
+            with st.spinner("Compacting database..."):
+                try:
+                    db.vacuum()
+                except Exception as e:
+                    st.error(f"Could not compact the database: {e}")
+                else:
+                    size_after_mb = db_path.stat().st_size / (1024 * 1024)
+                    st.success(
+                        f"Compacted `{db_path.name}`: {size_before_mb:.2f} MB -> {size_after_mb:.2f} MB."
+                    )
+    else:
+        st.caption("Database file not found yet.")
+
+    st.divider()
+
     st.subheader("Reviewer Access")
     st.caption("Generate reviewer keys and revoke access from the workspace.")
 
