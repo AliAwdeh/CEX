@@ -5168,8 +5168,9 @@ def tab_review() -> None:
             2. Leaving a filter empty means it does not limit the results. Choosing several
                values inside one filter shows journeys matching any of those values. Filters
                used in different boxes work together, so a journey must match all of them.
-            3. **Broadcast-only issue journeys** are hidden by default. Turn on that option if
-               you also want journeys where the only red message was a system broadcast.
+            3. **Broadcast-only issue journeys** are hidden by default. Select
+               **Only broadcast-only issue journeys** to show exclusively the journeys where
+               the only red issue came from a system broadcast.
             4. The Agent, Bot, and Broadcast message filters look for journeys containing at
                least one evaluated message with the selected color:
                **Red** needs attention, **Yellow** may need improvement, and **Green** was
