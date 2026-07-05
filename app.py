@@ -2287,6 +2287,22 @@ def render_auth_sidebar() -> None:
             st.rerun()
 
 
+def hide_sidebar() -> None:
+    """Remove the sidebar and its expand/collapse controls for reviewer sessions."""
+    st.markdown(
+        """
+        <style>
+        [data-testid="stSidebar"],
+        [data-testid="stSidebarCollapsedControl"],
+        [data-testid="stSidebarCollapseButton"] {
+            display: none !important;
+        }
+        </style>
+        """,
+        unsafe_allow_html=True,
+    )
+
+
 def tab_reviewer_admin() -> None:
     if st.session_state.get("auth_role") != "master":
         st.warning("Only master admins can manage reviewer access.")
@@ -4156,6 +4172,170 @@ def _render_stats_summary_table(rows: list[dict[str, Any]]) -> None:
     )
 
 
+def _message_flag_stats(conversation_results: list[dict]) -> pd.DataFrame:
+    """Count evaluated message flag colors by sender origin."""
+    sender_types = ("Agent", "Bot", "Broadcast")
+    flag_levels = ("Red", "Yellow", "Green")
+    counts = {
+        sender_type: {flag_level: 0 for flag_level in flag_levels}
+        for sender_type in sender_types
+    }
+
+    for conversation_result in conversation_results:
+        transcript = conversation_result.get("transcript") or []
+        eval_by_idx = _message_results_by_index(
+            conversation_result.get("message_level_results")
+        )
+        for message in transcript:
+            message_index = message.get("message_index")
+            if message_index is None:
+                continue
+            sender_type = _flagged_sender_type(message)
+            flag_level = _message_flag_level(eval_by_idx.get(str(message_index)))
+            if sender_type in counts and flag_level in flag_levels:
+                counts[sender_type][flag_level] += 1
+
+    rows = []
+    for sender_type in sender_types:
+        red = counts[sender_type]["Red"]
+        yellow = counts[sender_type]["Yellow"]
+        green = counts[sender_type]["Green"]
+        flagged = red + yellow
+        total_evaluated = flagged + green
+        rows.append(
+            {
+                "Sender origin": sender_type,
+                "Red": red,
+                "Yellow": yellow,
+                "Green": green,
+                "Flagged (red + yellow)": flagged,
+                "Total evaluated": total_evaluated,
+            }
+        )
+
+    all_flagged = sum(row["Flagged (red + yellow)"] for row in rows)
+    all_evaluated = sum(row["Total evaluated"] for row in rows)
+    for row in rows:
+        sender_evaluated = int(row["Total evaluated"])
+        sender_flagged = int(row["Flagged (red + yellow)"])
+        row["Flagged rate"] = (
+            f"{_pct(sender_flagged, sender_evaluated):.1f}%"
+        )
+        row["Share of all flagged"] = (
+            f"{_pct(sender_flagged, all_flagged):.1f}%"
+        )
+
+    total_row = {
+        "Sender origin": "Total",
+        "Red": sum(row["Red"] for row in rows),
+        "Yellow": sum(row["Yellow"] for row in rows),
+        "Green": sum(row["Green"] for row in rows),
+        "Flagged (red + yellow)": all_flagged,
+        "Total evaluated": all_evaluated,
+        "Flagged rate": f"{_pct(all_flagged, all_evaluated):.1f}%",
+        "Share of all flagged": f"{_pct(all_flagged, all_flagged):.1f}%",
+    }
+    return pd.DataFrame([*rows, total_row])
+
+
+def _render_message_flag_stats_table(flag_stats_df: pd.DataFrame) -> None:
+    """Render message flag stats with the same visual system as the summary table."""
+    header_bg = "#24272d"
+    total_bg = "#202329"
+    row_bg = "#17191d"
+    border = _DASH_COLORS["panel_border"]
+    text = _DASH_COLORS["text"]
+    muted = _DASH_COLORS["muted"]
+    accent_by_sender = {
+        "Agent": _DASH_COLORS["handled"],
+        "Bot": _DASH_COLORS["calm"],
+        "Broadcast": _DASH_COLORS["many"],
+        "Total": _DASH_COLORS["calm"],
+    }
+    value_colors = {
+        "Red": _DASH_COLORS["unhandled"],
+        "Yellow": _DASH_COLORS["many"],
+        "Green": _DASH_COLORS["minimal"],
+    }
+
+    body = []
+    for row in flag_stats_df.to_dict(orient="records"):
+        sender = str(row["Sender origin"])
+        is_total = sender == "Total"
+        bg = total_bg if is_total else row_bg
+        weight = "700" if is_total else "500"
+        accent = accent_by_sender.get(sender, _DASH_COLORS["dim"])
+
+        cells = [
+            (
+                sender,
+                text,
+                f"border-left:4px solid {accent};",
+            )
+        ]
+        for column in flag_stats_df.columns[1:]:
+            value = row[column]
+            if column in {"Red", "Yellow", "Green"}:
+                color = value_colors[column]
+            elif column in {"Flagged rate", "Share of all flagged"}:
+                color = accent
+            else:
+                color = muted if not is_total else text
+            display_value = f"{int(value):,}" if isinstance(value, (int, float)) else str(value)
+            cells.append((display_value, color, ""))
+
+        body.append(
+            "<tr>"
+            + "".join(
+                f'<td style="background:{bg};border:1px solid {border};{extra}'
+                f'padding:8px 10px;text-align:left;font-weight:{weight};'
+                f'color:{color};white-space:nowrap;">{html_lib.escape(value)}</td>'
+                for value, color, extra in cells
+            )
+            + "</tr>"
+        )
+
+    headers = "".join(
+        f"<th>{html_lib.escape(str(column))}</th>"
+        for column in flag_stats_df.columns
+    )
+    st.markdown(
+        f"""
+        <style>
+        .message-flag-stats-table {{
+            width: min(1180px, 100%);
+            border-collapse: separate;
+            border-spacing: 0;
+            color: {text};
+            font-size: 1rem;
+            line-height: 1.25;
+            border: 1px solid {border};
+            border-radius: 10px;
+            overflow: hidden;
+            background: {total_bg};
+        }}
+        .message-flag-stats-table th {{
+            background: {header_bg};
+            border: 1px solid {border};
+            padding: 10px;
+            text-align: left;
+            font-weight: 800;
+            color: {text};
+            white-space: nowrap;
+        }}
+        .message-flag-stats-table td:first-child {{
+            min-width: 145px;
+        }}
+        </style>
+        <table class="message-flag-stats-table">
+            <thead><tr>{headers}</tr></thead>
+            <tbody>{''.join(body)}</tbody>
+        </table>
+        """,
+        unsafe_allow_html=True,
+    )
+
+
 def tab_stats() -> None:
     st.subheader("Stats")
     st.caption(
@@ -4174,6 +4354,15 @@ def tab_stats() -> None:
     rows = _stats_summary_rows(conv_df)
     _render_stats_summary_table(rows)
 
+    flag_stats_df = _message_flag_stats(
+        st.session_state.run_results.conversation_results
+    )
+    st.markdown("### Message flags by sender origin")
+    st.caption(
+        "Evaluated message counts using the same red, yellow, and green rules as Journey Review."
+    )
+    _render_message_flag_stats_table(flag_stats_df)
+
     stats_df = pd.DataFrame(
         [
             {k: v for k, v in row.items() if not k.startswith("_")}
@@ -4184,6 +4373,12 @@ def tab_stats() -> None:
         "Download stats CSV",
         data=stats_df.to_csv(index=False).encode("utf-8-sig"),
         file_name="cx_stats_summary.csv",
+        mime="text/csv",
+    )
+    st.download_button(
+        "Download message flag stats CSV",
+        data=flag_stats_df.to_csv(index=False).encode("utf-8-sig"),
+        file_name="cx_message_flag_stats.csv",
         mime="text/csv",
     )
 
@@ -4718,7 +4913,8 @@ def _render_journey_review_tracking(run_id: int | None, conversation_id: str) ->
         st.rerun()
 
 
-def _flagged_message_level(message_result: dict | None) -> str | None:
+def _message_flag_level(message_result: dict | None) -> str | None:
+    """Return the transcript flag color for an evaluated message."""
     if not message_result:
         return None
     if message_result.get("parse_status") != "ok":
@@ -4735,8 +4931,14 @@ def _flagged_message_level(message_result: dict | None) -> str | None:
     if change == "created" and has_issue:
         return "Red"
     if effect == "minor_issue" or (has_issue and frustration in {"medium", "low"}) or change == "increased":
-        return "Orange"
-    return None
+        return "Yellow"
+    return "Green"
+
+
+def _flagged_message_level(message_result: dict | None) -> str | None:
+    """Return only issue flags for the flagged-message detail table."""
+    level = _message_flag_level(message_result)
+    return level if level in {"Red", "Yellow"} else None
 
 
 def _flagged_sender_type(message: dict) -> str | None:
@@ -4751,12 +4953,86 @@ def _flagged_sender_type(message: dict) -> str | None:
     return None
 
 
+def _message_results_by_index(message_results: list[dict] | None) -> dict[str, dict]:
+    """Index message evaluations while tolerating numeric/string index differences."""
+    return {
+        str(result.get("message_index")): result
+        for result in (message_results or [])
+        if result.get("message_index") is not None
+    }
+
+
+def _sender_flag_levels_for_journey(conversation_result: dict) -> dict[str, set[str]]:
+    """Collect the message flag colors present for each supported sender type."""
+    levels = {kind: set() for kind in ("Agent", "Bot", "Broadcast")}
+    transcript = conversation_result.get("transcript") or []
+    eval_by_idx = _message_results_by_index(conversation_result.get("message_level_results"))
+    for message in transcript:
+        message_index = message.get("message_index")
+        if message_index is None:
+            continue
+        result = eval_by_idx.get(str(message_index))
+        sender_type = _flagged_sender_type(message)
+        flag_level = _message_flag_level(result)
+        if sender_type and flag_level:
+            levels[sender_type].add(flag_level)
+    return levels
+
+
+def _filter_conversations_by_sender_flags(
+    conv_df: pd.DataFrame,
+    conversation_results: list[dict],
+    filters: dict[str, str | None],
+) -> pd.DataFrame:
+    """Keep journeys containing each requested sender/severity combination."""
+    active_filters = {
+        sender_type: flag_level
+        for sender_type, flag_level in filters.items()
+        if flag_level
+    }
+    if not active_filters or conv_df.empty or "conversation_id" not in conv_df.columns:
+        return conv_df
+
+    matching_ids: set[str] = set()
+    for conversation_result in conversation_results:
+        levels = _sender_flag_levels_for_journey(conversation_result)
+        if all(
+            flag_level in levels.get(sender_type, set())
+            for sender_type, flag_level in active_filters.items()
+        ):
+            matching_ids.add(str(conversation_result.get("conversation_id") or ""))
+
+    return conv_df[conv_df["conversation_id"].astype(str).isin(matching_ids)]
+
+
+def _render_sender_flag_filters() -> dict[str, str | None]:
+    """Render independent Agent/Bot/Broadcast message flag filters."""
+    st.markdown("**Message flag filters**")
+    st.caption(
+        "Show journeys containing the selected flag for each sender type. "
+        "When several filters are selected, a journey must match all of them."
+    )
+    options = ["All (no filter)", "Red", "Yellow", "Green"]
+    filters: dict[str, str | None] = {}
+    columns = st.columns(3)
+    for column, sender_type in zip(columns, ("Agent", "Bot", "Broadcast")):
+        with column:
+            selected = st.selectbox(
+                f"{sender_type} messages",
+                options,
+                index=0,
+                key=f"review_{sender_type.lower()}_flag_filter",
+            )
+        filters[sender_type] = None if selected == options[0] else selected
+    return filters
+
+
 def _flagged_messages_by_sender(transcript: list[dict], message_results: list[dict]) -> list[dict[str, Any]]:
-    eval_by_idx = {result.get("message_index"): result for result in (message_results or [])}
+    eval_by_idx = _message_results_by_index(message_results)
     rows: list[dict[str, Any]] = []
     for message in transcript or []:
         msg_index = message.get("message_index")
-        result = eval_by_idx.get(msg_index)
+        result = eval_by_idx.get(str(msg_index))
         flag_level = _flagged_message_level(result)
         sender_type = _flagged_sender_type(message)
         if not flag_level or not sender_type:
@@ -4805,7 +5081,7 @@ def _render_flagged_message_checker(transcript: list[dict], message_results: lis
     shown = flagged_rows if selected == "All" else [row for row in flagged_rows if row["Type"] == selected]
     severity_counts = {
         "Red": sum(1 for row in shown if row.get("Flag") == "Red"),
-        "Orange": sum(1 for row in shown if row.get("Flag") == "Orange"),
+        "Yellow": sum(1 for row in shown if row.get("Flag") == "Yellow"),
     }
     if not flagged_rows:
         st.success("No evaluated agent, bot, or broadcast messages were flagged for this journey.")
@@ -4817,7 +5093,7 @@ def _render_flagged_message_checker(transcript: list[dict], message_results: lis
     metric_row(
         [
             ("Flagged red", f"{severity_counts['Red']:,}", None),
-            ("Flagged orange", f"{severity_counts['Orange']:,}", None),
+            ("Flagged yellow", f"{severity_counts['Yellow']:,}", None),
         ]
     )
     st.dataframe(pd.DataFrame(shown), use_container_width=True, hide_index=True, height=min(360, 88 + len(shown) * 54))
@@ -4852,6 +5128,12 @@ def tab_review() -> None:
         include_journey_starter=True,
     )
     filtered_df = _apply_conversation_filters_fresh(conv_df, review_filters)
+    sender_flag_filters = _render_sender_flag_filters()
+    filtered_df = _filter_conversations_by_sender_flags(
+        filtered_df,
+        rr.conversation_results,
+        sender_flag_filters,
+    )
 
     search = st.text_input(
         "Search by ID, customer name, phone, source conversation ID, result, or problem summary",
@@ -5368,23 +5650,51 @@ def tab_debug() -> None:
 # --------- Main layout ---------
 
 
+def _workspace_tab_specs(auth_role: str) -> list[tuple[str, Any]]:
+    """Return the tabs available to the signed-in role."""
+    review_tabs = [
+        ("Overview", tab_overview),
+        ("Stats", tab_stats),
+        ("Dashboard", tab_dashboard),
+        ("Journey Review", tab_review),
+    ]
+    if auth_role != "master":
+        return review_tabs
+    return [
+        ("Reviewer Admin", tab_reviewer_admin),
+        ("Upload & Settings", tab_upload),
+        ("Prompts", tab_prompts),
+        ("Run Evaluation", tab_run),
+        *review_tabs,
+        ("Exports", tab_exports),
+        ("Debug", tab_debug),
+    ]
+
+
 def main() -> None:
     _apply_theme()
     if not _render_auth_gate():
         return
 
+    auth_role = str(st.session_state.get("auth_role") or "reviewer")
+    is_master = auth_role == "master"
+
     # Force DB initialization at app start so the seeded defaults exist before
     # the sidebar status or any tab tries to read them.
     db = get_active_db()
-    _refresh_default_prompts(db)
+    if is_master:
+        _refresh_default_prompts(db)
     _auto_load_latest_run(db)
 
-    render_auth_sidebar()
-    with st.sidebar:
-        render_database_selector(in_sidebar=True)
-        st.markdown("---")
-        render_active_prompt_status()
-    render_sidebar()
+    if is_master:
+        render_auth_sidebar()
+        with st.sidebar:
+            render_database_selector(in_sidebar=True)
+            st.markdown("---")
+            render_active_prompt_status()
+        render_sidebar()
+    else:
+        hide_sidebar()
 
     _render_workspace_header()
 
@@ -5393,45 +5703,11 @@ def main() -> None:
         "Built for management review — focused on outcomes, frustration, and root cause."
     )
 
-    tab_labels = [
-        "Upload & Settings",
-        "Prompts",
-        "Run Evaluation",
-        "Overview",
-        "Stats",
-        "Dashboard",
-        "Journey Review",
-        "Exports",
-        "Debug",
-    ]
-    if st.session_state.get("auth_role") == "master":
-        tab_labels.insert(0, "Reviewer Admin")
-
-    tabs = st.tabs(tab_labels)
-    tab_offset = 1 if st.session_state.get("auth_role") == "master" else 0
-
-    if tab_offset:
-        with tabs[0]:
-            tab_reviewer_admin()
-
-    with tabs[0 + tab_offset]:
-        tab_upload()
-    with tabs[1 + tab_offset]:
-        tab_prompts()
-    with tabs[2 + tab_offset]:
-        tab_run()
-    with tabs[3 + tab_offset]:
-        tab_overview()
-    with tabs[4 + tab_offset]:
-        tab_stats()
-    with tabs[5 + tab_offset]:
-        tab_dashboard()
-    with tabs[6 + tab_offset]:
-        tab_review()
-    with tabs[7 + tab_offset]:
-        tab_exports()
-    with tabs[8 + tab_offset]:
-        tab_debug()
+    tab_specs = _workspace_tab_specs(auth_role)
+    tabs = st.tabs([label for label, _render in tab_specs])
+    for tab, (_label, render_tab) in zip(tabs, tab_specs):
+        with tab:
+            render_tab()
 
 
 if __name__ == "__main__":
