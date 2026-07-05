@@ -18,8 +18,11 @@
     "context_understanding_score": 0,
     "customer_effort_score": 0,
     "trust_frustration_risk_score": 0,
+    "ai_judgment_score": 0,
+    "message_signal_score": 0,
     "raw_total_score": 0,
     "final_score": 0,
+    "final_score_100": 0,
     "score_rating": "Excellent|Good|Fair|Poor|Critical",
     "score_explanation": "short explanation of the score"
   },
@@ -46,6 +49,10 @@
     "short bullet"
   ],
   "management_summary": "concise business-friendly explanation of the outcome and customer experience",
+  "culprits": [
+    "agent|bot|broadcast|customer"
+  ],
+  "culprit_reason": "short explanation of who materially caused the bad experience or friction, or none",
   "recommended_actions": [
     "short actionable recommendation"
   ],

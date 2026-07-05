@@ -336,6 +336,20 @@ def _normalize_sami_origin(value: Any) -> str:
     return origin if origin in _FRUSTRATION_ORIGINS else "none"
 
 
+def _normalize_culprits(value: Any) -> list[str]:
+    allowed = {"agent", "bot", "broadcast", "customer"}
+    if not isinstance(value, list):
+        return []
+    out: list[str] = []
+    seen: set[str] = set()
+    for item in value:
+        culprit = str(item or "").strip().lower().replace(" ", "_").replace("-", "_")
+        if culprit in allowed and culprit not in seen:
+            out.append(culprit)
+            seen.add(culprit)
+    return out
+
+
 def _normalize_unhandled_subtype(value: Any) -> str:
     subtype = str(value or "").strip().lower().replace(" ", "_").replace("-", "_")
     if subtype in {"n/a", "na", "none", "not_applicable"}:
@@ -425,13 +439,15 @@ def _rating_from_score(score: Any) -> str:
         value = float(score)
     except (TypeError, ValueError):
         value = 0.0
-    if value >= 90:
+    if value > 10:
+        value = value / 10.0
+    if value >= 9:
         return "Excellent"
-    if value >= 75:
+    if value >= 7.5:
         return "Good"
-    if value >= 60:
+    if value >= 6:
         return "Fair"
-    if value >= 40:
+    if value >= 4:
         return "Poor"
     return "Critical"
 
@@ -440,20 +456,62 @@ def _normalize_conversation_score(value: Any) -> dict:
     if not isinstance(value, dict):
         return {}
 
-    resolution = _score_number(value.get("resolution_score"), 0, 20)
-    context = _score_number(value.get("context_understanding_score"), 0, 20)
-    effort = _score_number(value.get("customer_effort_score"), 0, 20)
-    frustration_risk = _score_number(
-        value.get("trust_frustration_risk_score", value.get("frustration_risk_score")),
-        0,
-        40,
+    is_new_scale = any(
+        key in value
+        for key in ("ai_judgment_score", "message_signal_score", "final_score_100")
     )
-    raw_total = _score_number(
-        value.get("raw_total_score", float(resolution) + float(context) + float(effort) + float(frustration_risk)),
-        0,
-        100,
-    )
-    final_score = _score_number(value.get("final_score", raw_total), 0, 100)
+    if is_new_scale:
+        resolution = _score_number(value.get("resolution_score"), 0, 10)
+        context = _score_number(value.get("context_understanding_score"), 0, 10)
+        effort = _score_number(value.get("customer_effort_score"), 0, 10)
+        frustration_risk = _score_number(
+            value.get("trust_frustration_risk_score", value.get("frustration_risk_score")),
+            0,
+            10,
+        )
+        ai_judgment = _score_number(
+            value.get(
+                "ai_judgment_score",
+                (float(resolution) + float(context) + float(effort) + float(frustration_risk)) / 4.0,
+            ),
+            0,
+            10,
+        )
+        message_signal = _score_number(value.get("message_signal_score"), 0, 10)
+        raw_total = _score_number(
+            value.get("raw_total_score", (float(ai_judgment) + float(message_signal)) / 2.0),
+            0,
+            10,
+        )
+        final_score = _score_number(value.get("final_score", raw_total), 0, 10)
+        final_score_100 = _score_number(value.get("final_score_100", float(final_score) * 10.0), 0, 100)
+        display_max = 10
+    else:
+        resolution = _score_number(value.get("resolution_score"), 0, 20)
+        context = _score_number(value.get("context_understanding_score"), 0, 20)
+        effort = _score_number(value.get("customer_effort_score"), 0, 20)
+        frustration_risk = _score_number(
+            value.get("trust_frustration_risk_score", value.get("frustration_risk_score")),
+            0,
+            40,
+        )
+        ai_judgment = _score_number(
+            value.get(
+                "ai_judgment_score",
+                (float(resolution) + float(context) + float(effort) + float(frustration_risk)) / 10.0,
+            ),
+            0,
+            10,
+        )
+        message_signal = _score_number(value.get("message_signal_score", ai_judgment), 0, 10)
+        raw_total = _score_number(
+            value.get("raw_total_score", float(resolution) + float(context) + float(effort) + float(frustration_risk)),
+            0,
+            100,
+        )
+        final_score = _score_number(value.get("final_score", raw_total / 10.0), 0, 10)
+        final_score_100 = _score_number(value.get("final_score_100", raw_total), 0, 100)
+        display_max = 10
 
     rating = str(value.get("score_rating") or "").strip()
     if rating not in {"Excellent", "Good", "Fair", "Poor", "Critical"}:
@@ -464,11 +522,67 @@ def _normalize_conversation_score(value: Any) -> dict:
         "context_understanding_score": context,
         "customer_effort_score": effort,
         "trust_frustration_risk_score": frustration_risk,
+        "ai_judgment_score": ai_judgment,
+        "message_signal_score": message_signal,
         "raw_total_score": raw_total,
         "final_score": final_score,
+        "final_score_100": final_score_100,
+        "display_max": display_max,
+        "score_version": "v2" if is_new_scale else "legacy",
         "score_rating": rating,
         "score_explanation": str(value.get("score_explanation", "") or ""),
     }
+
+
+def _apply_message_signal_to_conversation_score(parsed_json: dict, computed_metadata: dict | None) -> None:
+    if not isinstance(parsed_json, dict):
+        return
+    existing = parsed_json.get("conversation_score") or {}
+    score = _normalize_conversation_score(existing)
+    if not score:
+        score = _normalize_conversation_score(
+            {
+                "resolution_score": 0,
+                "context_understanding_score": 0,
+                "customer_effort_score": 0,
+                "trust_frustration_risk_score": 0,
+                "ai_judgment_score": 0,
+                "message_signal_score": (computed_metadata or {}).get("message_signal_score", 0),
+                "raw_total_score": 0,
+                "final_score": 0,
+                "final_score_100": 0,
+                "score_explanation": "",
+            }
+        )
+    ai_judgment = _score_number(
+        score.get(
+            "ai_judgment_score",
+            (
+                float(score.get("resolution_score", 0))
+                + float(score.get("context_understanding_score", 0))
+                + float(score.get("customer_effort_score", 0))
+                + float(score.get("trust_frustration_risk_score", 0))
+            )
+            / 4.0,
+        ),
+        0,
+        10,
+    )
+    message_signal = _score_number(
+        (computed_metadata or {}).get("message_signal_score", score.get("message_signal_score", 0)),
+        0,
+        10,
+    )
+    raw_total = _score_number((float(ai_judgment) + float(message_signal)) / 2.0, 0, 10)
+    final_score = raw_total
+    score["ai_judgment_score"] = ai_judgment
+    score["message_signal_score"] = message_signal
+    score["raw_total_score"] = raw_total
+    score["final_score"] = final_score
+    score["final_score_100"] = _score_number(float(final_score) * 10.0, 0, 100)
+    score["display_max"] = 10
+    score["score_rating"] = _rating_from_score(final_score)
+    parsed_json["conversation_score"] = score
 
 
 def validate_conversation_level_result(data: dict) -> dict:
@@ -664,6 +778,8 @@ def validate_conversation_level_result(data: dict) -> dict:
         )
     out["classification_reason"] = classification_reason
     out["management_summary"] = management_summary
+    out["culprits"] = _normalize_culprits(data.get("culprits"))
+    out["culprit_reason"] = str(data.get("culprit_reason", "") or "")
     out["recommended_actions"] = [str(x) for x in (data.get("recommended_actions") or []) if x]
     out["manual_review_required"] = _normalize_bool_flag(data.get("manual_review_required"), default=False)
     out["manual_review_reason"] = str(data.get("manual_review_reason", "") or "")
@@ -1048,6 +1164,10 @@ def run_evaluation(
                 "manual_review_reason": cr.get("error_message") or "Parse failure",
                 "confidence": "low",
             }
+        _apply_message_signal_to_conversation_score(
+            cr.get("parsed_json") or {},
+            state.get("computed_metadata") or {},
+        )
         cr["evaluation_output"] = cr.get("parsed_json")
         return cr
 
@@ -1247,6 +1367,333 @@ def run_evaluation(
             ]
         results.message_level_results.extend(ordered)
 
+    results.finished_at = time.time()
+    if on_progress:
+        on_progress({"phase": "done", "total_conversations": total_conversations})
+    return results
+
+
+def run_conversation_level_only(
+    existing_message_level_results: list[dict],
+    client,
+    config: RunConfig,
+    df: pd.DataFrame | None = None,
+    existing_conversation_results: Optional[list[dict]] = None,
+    on_progress: Optional[Callable[[dict], None]] = None,
+    cancel_requested: Optional[Callable[[], bool]] = None,
+    on_message_result: Optional[Callable[[dict], None]] = None,
+    on_conversation_result: Optional[Callable[[dict], None]] = None,
+    on_error: Optional[Callable[[dict], None]] = None,
+) -> RunResults:
+    """Run only the conversation-level layer using existing message-level results."""
+    results = RunResults(started_at=time.time())
+    truncate_chars = config.max_chars_per_message if config.truncate_messages else None
+    workers = max(1, int(getattr(config.api, "concurrency", 1) or 1))
+
+    target_role = (config.message_target_role or "agent").strip().lower()
+    if target_role not in ("agent", "customer"):
+        target_role = "agent"
+
+    by_conv: dict[str, dict[Any, dict]] = {}
+    for mr in existing_message_level_results or []:
+        if not isinstance(mr, dict):
+            continue
+        conversation_id = str(mr.get("conversation_id") or mr.get("thread_id") or "")
+        message_index = mr.get("message_index")
+        if not conversation_id or message_index is None:
+            continue
+        try:
+            normalized_idx: Any = int(message_index)
+        except (TypeError, ValueError):
+            normalized_idx = message_index
+        by_conv.setdefault(conversation_id, {})[normalized_idx] = dict(mr)
+
+    conv_state: dict[str, dict[str, Any]] = {}
+    conv_order: list[str] = []
+
+    wanted_ids = (
+        set(str(x) for x in config.selected_conversation_ids)
+        if config.selected_conversation_ids is not None
+        else None
+    )
+
+    if df is not None and not df.empty:
+        groups = get_conversation_groups(df)
+        if wanted_ids is not None:
+            groups = [g for g in groups if str(g[0]) in wanted_ids]
+        elif config.max_conversations is not None:
+            groups = groups[: config.max_conversations]
+
+        for _, (conversation_id, group) in enumerate(groups, start=1):
+            records = message_records_from_group(group, conversation_id)
+            conversation_metadata = conversation_metadata_from_group(group)
+            targets = [r for r in records if r.get("sender_role") == target_role]
+            if config.max_agent_messages_per_conv is not None:
+                targets = targets[: config.max_agent_messages_per_conv]
+
+            available = by_conv.get(str(conversation_id), {})
+            missing_indices: list[Any] = []
+            message_results_ordered: list[dict] = []
+            for target in targets:
+                idx = target.get("message_index")
+                try:
+                    normalized_idx: Any = int(idx)
+                except (TypeError, ValueError):
+                    normalized_idx = idx
+                if normalized_idx in available:
+                    message_results_ordered.append(dict(available[normalized_idx]))
+                else:
+                    missing_indices.append(idx)
+
+            if missing_indices:
+                err = {
+                    "level": "conversation",
+                    "conversation_id": conversation_id,
+                    "error": (
+                        "Conversation-only run skipped because required message-level "
+                        f"results are missing for message_index values: {missing_indices[:10]}"
+                    ),
+                }
+                results.errors.append(err)
+                if on_error:
+                    try:
+                        on_error(err)
+                    except Exception:
+                        pass
+                continue
+
+            computed_md = compute_metadata(message_results_ordered, records)
+            computed_md["evaluation_target_role"] = target_role
+            computed_md["target_messages_evaluated"] = sum(
+                1 for m in message_results_ordered if m.get("parse_status") == "ok"
+            )
+            full_transcript = (
+                records if config.include_unknown_in_history
+                else [r for r in records if r.get("sender_role") != "unknown"]
+            )
+            conv_md_for_judge = dict(conversation_metadata)
+            conv_md_for_judge["evaluation_target_role"] = target_role
+
+            state = {
+                "conversation_id": conversation_id,
+                "conversation_index": len(conv_order) + 1,
+                "records": records,
+                "conversation_metadata": conversation_metadata,
+                "message_results_ordered": message_results_ordered,
+                "computed_metadata": computed_md,
+                "full_transcript": full_transcript,
+                "conv_md_for_judge": conv_md_for_judge,
+            }
+            conv_state[conversation_id] = state
+            conv_order.append(conversation_id)
+    else:
+        loaded_conversations = existing_conversation_results or []
+        for loaded in loaded_conversations:
+            conversation_id = str(loaded.get("conversation_id") or loaded.get("thread_id") or "")
+            if not conversation_id:
+                continue
+            if wanted_ids is not None and conversation_id not in wanted_ids:
+                continue
+            if wanted_ids is None and config.max_conversations is not None and len(conv_order) >= config.max_conversations:
+                break
+
+            records = list(loaded.get("transcript") or [])
+            conversation_metadata = dict(loaded.get("conversation_metadata") or {})
+            message_results_ordered = list(loaded.get("message_level_results") or [])
+            if not message_results_ordered:
+                available = by_conv.get(conversation_id, {})
+                message_results_ordered = [available[idx] for idx in sorted(available)]
+            if config.max_agent_messages_per_conv is not None:
+                message_results_ordered = message_results_ordered[: config.max_agent_messages_per_conv]
+
+            computed_md = compute_metadata(message_results_ordered, records)
+            computed_md["evaluation_target_role"] = target_role
+            computed_md["target_messages_evaluated"] = sum(
+                1 for m in message_results_ordered if m.get("parse_status") == "ok"
+            )
+            full_transcript = (
+                records if config.include_unknown_in_history
+                else [r for r in records if r.get("sender_role") != "unknown"]
+            )
+            conv_md_for_judge = dict(conversation_metadata)
+            conv_md_for_judge["evaluation_target_role"] = target_role
+
+            state = {
+                "conversation_id": conversation_id,
+                "conversation_index": len(conv_order) + 1,
+                "records": records,
+                "conversation_metadata": conversation_metadata,
+                "message_results_ordered": message_results_ordered,
+                "computed_metadata": computed_md,
+                "full_transcript": full_transcript,
+                "conv_md_for_judge": conv_md_for_judge,
+            }
+            conv_state[conversation_id] = state
+            conv_order.append(conversation_id)
+
+    total_conversations = len(conv_order)
+    if on_progress:
+        on_progress(
+            {
+                "phase": "start",
+                "total_conversations": total_conversations,
+                "workers": workers,
+            }
+        )
+
+    for conversation_id in conv_order:
+        state = conv_state[conversation_id]
+        for mr in state["message_results_ordered"]:
+            results.message_level_results.append(mr)
+            if on_message_result:
+                try:
+                    on_message_result(dict(mr))
+                except Exception:
+                    pass
+
+    def _finalize_cl_record(conversation_id: str, cr: dict) -> dict:
+        state = conv_state[conversation_id]
+        cr["thread_id"] = conversation_id
+        cr["conversation_metadata"] = state["conversation_metadata"]
+        cr["computed_metadata"] = state["computed_metadata"]
+        cr["transcript"] = state["records"]
+        cr["message_level_results"] = state["message_results_ordered"]
+        cr["evaluation_target_role"] = target_role
+        if cr.get("parse_status") != "ok" and not cr.get("parsed_json"):
+            cr["parsed_json"] = {
+                "customer_objective_type": "Inquiry",
+                "customer_primary_objective": "",
+                "handled_status": "unhandled",
+                "customer_experience": "bad",
+                "unhandled_resolution_subtype": "totally_unresolved",
+                "frustration_detected": True,
+                "frustration_origin": "our_side",
+                "customer_started_frustrated": False,
+                "customer_became_frustrated_during_chat": True,
+                "customer_ended_frustrated": False,
+                "frustration_timing": "during",
+                "final_customer_sentiment": "unknown",
+                "max_frustration_level": state["computed_metadata"].get("max_frustration_level", "none"),
+                "main_issue": {
+                    "issue_exists": True,
+                    "issue_origin": "our_side",
+                    "issue_type": "other",
+                    "issue_summary": "Conversation-level evaluator failed to parse",
+                    "customer_impact": "Unable to assess automatically",
+                },
+                "all_detected_issues": [],
+                "positive_signals": [],
+                "negative_signals": [],
+                "classification_reason": "The conversation-level evaluator failed, so the result is treated as unresolved and high risk for review.",
+                "management_summary": "Automatic evaluation could not parse a result for this conversation. Manual review required.",
+                "recommended_actions": ["Review this conversation manually."],
+                "manual_review_required": True,
+                "manual_review_reason": cr.get("error_message") or "Parse failure",
+                "confidence": "low",
+            }
+        _apply_message_signal_to_conversation_score(
+            cr.get("parsed_json") or {},
+            state.get("computed_metadata") or {},
+        )
+        cr["evaluation_output"] = cr.get("parsed_json")
+        return cr
+
+    pending: set[cf.Future] = set()
+    fut_info: dict[cf.Future, str] = {}
+
+    with cf.ThreadPoolExecutor(max_workers=workers) as ex:
+        for conversation_id in conv_order:
+            state = conv_state[conversation_id]
+            if on_progress:
+                on_progress(
+                    {
+                        "phase": "conversation_start",
+                        "conversation_index": state["conversation_index"],
+                        "conversation_id": conversation_id,
+                        "agent_messages": len(state["message_results_ordered"]),
+                        "target_messages": len(state["message_results_ordered"]),
+                        "target_role": target_role,
+                        "total_conversations": total_conversations,
+                        "workers": workers,
+                    }
+                )
+            fut = ex.submit(
+                _eval_conversation_level,
+                client=client,
+                api=config.api,
+                conversation_id=conversation_id,
+                conversation_metadata=state["conv_md_for_judge"],
+                full_transcript=state["full_transcript"],
+                message_level_evaluations=state["message_results_ordered"],
+                computed_metadata=state["computed_metadata"],
+                save_raw=config.save_raw_responses,
+                truncate_chars=truncate_chars,
+                prompt=config.conversation_prompt,
+            )
+            pending.add(fut)
+            fut_info[fut] = conversation_id
+
+        while pending:
+            done, _ = cf.wait(pending, return_when=cf.FIRST_COMPLETED)
+            for fut in done:
+                pending.discard(fut)
+                conversation_id = fut_info.pop(fut)
+                state = conv_state[conversation_id]
+                try:
+                    cr = fut.result()
+                except Exception as e:  # noqa: BLE001
+                    cr = {
+                        "conversation_id": conversation_id,
+                        "raw_model_response": None,
+                        "parsed_json": None,
+                        "parse_status": "api_error",
+                        "error_message": f"Worker raised: {e}",
+                        "debug": None,
+                    }
+                cr = _finalize_cl_record(conversation_id, cr)
+
+                if cr.get("parse_status") != "ok":
+                    err = {
+                        "level": "conversation",
+                        "conversation_id": conversation_id,
+                        "error": cr.get("error_message"),
+                    }
+                    results.errors.append(err)
+                    if on_error:
+                        try:
+                            on_error(err)
+                        except Exception:
+                            pass
+
+                results.conversation_results.append(cr)
+                if on_conversation_result:
+                    try:
+                        on_conversation_result(cr)
+                    except Exception:
+                        pass
+
+                if on_progress:
+                    on_progress(
+                        {
+                            "phase": "conversation_done",
+                            "conversation_index": state["conversation_index"],
+                            "conversation_id": conversation_id,
+                            "total_conversations": total_conversations,
+                            "status": cr.get("parse_status"),
+                        }
+                    )
+
+            if cancel_requested and cancel_requested():
+                for fut in list(pending):
+                    if not fut.done():
+                        fut.cancel()
+                    pending.discard(fut)
+                break
+
+    order_by_cid = {cid: i for i, cid in enumerate(conv_order)}
+    results.conversation_results.sort(
+        key=lambda c: order_by_cid.get(c.get("conversation_id"), 0)
+    )
     results.finished_at = time.time()
     if on_progress:
         on_progress({"phase": "done", "total_conversations": total_conversations})

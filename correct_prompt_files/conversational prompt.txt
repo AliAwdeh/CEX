@@ -41,7 +41,13 @@ Use only what is visible in the transcript, metadata, and message-level evaluati
 
 Message-level evaluations may be used only as supporting signals for chatbot behavior, issue patterns, and examples of friction. They are not evidence of the customer's emotional state.
 
+If a structured message-level summary is provided, use it as a concrete cross-check for issue burden, recovery, repetition, unresolved red flags, and sender-entity patterns. Treat it as strong supporting evidence, not automatic truth.
+
+One recovered issue does not erase other unrelated unresolved red flags. If one point was fixed later but other message-level issues remained unresolved or repeated, keep those failures in the overall customer_experience judgment and score.
+
 For all frustration fields, use only the visible conversation transcript and customer language/behavior. Do not rely on, copy, aggregate, average, inherit, or infer from message-level frustration scores, message-level frustration_change values, or message-level issue severity. The message-level prompt estimates expected impact; the conversational prompt judges actual observed frustration.
+
+When the transcript exposes raw sender identity fields such as `raw_sender_role` or `sender_entity`, use them to distinguish customer, human agent, bot, and broadcast/system behavior when assigning culprits.
 
 Do not infer customer frustration from the agent's wording about the customer, such as "I understand your frustration", "I can see why this feels stuck", "we know this is urgent", or "sorry this is frustrating." Those are agent assumptions or empathy statements, not evidence of the customer's emotional state. Frustration must come from the customer's own visible messages or repeated customer behavior.
 
@@ -440,89 +446,74 @@ If frustration_detected = false, frustration_origin = none and frustration_timin
 
 # 9. Scoring
 
-conversation_score components (0-100 total):
+conversation_score components:
 
-Scores must be holistic, not a mechanical count of message-level issues. Group repeated patterns and judge the final customer journey quality.
+The default score scale is 0-10. Also provide a 0-100 equivalent for display.
+
+Scores must be holistic, not a mechanical count of message-level issues. Group repeated patterns and judge the final customer journey quality. Use the structured message-level summary as a strong cross-check for how many issues happened, how many were major/minor/recovered, and whether unresolved red flags still remained by the end.
 
 Do not automatically give full resolution just because handled_status = handled. Handled means the objective was addressed enough to classify the outcome; resolution_score measures how completely and cleanly it was addressed.
 
-Do not automatically give a low score just because customer_experience = bad. A handled conversation with mild recovered friction, clear final answers, customer acceptance, and no high visible frustration should usually stay in the Fair range or above unless there was severe trust damage, cancellation/refund risk, wrong information, or an unresolved material issue.
+Do not automatically give a low score just because customer_experience = bad. A handled conversation with mild recovered friction, clear final answers, customer acceptance, and no high visible frustration should usually stay in the middle or above unless there was severe trust damage, wrong information, repeated unresolved friction, or an unresolved material issue.
 
-Do not tie the final score mechanically to handled_status. Handled conversations generally have higher resolution_score, but an unhandled conversation can still score near a handled one when the chatbot clearly explains a valid pending state or constraint, gives ownership, timeline, and next steps, and creates low customer effort. Conversely, a handled conversation can score low if the path involved severe friction, trust damage, or high effort.
+One recovered issue does not erase other unresolved issues. If one point was solved later but other red flags remained unresolved, repeated, or still blocked the customer, keep those failures visible in the score.
 
-**resolution_score** (0-20)
-- 20 = full objective achieved, or a narrow status-only question was directly answered with a clear current state, dependency, next milestone, and customer action state
-- 16-19 = objective mostly handled with only minor missing detail that would not materially affect the customer's next step
-- 12-15 = useful current state or partial answer given, but material parts of the customer's objective remained incomplete, such as missing timeline, missing explanation of what a stage means, unresolved contradiction, or unanswered named-agent/escalation request
-- 8-11 = partial progress only; customer received some relevant information but still lacked a usable answer for a material part of the objective
-- 1-7 = minimal progress; mostly vague updates or generic reassurance with little usable information
+**resolution_score** (0-10)
+- 10 = full objective achieved, or a narrow status-only question was directly answered with a clear current state, dependency, next milestone, and customer action state
+- 8-9 = objective mostly handled with only minor missing detail that would not materially affect the customer's next step
+- 6-7 = useful current state or partial answer given, but material parts of the customer's objective remained incomplete
+- 3-5 = partial progress only; customer received some relevant information but still lacked a usable answer for a material part of the objective
+- 1-2 = minimal progress; mostly vague updates or generic reassurance with little usable information
 - 0 = unresolved with no usable answer, current state, or next step
 
-**context_understanding_score** (0-20)
-- 20 = used visible context correctly throughout and answered the real questions directly
-- 16-19 = mostly good context handling with one small miss or harmless clarification
-- 11-15 = some context used, but the chatbot delayed, misunderstood, or incompletely answered an important point before recovering
-- 6-10 = repeated context misses, contradictory guidance, ignored direct questions, or confusing handoff/identity handling
-- 1-5 = severe context failure, repeated requests for already-visible information, or major contradiction
+**context_understanding_score** (0-10)
+- 10 = used visible context correctly throughout and answered the real questions directly
+- 8-9 = mostly good context handling with one small miss or harmless clarification
+- 6-7 = some context used, but the chatbot delayed, misunderstood, or incompletely answered an important point before recovering
+- 3-5 = repeated context misses, contradictory guidance, ignored direct questions, or confusing handoff/identity handling
+- 1-2 = severe context failure, repeated requests for already-visible information, or major contradiction
 - 0 = the chatbot essentially missed the customer's actual objective
 
-**customer_effort_score** (0-20)
-- 20 = low effort; no repetition, no unnecessary collection, no avoidable follow-up needed
-- 16-19 = one minor clarification or low-impact follow-up, promptly resolved
-- 11-15 = some avoidable effort, but the customer did not have to repeatedly chase the same answer
-- 6-10 = customer had to repeat, reframe, chase, or request escalation more than once
-- 1-5 = high effort with looping, repeated unanswered asks, unnecessary collection, or failed handoff
+**customer_effort_score** (0-10)
+- 10 = low effort; no repetition, no unnecessary collection, no avoidable follow-up needed
+- 8-9 = one minor clarification or low-impact follow-up, promptly resolved
+- 6-7 = some avoidable effort, but the customer did not have to repeatedly chase the same answer
+- 3-5 = customer had to repeat, reframe, chase, or request escalation more than once
+- 1-2 = high effort with looping, repeated unanswered asks, unnecessary collection, or failed handoff
 - 0 = severe loop/dead end where the customer had to do most of the work and still lacked a path forward
 
-**trust_frustration_risk_score** (0-40)
-- 40 = no visible trust risk and no observed customer frustration
-- 32-39 = minor risk only; issue was promptly clarified, customer stayed calm, and final response was accepted
-- 24-31 = moderate risk from delay, unclear guidance, or vague updates, with no severe trust damage and no high observed frustration
-- 12-23 = high risk from repeated deferrals plus visible customer concern/escalation, confusing handoff, visible anger, strong emotional urgency, trust concern, or unresolved anxiety
-- 1-11 = severe trust damage, explicit accusation, cancellation/refund/escalation risk, legal/visa overstay risk mishandled, or severe dissatisfaction
-- 0 = extreme breakdown: cancellation/refund/escalation risk plus no credible recovery, or severe unresolved trust/safety/legal risk
+**trust_frustration_risk_score** (0-10)
+- 10 = no visible trust risk and no observed customer frustration
+- 8-9 = minor risk only; issue was promptly clarified, customer stayed calm, and final response was accepted
+- 6-7 = moderate risk from delay, unclear guidance, or vague updates, with no severe trust damage and no high observed frustration
+- 3-5 = high risk from repeated deferrals, visible customer concern/escalation, confusing handoff, visible anger, or unresolved anxiety
+- 1-2 = severe trust damage, explicit accusation, cancellation/refund/escalation risk, or severe dissatisfaction
+- 0 = complete CX breakdown: repeated unrecovered looping, repeated unanswered chasing, broken or circular routing, or no credible recovery/path forward
 
 For this score, use actual transcript evidence of customer frustration and trust damage. Do not import message-level frustration ratings.
 
 ## Score Calibration Guardrails
 
 - Score the four components first. Use handled_status and customer_experience as context, not as hard caps.
-- Handled + good usually scores 75-100.
-- Handled + good with one low-impact missed or generic response that is immediately corrected after one follow-up, no visible frustration, and a clear final answer usually scores 80-90.
-- Handled + good with several process questions, a concrete accepted queue handoff, complete later answer, and satisfied ending usually scores 82-90 unless there is visible frustration, repeated chasing, wrong information, or unresolved material detail.
-- If the journey is handled, the likely score is 80 or above, and the only negatives are minor recovered friction, natural follow-ups, accepted handoff, harmless promo, normal address collection, or external-process uncertainty, customer_experience should usually be good. Mark bad only when there is a material unresolved issue, repeated chasing, visible frustration, trust damage, wrong information, or serious process contradiction.
-- Handled + bad with mild friction that is promptly clarified and accepted usually scores 65-74.
-- Handled + bad with several avoidable issues but no actual visible frustration, and a neutral/polite customer tone, usually scores 60-72.
-- Handled + bad with several avoidable issues and low/medium visible frustration usually scores 55-70.
-- Handled + bad with repeated vague deferrals, confusing handoff, explicit customer frustration, or trust damage usually scores 30-55.
-- Unhandled + good with a clear pending state, valid constraint, owner, timeline/trigger, and next step can score 60-80 even though the final outcome is not complete.
-- Unhandled + good with only a partial pending explanation usually scores 50-65.
-- Unhandled + bad can still score in the 45-65 range when the objective is pending but there is a usable current state and some helpful progress; score below 45 only when there is high effort, severe trust damage, cancellation/refund/escalation risk, or no credible path forward.
-- Unhandled + bad with no usable current state or next step usually scores below 50.
+- `ai_judgment_score` = average of the four component scores above.
+- If `message_level_summary.message_signal_score` is provided, copy that value into `message_signal_score`.
+- `raw_total_score` = average of `ai_judgment_score` and `message_signal_score`.
+- `final_score` = `raw_total_score`.
+- `final_score_100` = `final_score * 10`.
+- `0` is allowed. Use it when the journey is a complete CX breakdown with repeated unrecovered looping, repeated customer chasing, broken routing, and no usable path forward.
+- Handled + good usually lands in the 7.5-10 range.
+- Handled + bad with mild but real friction usually lands around 6-7.4.
+- Handled + bad with repeated unresolved friction, trust damage, or visible chasing usually lands around 3-5.5.
+- Unhandled + good with a clear pending state, owner/dependency, timeline/trigger, and next step can still land around 6-8.
+- Unhandled + bad with no usable current state or next step usually lands below 5.
 
 Do not use a final_score threshold to override customer_experience. A handled journey can still be customer_experience = bad when visible evidence shows avoidable effort, confusing guidance, trust damage, wrong information, repeated unrecovered friction, or a material pre-resolution issue. If customer_experience is bad but the numeric score is relatively high, keep customer_experience = bad when the evidence supports it and explain the mismatch in score_explanation.
 
 If customer_experience = good, do not list minor recovered friction as main_issue or all_detected_issues unless it caused real customer effort, confusion, delay, or trust risk.
 
-If the customer ended satisfied or thankful, the objective was handled, and there is no high visible frustration, do not score below 65 unless there was a severe hidden-cost issue, wrong information, cancellation/refund risk, legal/visa risk, or an unresolved material question.
+score_rating: Excellent (9-10) | Good (7.5-8.9) | Fair (6-7.4) | Poor (4-5.9) | Critical (0-3.9)
 
-If the objective was handled and the customer remained neutral, polite, or thankful with no actual observed frustration, do not score below 60 unless there was a material unresolved question, severe trust damage, wrong information, cancellation/refund risk, legal/visa risk, or a serious process contradiction.
-
-If the customer explicitly expresses strong frustration, loss of trust, accusation of stalling, or repeated unanswered chasing, do not score above 55 unless the chatbot clearly recovers with a complete answer, credible ownership, and a concrete next step.
-
-If the chatbot gives only the current stage but does not answer the customer's material follow-up questions about what that stage means, how long it will take, or who owns the next step, resolution_score should usually be 12-15, not 20.
-
-If a direct fine/fee/value question is answered with a clear limitation that the exact number is not confirmed or not available in chat, but the customer receives useful current-state/process context and is not left unable to act, resolution_score can be 15-18. Do not give resolution_score = 20 unless the exact value or a complete verification/payment path is provided. Use 8-12 only when the missing value materially blocks the customer's next step.
-
-If a final outcome such as refund, approval, delivery, or cancellation is still pending but the chatbot gives a clear owner, dependency, timeframe/trigger, and customer action state, resolution_score can be 12-16 even though handled_status = unhandled.
-
-raw_total_score = sum of four components.
-
-final_score = raw_total_score.
-
-score_rating: Excellent (90-100) | Good (75-89) | Fair (60-74) | Poor (40-59) | Critical (0-39)
-
-score_explanation: brief explanation of main score drivers.
+score_explanation: brief explanation of main score drivers, including whether the concrete message-level issue burden pulled the final score down despite any local recovery.
 
 ---
 
@@ -562,6 +553,18 @@ Examples: "Agent answered the direct question early before asking for more detai
 ## negative_signals
 Array of visible weaknesses. Return [] if none exist.
 Examples: "Customer had to repeat information already provided", "Agent relied on vague update language instead of a usable next step", "Agent implied downstream action was ready while visible prerequisites were still pending", "Customer remained polite throughout a structurally bad journey — friction was not visible in tone"
+
+## culprits
+List which sender entities materially caused the bad experience or unresolved friction. Use only: `agent`, `bot`, `broadcast`, `customer`.
+
+- Multiple culprits are allowed.
+- Use sender identity from the transcript such as `sender_entity` / `raw_sender_role` when available.
+- Include an entity only when it materially contributed to the bad experience, repeated friction, wrong routing, wrong information, or unresolved issue burden.
+- Do not list an entity just because it appeared once harmlessly or because it created one small recovered issue inside an otherwise good journey.
+- If the journey is good and no material culprit exists, return `culprits = []` and `culprit_reason = "none"`.
+
+## culprit_reason
+One short explanation of why the listed culprits were materially responsible, including mixed responsibility when applicable.
 
 ## management_summary
 Concise business-friendly explanation: what the customer wanted, whether it was handled, whether the experience was good or bad, and why.
