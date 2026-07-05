@@ -393,6 +393,15 @@ def flatten_conversation_row(
     ]
     for f in cm_fields:
         row[f] = computed_metadata.get(f)
+    # Older saved runs may predate this computed marker or contain a stale
+    # value. Recalculate it from the persisted transcript and message results
+    # whenever the platform rebuilds its conversation table.
+    message_level_results = conv_result.get("message_level_results") or []
+    if transcript and message_level_results:
+        row["broadcast_only_red_issue"] = _broadcast_only_red_issue_flag(
+            message_level_results,
+            transcript,
+        )
     row.update(_flatten_conversation_score(cl.get("conversation_score")))
     return row
 

@@ -8,6 +8,7 @@ import hmac
 import importlib
 import os
 import sqlite3
+import textwrap
 import time
 from dataclasses import asdict
 from pathlib import Path
@@ -4339,9 +4340,29 @@ def _render_message_flag_stats_table(flag_stats_df: pd.DataFrame) -> None:
 def tab_stats() -> None:
     st.subheader("Stats")
     st.caption(
-        "Handled, not-handled, unresolved subtype, and overall customer experience counts "
-        "for the current evaluated journeys."
+        "A simple count of journey outcomes, customer experience, and message quality "
+        "for the currently loaded review."
     )
+    with st.expander("How to read the Stats page", expanded=False):
+        st.markdown(textwrap.dedent(
+            """
+            - **Count** is the number of customer journeys in that result.
+            - **Percentage** shows how much of the full review that result represents.
+            - **Handled** means the customer's request was completed. **Pending unresolved**
+              means more work or follow-up was still needed. **Totally unresolved** means the
+              request was not solved.
+            - The message table separates replies from a human **Agent**, an automated **Bot**,
+              and a system **Broadcast**.
+            - **Red** messages need attention, **Yellow** messages may need improvement, and
+              **Green** messages were assessed as acceptable.
+            - **Flagged rate** is the share of that sender's evaluated messages that were red or
+              yellow. **Share of all flagged** shows how much that sender contributed to all red
+              and yellow messages.
+
+            Use these totals to spot patterns, then open **Journey Review** to read the actual
+            conversation and check its journey analysis before making a decision.
+            """
+        ))
     if not _has_results():
         st.info("Run an evaluation first.")
         return
@@ -4386,9 +4407,28 @@ def tab_stats() -> None:
 def tab_overview() -> None:
     st.subheader("Overview")
     st.caption(
-        "Management view of where journeys land across the handled / not-handled "
-        "families, focused on surfacing problems and their measurable impact."
+        "A quick picture of how customer journeys ended, where frustration came from, "
+        "and which problems appeared most often."
     )
+    with st.expander("How to read the Overview page", expanded=False):
+        st.markdown(textwrap.dedent(
+            """
+            Start with the three summary cards:
+
+            - **Handled** means the customer's request was completed.
+            - **Pending unresolved** means the request still needed follow-up or another action.
+            - **Totally unresolved** means the request was not solved.
+
+            Each card also shows whether the overall customer experience was good or bad.
+            The **Journey marker breakdown** explains where frustration came from inside each
+            outcome group. The **Detected issues** section shows the most common problem types
+            and whether they came from our side, the customer side, or another source.
+
+            This page is for finding patterns. To confirm what happened in a specific case,
+            open **Journey Review**, turn on **Show journey analysis and review metrics**, and
+            read the full conversation.
+            """
+        ))
     if not _has_results():
         st.info("Run an evaluation first.")
         return
@@ -5114,6 +5154,39 @@ def tab_review() -> None:
     st.caption(
         "Browse customer journeys by result, customer frustration, review priority, or the main customer problem."
     )
+    st.info(
+        "For a complete review, turn on **Show journey analysis and review metrics**, "
+        "check the flagged messages, read the full conversation, and add your review comment "
+        "before marking the journey as reviewed."
+    )
+    with st.expander("How to use Journey Review and its filters", expanded=False):
+        st.markdown(textwrap.dedent(
+            """
+            1. Use the main filters to narrow the list by outcome, customer experience,
+               unresolved status, frustration, problem type, who started the journey, review
+               requirement, or date.
+            2. Leaving a filter empty means it does not limit the results. Choosing several
+               values inside one filter shows journeys matching any of those values. Filters
+               used in different boxes work together, so a journey must match all of them.
+            3. **Broadcast-only issue journeys** are hidden by default. Turn on that option if
+               you also want journeys where the only red message was a system broadcast.
+            4. The Agent, Bot, and Broadcast message filters look for journeys containing at
+               least one evaluated message with the selected color:
+               **Red** needs attention, **Yellow** may need improvement, and **Green** was
+               assessed as acceptable. **All (no filter)** places no restriction on that sender.
+               If you select colors for several sender types, the journey must match every
+               selected sender filter.
+            5. Use search to find a customer or conversation directly. Use **Worst score first**
+               to begin with the journeys that may need the most attention.
+            6. Turn on **Show journey analysis and review metrics**. Check the journey outcome,
+               experience, score, frustration, main issue, recommended actions, and flagged
+               message summary.
+            7. Read the full conversation. Use the information button beside an evaluated
+               message to understand why it was marked red, yellow, or green.
+            8. Add a clear review comment and select **Mark as reviewed** when your check is
+               complete.
+            """
+        ))
 
     show_review_details = st.toggle(
         "Show journey analysis and review metrics",
