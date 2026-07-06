@@ -15,13 +15,16 @@ from openai import OpenAI
 
 DEFAULT_BASE_URL = "https://langcc.maidstech.ai/v1"
 DEFAULT_MODEL = "openai/gpt-5.4-mini"
-MAX_CONCURRENCY = 100
+MAX_CONCURRENCY = 200
 
 @dataclass
 class APIConfig:
     base_url: str = DEFAULT_BASE_URL
     api_key: str = ""
     model: str = DEFAULT_MODEL
+    # Cross-provider thinking control. Supported values are:
+    # default, disabled, low, medium, high, maximum.
+    thinking_effort: str = "default"
     temperature: float = 0.1
     top_p: float = 1.0
     max_tokens: int = 100000
@@ -69,6 +72,27 @@ def _looks_like_response_format_rejection(error: Exception) -> bool:
     )
 
 
+def _thinking_request_kwargs(config: APIConfig) -> dict[str, Any]:
+    """Translate the platform thinking setting to provider-compatible fields."""
+    effort = str(config.thinking_effort or "default").strip().lower()
+    if effort in {"", "default", "provider default"}:
+        return {}
+
+    is_deepseek = "deepseek" in f"{config.base_url} {config.model}".lower()
+    if effort in {"disabled", "off", "none"}:
+        if is_deepseek:
+            return {"extra_body": {"thinking": {"type": "disabled"}}}
+        return {"reasoning_effort": "none"}
+
+    effort = effort if effort in {"low", "medium", "high", "maximum"} else "medium"
+    if is_deepseek:
+        return {
+            "reasoning_effort": "max" if effort == "maximum" else effort,
+            "extra_body": {"thinking": {"type": "enabled"}},
+        }
+    return {"reasoning_effort": "xhigh" if effort == "maximum" else effort}
+
+
 def chat_completion(
     client: OpenAI,
     config: APIConfig,
@@ -82,7 +106,11 @@ def chat_completion(
     ]
     last_error: Exception | None = None
     attempts = max(1, int(config.retries) + 1)
-    debug: dict[str, Any] = {"attempts": 0, "errors": []}
+    debug: dict[str, Any] = {
+        "attempts": 0,
+        "errors": [],
+        "thinking_effort": str(config.thinking_effort or "default"),
+    }
 
     for attempt in range(1, attempts + 1):
         debug["attempts"] = attempt
@@ -95,6 +123,7 @@ def chat_completion(
                 "max_tokens": int(config.max_tokens),
                 "timeout": float(config.timeout),
             }
+            kwargs.update(_thinking_request_kwargs(config))
             # Hint compatible endpoints to prefer JSON responses where supported.
             # Some proxies will ignore unknown params, so guard the call.
             try:

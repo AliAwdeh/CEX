@@ -11,6 +11,7 @@ import concurrent.futures as cf
 import json
 import re
 import time
+from collections import deque
 from dataclasses import dataclass, field
 from typing import Any, Callable, Optional
 
@@ -981,11 +982,11 @@ def run_evaluation(
 
     All AI calls — both message-level and conversation-level, across all
     conversations — share ONE ``ThreadPoolExecutor`` whose worker count equals
-    ``config.api.concurrency``. The instant a
-    worker is free it picks the next pending task from the queue, regardless of
-    which conversation it belongs to. As soon as the *last* message-level call
-    for a given conversation completes, that conversation's conversation-level
-    call is submitted to the same pool — no cross-conversation barrier.
+    ``config.api.concurrency``. Only enough work to fill the active worker slots
+    is submitted at once. As soon as the *last* message-level call for a
+    conversation completes, its conversation-level call receives priority for
+    the next free slot — no cross-conversation barrier and no waiting behind the
+    entire message-level queue.
 
     Optional persistence callbacks (``on_message_result``,
     ``on_conversation_result``, ``on_error``) are invoked on the calling thread
@@ -1179,34 +1180,47 @@ def run_evaluation(
 
     fut_info: dict[cf.Future, dict] = {}
     pending: set[cf.Future] = set()
+    unscheduled_ml = deque(ml_tasks)
+    ready_cl = deque(no_target_convs)
 
     with cf.ThreadPoolExecutor(max_workers=workers) as ex:
-        # 1. Submit every message-level task across every conversation up front.
-        for conversation_id, target, history in ml_tasks:
-            fut = ex.submit(
-                _eval_message_level,
-                client=client,
-                api=config.api,
-                conversation_id=conversation_id,
-                target_record=target,
-                history_records=history,
-                conversation_metadata=conv_state[conversation_id]["conversation_metadata"],
-                save_raw=config.save_raw_responses,
-                truncate_chars=truncate_chars,
-                prompt=config.message_prompt,
-            )
-            pending.add(fut)
-            fut_info[fut] = {"type": "ml", "conversation_id": conversation_id, "target": target}
+        def fill_worker_slots() -> None:
+            """Keep the pool full, prioritizing newly-ready conversation calls."""
+            while len(pending) < workers and (ready_cl or unscheduled_ml):
+                if ready_cl:
+                    conversation_id = ready_cl.popleft()
+                    fut = _submit_cl(ex, conversation_id)
+                    pending.add(fut)
+                    fut_info[fut] = {
+                        "type": "cl",
+                        "conversation_id": conversation_id,
+                    }
+                    continue
 
-        # 2. Conversations with no target messages can run their CL immediately.
-        for conversation_id in no_target_convs:
-            fut = _submit_cl(ex, conversation_id)
-            pending.add(fut)
-            fut_info[fut] = {"type": "cl", "conversation_id": conversation_id}
+                conversation_id, target, history = unscheduled_ml.popleft()
+                fut = ex.submit(
+                    _eval_message_level,
+                    client=client,
+                    api=config.api,
+                    conversation_id=conversation_id,
+                    target_record=target,
+                    history_records=history,
+                    conversation_metadata=conv_state[conversation_id]["conversation_metadata"],
+                    save_raw=config.save_raw_responses,
+                    truncate_chars=truncate_chars,
+                    prompt=config.message_prompt,
+                )
+                pending.add(fut)
+                fut_info[fut] = {
+                    "type": "ml",
+                    "conversation_id": conversation_id,
+                    "target": target,
+                }
 
-        # 3. Drain. As each ML finishes, check whether its conversation's CL is
-        #    now ready to fire; if so submit it to the same pool. As each CL
-        #    finishes, record the conversation result.
+        fill_worker_slots()
+
+        # Drain active work. Ready conversation calls are queued before any
+        # additional message calls whenever worker slots become available.
         while pending:
             done, _ = cf.wait(pending, return_when=cf.FIRST_COMPLETED)
             for fut in done:
@@ -1278,15 +1292,16 @@ def run_evaluation(
                         stop_signal["flag"] = True
                         stop_signal["reason"] = stop_signal["reason"] or "cancelled"
 
-                    # Submit this conversation's CL now if its ML batch is complete.
+                    # Give this conversation's CL priority for the next free slot.
                     if (
                         not stop_signal["flag"]
                         and not state["cl_submitted"]
                         and state["ml_done"] >= state["ml_total"]
                     ):
-                        cl_fut = _submit_cl(ex, conversation_id)
-                        pending.add(cl_fut)
-                        fut_info[cl_fut] = {"type": "cl", "conversation_id": conversation_id}
+                        # Mark now to prevent duplicate queueing when several
+                        # message futures complete in the same wait batch.
+                        state["cl_submitted"] = True
+                        ready_cl.append(conversation_id)
 
                 elif info["type"] == "cl":
                     try:
@@ -1339,6 +1354,8 @@ def run_evaluation(
 
             if stop_signal["flag"]:
                 # Cancel anything that hasn't started yet and drop the rest.
+                unscheduled_ml.clear()
+                ready_cl.clear()
                 for f in list(pending):
                     if not f.done():
                         f.cancel()
@@ -1351,6 +1368,7 @@ def run_evaluation(
                         }
                     )
                 break
+            fill_worker_slots()
 
     # Sort outputs by the original conversation order, then by message_index,
     # so the dashboard and exports stay deterministic regardless of completion

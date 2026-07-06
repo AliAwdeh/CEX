@@ -129,11 +129,12 @@ analysis, and other rows that should not appear in the customer-visible transcri
 
 Master users can configure:
 
-- API base URL, API key, and model
+- API base URL, API key, and separate message/conversation models
+- Separate message-level and conversation-level thinking effort
 - Temperature and top-p
 - Maximum response tokens
 - Request timeout and retry count
-- Message-level concurrency, capped at 100
+- Message-level concurrency, capped at 200
 - Number of journeys to process or run all uploaded journeys
 - Maximum target messages per journey
 - Whether to evaluate assistant or customer messages
@@ -146,7 +147,8 @@ The application sends `temperature`, `top_p`, `max_tokens`, and `timeout` with c
 completion requests. It requests JSON response formatting when the provider supports it
 and retries without that option when the provider explicitly rejects it.
 
-The application does **not** currently send a `reasoning_effort` parameter.
+The application sends the selected reasoning effort using OpenAI-compatible
+`reasoning_effort` fields and DeepSeek's thinking-mode fields.
 
 ## Prompts
 

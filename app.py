@@ -19,8 +19,8 @@ import streamlit as st
 import streamlit.components.v1 as components
 import ui_components as ui_components_module
 
-from api_client import APIConfig, DEFAULT_BASE_URL, build_client, fetch_models
-from cost_estimator import estimate_gpt5_mini_run_cost, is_gpt5_mini
+from api_client import APIConfig, DEFAULT_BASE_URL, MAX_CONCURRENCY, build_client, fetch_models
+from cost_estimator import estimate_run_tokens_and_cost
 from data_loader import (
     JOURNEY_ID_COLUMN,
     METADATA_COLUMNS,
@@ -92,6 +92,8 @@ DEFAULT_EVALUATION_SETTINGS = {
     "api_base_url": DEFAULT_BASE_URL,
     "selected_model": DEFAULT_SELECTED_MODEL,
     "conversation_selected_model": DEFAULT_SELECTED_MODEL,
+    "message_thinking_effort": "default",
+    "conversation_thinking_effort": "default",
     "temperature": 0.1,
     "top_p": 1.0,
     "max_tokens": 100000,
@@ -268,6 +270,8 @@ def _init_state() -> None:
         "api_key": "",
         "selected_model": DEFAULT_EVALUATION_SETTINGS["selected_model"],
         "conversation_selected_model": DEFAULT_EVALUATION_SETTINGS["conversation_selected_model"],
+        "message_thinking_effort": DEFAULT_EVALUATION_SETTINGS["message_thinking_effort"],
+        "conversation_thinking_effort": DEFAULT_EVALUATION_SETTINGS["conversation_thinking_effort"],
         "temperature": DEFAULT_EVALUATION_SETTINGS["temperature"],
         "top_p": DEFAULT_EVALUATION_SETTINGS["top_p"],
         "max_tokens": DEFAULT_EVALUATION_SETTINGS["max_tokens"],
@@ -323,6 +327,12 @@ def _init_state() -> None:
         st.session_state.conversation_selected_model = st.session_state.selected_model
     if not st.session_state.get("api_base_url"):
         st.session_state.api_base_url = DEFAULT_BASE_URL
+    if st.session_state.get("_separate_thinking_effort_version") != 1:
+        legacy_effort = str(st.session_state.get("thinking_effort") or "default")
+        if legacy_effort in {"default", "disabled", "low", "medium", "high", "maximum"}:
+            st.session_state.message_thinking_effort = legacy_effort
+            st.session_state.conversation_thinking_effort = legacy_effort
+        st.session_state["_separate_thinking_effort_version"] = 1
 
 
 _init_state()
@@ -969,6 +979,7 @@ def _build_api_config() -> APIConfig:
         base_url=st.session_state.api_base_url,
         api_key=st.session_state.api_key,
         model=st.session_state.selected_model,
+        thinking_effort=str(st.session_state.message_thinking_effort),
         temperature=float(st.session_state.temperature),
         top_p=float(st.session_state.top_p),
         max_tokens=int(st.session_state.max_tokens),
@@ -987,6 +998,7 @@ def _build_conversation_api_config() -> APIConfig:
             st.session_state.get("conversation_selected_model")
             or st.session_state.selected_model
         ),
+        thinking_effort=str(st.session_state.conversation_thinking_effort),
         temperature=api.temperature,
         top_p=api.top_p,
         max_tokens=api.max_tokens,
@@ -1040,6 +1052,38 @@ def _has_results() -> bool:
     return st.session_state.run_results is not None and bool(
         getattr(st.session_state.run_results, "conversation_results", [])
     )
+
+
+def _show_live_run_failure(
+    failure_box,
+    failures: list[dict],
+    error: dict,
+) -> None:
+    """Show persisted evaluator failures immediately while a run is active."""
+    failures.append(dict(error or {}))
+    visible = failures[-5:]
+    lines: list[str] = []
+    for failure in visible:
+        level = humanize_label(failure.get("level") or "evaluation")
+        location = []
+        if failure.get("conversation_id") not in (None, ""):
+            location.append(f"Customer `{failure['conversation_id']}`")
+        if failure.get("message_index") not in (None, ""):
+            location.append(f"message #{failure['message_index']}")
+        heading = f"**{level} failure**"
+        if location:
+            heading += " — " + ", ".join(location)
+        message = (
+            failure.get("error")
+            or failure.get("error_message")
+            or "The evaluation failed without an error message."
+        )
+        lines.append(f"{heading}\n\n{message}")
+
+    prefix = f"**{len(failures):,} evaluation failure(s) detected.**"
+    if len(failures) > len(visible):
+        prefix += " Showing the latest 5."
+    failure_box.error(prefix + "\n\n" + "\n\n---\n\n".join(lines))
 
 
 def _normalize_conversation_result_for_display(cr: dict) -> dict:
@@ -1172,6 +1216,8 @@ def _execute_conversation_only_run(
         "model": config.api.model,
         "message_model": config.api.model,
         "conversation_model": config.conversation_api_config().model,
+        "message_thinking_effort": config.api.thinking_effort,
+        "conversation_thinking_effort": config.conversation_api_config().thinking_effort,
         "temperature": config.api.temperature,
         "top_p": config.api.top_p,
         "max_tokens": config.api.max_tokens,
@@ -1232,6 +1278,8 @@ def _execute_conversation_only_run(
 
     total_calls = total_conv
     progress_state = {"convs_done": 0, "calls_done": 0, "successes": 0, "failures": 0}
+    live_failures: list[dict] = []
+    failure_box = st.empty()
 
     def on_progress(evt: dict) -> None:
         nonlocal total_conv, total_calls
@@ -1283,6 +1331,7 @@ def _execute_conversation_only_run(
             persistence_errors.append(f"conversation result: {e}")
 
     def save_err(err: dict) -> None:
+        _show_live_run_failure(failure_box, live_failures, err)
         try:
             db.save_error(run_id, err)
         except Exception as e:
@@ -1328,11 +1377,15 @@ def _execute_conversation_only_run(
         )
         st.session_state.run_results = results
         persist_completed_results()
-        progress_box.success(
+        completion_message = (
             f"Conversation-only evaluation finished. {len(results.conversation_results)} customer journeys processed, "
             f"{len(results.message_level_results)} reused message results, "
             f"{len(results.errors)} errors. Saved as run #{run_id}."
         )
+        if results.errors:
+            progress_box.warning(completion_message)
+        else:
+            progress_box.success(completion_message)
         if persistence_errors:
             st.warning(
                 "Some live DB saves failed during the run, but the completed results were saved again at the end. "
@@ -1487,6 +1540,8 @@ def _execute_full_batch_into_run(
             "journey_count": len(conversation_ids),
             "message_model": config.api.model,
             "conversation_model": config.conversation_api_config().model,
+            "message_thinking_effort": config.api.thinking_effort,
+            "conversation_thinking_effort": config.conversation_api_config().thinking_effort,
             "message_prompt_id": message_prompt_id,
             "conversation_prompt_id": conversation_prompt_id,
         },
@@ -1506,6 +1561,8 @@ def _execute_full_batch_into_run(
         "successes": 0,
         "failures": 0,
     }
+    live_failures: list[dict] = []
+    failure_box = st.empty()
 
     def on_progress(event: dict) -> None:
         phase = event.get("phase")
@@ -1554,6 +1611,7 @@ def _execute_full_batch_into_run(
             persistence_errors.append(f"conversation result: {exc}")
 
     def save_error(error: dict) -> None:
+        _show_live_run_failure(failure_box, live_failures, error)
         try:
             db.save_error(run_id, error)
         except Exception as exc:
@@ -1582,11 +1640,15 @@ def _execute_full_batch_into_run(
         status = "completed" if not results.errors else "completed_with_errors"
         counts = db.finish_run_from_saved_results(run_id, status=status)
         _load_saved_run_into_session(db, run_id)
-        progress_box.success(
+        completion_message = (
             f"Saved into run #{run_id}. This batch processed "
             f"{len(results.conversation_results):,} journeys. The run now contains "
             f"{counts['conversations']:,} journeys and {counts['errors']:,} recorded errors."
         )
+        if results.errors:
+            progress_box.warning(completion_message)
+        else:
+            progress_box.success(completion_message)
         if persistence_errors:
             st.warning(f"Some live saves failed. First error: {persistence_errors[0]}")
     except Exception as exc:
@@ -1860,32 +1922,22 @@ def _conversation_filters_with_keys(
     key_prefix: str,
     include_journey_starter: bool = False,
 ) -> dict:
-    try:
-        return conversation_filters(
-            conv_df,
-            key_prefix=key_prefix,
-            include_journey_starter=include_journey_starter,
-        )
-    except TypeError:
-        reloaded = importlib.reload(ui_components_module)
-        return reloaded.conversation_filters(
-            conv_df,
-            key_prefix=key_prefix,
-            include_journey_starter=include_journey_starter,
-        )
+    return ui_components_module.conversation_filters(
+        conv_df,
+        key_prefix=key_prefix,
+        include_journey_starter=include_journey_starter,
+    )
 
 
 def _apply_conversation_filters_fresh(conv_df: pd.DataFrame, filters: dict) -> pd.DataFrame:
-    reloaded = importlib.reload(ui_components_module)
-    return reloaded.apply_conversation_filters(conv_df, filters)
+    return ui_components_module.apply_conversation_filters(conv_df, filters)
 
 
 def _render_conversation_summary_card_fresh(
     conv_result: dict,
     show_details: bool = True,
 ) -> None:
-    reloaded = importlib.reload(ui_components_module)
-    reloaded.render_conversation_summary_card(
+    ui_components_module.render_conversation_summary_card(
         conv_result,
         show_details=show_details,
     )
@@ -2900,6 +2952,36 @@ def render_sidebar() -> None:
             use_container_width=True,
             on_click=_reset_default_choices,
         )
+        thinking_options = ["default", "disabled", "low", "medium", "high", "maximum"]
+        thinking_labels = {
+            "default": "Provider default",
+            "disabled": "Disabled",
+            "low": "Low",
+            "medium": "Medium",
+            "high": "High",
+            "maximum": "Maximum",
+        }
+        st.selectbox(
+            "Message-level thinking effort",
+            thinking_options,
+            key="message_thinking_effort",
+            format_func=thinking_labels.__getitem__,
+            help=(
+                "Reasoning used for every individual message evaluation. "
+                "Lower values usually save the most time and output-token cost."
+            ),
+        )
+        st.selectbox(
+            "Conversation-level thinking effort",
+            thinking_options,
+            key="conversation_thinking_effort",
+            format_func=thinking_labels.__getitem__,
+            help=(
+                "Reasoning used for the final whole-journey analysis. "
+                "OpenAI receives reasoning_effort; DeepSeek also receives its "
+                "compatible thinking toggle."
+            ),
+        )
         st.slider(
             "Temperature",
             min_value=0.0,
@@ -2937,11 +3019,14 @@ def render_sidebar() -> None:
             key="retries",
             help=f"Default: {DEFAULT_EVALUATION_SETTINGS['retries']}",
         )
-        st.session_state.concurrency = min(100, max(1, int(st.session_state.concurrency)))
+        st.session_state.concurrency = min(
+            MAX_CONCURRENCY,
+            max(1, int(st.session_state.concurrency)),
+        )
         st.number_input(
             "Concurrency",
             min_value=1,
-            max_value=100,
+            max_value=MAX_CONCURRENCY,
             step=1,
             key="concurrency",
             help=(
@@ -4042,26 +4127,65 @@ def tab_run() -> None:
         ]
     )
 
-    if (
-        is_gpt5_mini(st.session_state.selected_model)
-        and is_gpt5_mini(st.session_state.get("conversation_selected_model"))
-    ):
-        cost_config, _, _ = _build_run_config()
-        cost_estimate = estimate_gpt5_mini_run_cost(df, cost_config)
-        st.markdown("#### Estimated GPT-5 mini cost")
-        metric_row(
-            [
-                ("Estimated input tokens", f"{cost_estimate['input_tokens']:,}", None),
-                ("Estimated output tokens", f"{cost_estimate['output_tokens']:,}", None),
-                ("Estimated input cost", f"${cost_estimate['input_cost']:,.4f}", None),
-                ("Estimated output cost", f"${cost_estimate['output_cost']:,.4f}", None),
-                ("Estimated total cost", f"${cost_estimate['total_cost']:,.4f}", None),
-            ]
-        )
-        st.caption(
-            "Pricing used: $0.25 per 1M input tokens and $2.00 per 1M output tokens. "
-            "Input counts use the loaded journeys and active prompts; output size is estimated from the active JSON schemas."
-        )
+    cost_config, _, _ = _build_run_config()
+    reasoning_db = get_active_db()
+    message_reasoning = reasoning_db.estimate_reasoning_tokens_per_call(
+        "message",
+        model=cost_config.api.model,
+        thinking_effort=cost_config.api.thinking_effort,
+    )
+    conversation_reasoning = reasoning_db.estimate_reasoning_tokens_per_call(
+        "conversation",
+        model=cost_config.conversation_api_config().model,
+        thinking_effort=cost_config.conversation_api_config().thinking_effort,
+    )
+    estimated_message_reasoning_tokens = (
+        int(message_reasoning["average_tokens"]) * int(estimate["message_level_calls"])
+    )
+    estimated_conversation_reasoning_tokens = (
+        int(conversation_reasoning["average_tokens"])
+        * int(estimate["conversation_level_calls"])
+    )
+    estimated_reasoning_tokens = (
+        estimated_message_reasoning_tokens + estimated_conversation_reasoning_tokens
+    )
+    cost_estimate = estimate_run_tokens_and_cost(
+        df,
+        cost_config,
+        reasoning_tokens=estimated_reasoning_tokens,
+    )
+    st.markdown("#### Estimated tokens and reference cost")
+    metric_row(
+        [
+            ("Input tokens", f"{cost_estimate['input_tokens']:,}", None),
+            ("Visible output tokens", f"{cost_estimate['visible_output_tokens']:,}", None),
+            ("Message reasoning", f"~{estimated_message_reasoning_tokens:,}", None),
+            ("Conversation reasoning", f"~{estimated_conversation_reasoning_tokens:,}", None),
+            ("Total reasoning", f"~{cost_estimate['reasoning_tokens']:,}", None),
+            ("Total billable tokens", f"~{cost_estimate['total_tokens']:,}", None),
+        ]
+    )
+    metric_row(
+        [
+            ("Estimated input cost", f"${cost_estimate['input_cost']:,.4f}", None),
+            ("Estimated output cost", f"${cost_estimate['output_cost']:,.4f}", None),
+            ("Estimated total cost", f"${cost_estimate['total_cost']:,.4f}", None),
+        ]
+    )
+    st.caption(
+        "Reasoning estimate: "
+        f"message calls average {int(message_reasoning['average_tokens']):,} tokens "
+        f"from {int(message_reasoning['samples']):,} saved samples "
+        f"({message_reasoning['basis']}); conversation calls average "
+        f"{int(conversation_reasoning['average_tokens']):,} tokens from "
+        f"{int(conversation_reasoning['samples']):,} saved samples "
+        f"({conversation_reasoning['basis']})."
+    )
+    st.caption(
+        "Reference pricing: $0.75 per 1M input tokens and $4.50 per 1M output tokens. "
+        "Token counts use the loaded journeys, active prompts, output schemas, and recent saved reasoning usage. "
+        "Your API proxy or selected model may charge different rates."
+    )
 
     large_job = estimate["total_calls"] > 200
     if large_job:
@@ -4126,6 +4250,8 @@ def tab_run() -> None:
             "model": config.api.model,
             "message_model": config.api.model,
             "conversation_model": config.conversation_api_config().model,
+            "message_thinking_effort": config.api.thinking_effort,
+            "conversation_thinking_effort": config.conversation_api_config().thinking_effort,
             "temperature": config.api.temperature,
             "top_p": config.api.top_p,
             "max_tokens": config.api.max_tokens,
@@ -4160,6 +4286,7 @@ def tab_run() -> None:
         total_conv = estimate["conversations"]
         total_msg = estimate["message_level_calls"] + estimate["conversation_level_calls"]
         progress_state = {"convs_done": 0, "calls_done": 0, "successes": 0, "failures": 0}
+        live_failures: list[dict] = []
 
         def on_progress(evt: dict) -> None:
             phase = evt.get("phase")
@@ -4216,6 +4343,7 @@ def tab_run() -> None:
                 persistence_errors.append(f"conversation result: {e}")
 
         def save_err(err: dict) -> None:
+            _show_live_run_failure(log_box, live_failures, err)
             try:
                 db.save_error(run_id, err)
             except Exception as e:
@@ -4260,11 +4388,15 @@ def tab_run() -> None:
             st.session_state.run_results = results
             st.session_state._run_results_db_path = _active_db_path()
             persist_completed_results()
-            progress_box.success(
+            completion_message = (
                 f"Evaluation finished. {len(results.conversation_results)} customer journeys processed, "
                 f"{len(results.message_level_results)} message-level calls, "
                 f"{len(results.errors)} errors. Saved as run #{run_id}."
             )
+            if results.errors:
+                progress_box.warning(completion_message)
+            else:
+                progress_box.success(completion_message)
             if persistence_errors:
                 st.warning(
                     "Some live DB saves failed during the run, but the completed results were saved again at the end. "
@@ -6485,6 +6617,8 @@ def tab_exports() -> None:
         "model": st.session_state.selected_model,
         "message_model": st.session_state.selected_model,
         "conversation_model": st.session_state.get("conversation_selected_model"),
+        "message_thinking_effort": st.session_state.message_thinking_effort,
+        "conversation_thinking_effort": st.session_state.conversation_thinking_effort,
         "temperature": st.session_state.temperature,
         "top_p": st.session_state.top_p,
         "max_tokens": st.session_state.max_tokens,
@@ -6732,6 +6866,8 @@ def tab_debug() -> None:
         "model": st.session_state.selected_model,
         "message_model": st.session_state.selected_model,
         "conversation_model": st.session_state.get("conversation_selected_model"),
+        "message_thinking_effort": st.session_state.message_thinking_effort,
+        "conversation_thinking_effort": st.session_state.conversation_thinking_effort,
         "temperature": st.session_state.temperature,
         "top_p": st.session_state.top_p,
         "max_tokens": st.session_state.max_tokens,

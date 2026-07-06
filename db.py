@@ -809,6 +809,106 @@ class Database:
         d["run_config"] = _json_load(d.pop("run_config_json")) or {}
         return d
 
+    def estimate_reasoning_tokens_per_call(
+        self,
+        layer: str,
+        *,
+        model: str,
+        thinking_effort: str,
+        recent_run_limit: int = 10,
+    ) -> dict:
+        """Average observed reasoning tokens from recent successful API calls."""
+        normalized_layer = str(layer or "").strip().lower()
+        if normalized_layer not in {"message", "conversation"}:
+            raise ValueError("layer must be 'message' or 'conversation'")
+        effort = str(thinking_effort or "default").strip().lower()
+        if effort == "disabled":
+            return {
+                "average_tokens": 0,
+                "samples": 0,
+                "basis": "thinking disabled",
+            }
+
+        table = "message_results" if normalized_layer == "message" else "conversation_results"
+        rows = self._fetchall(
+            f"SELECT result.debug_json, runs.run_config_json "
+            f"FROM {table} AS result "
+            "JOIN runs ON runs.id=result.run_id "
+            "WHERE result.parse_status='ok' AND result.debug_json IS NOT NULL "
+            "AND runs.id IN (SELECT id FROM runs ORDER BY started_at DESC LIMIT ?) "
+            "ORDER BY runs.started_at DESC, result.id DESC",
+            (max(1, int(recent_run_limit)),),
+        )
+
+        observations: list[dict] = []
+        for row in rows:
+            debug = _json_load(row["debug_json"]) or {}
+            usage = debug.get("usage") or {}
+            details = (
+                usage.get("completion_tokens_details")
+                or usage.get("output_tokens_details")
+                or {}
+            )
+            reasoning_tokens = details.get("reasoning_tokens")
+            if reasoning_tokens is None:
+                continue
+            try:
+                reasoning_tokens = max(0, int(reasoning_tokens))
+            except (TypeError, ValueError):
+                continue
+
+            config = _json_load(row["run_config_json"]) or {}
+            if normalized_layer == "message":
+                observed_model = config.get("message_model") or config.get("model")
+                configured_effort = config.get("message_thinking_effort")
+            else:
+                observed_model = config.get("conversation_model") or config.get("model")
+                configured_effort = config.get("conversation_thinking_effort")
+            observed_effort = (
+                debug.get("thinking_effort")
+                or configured_effort
+                or config.get("thinking_effort")
+                or "default"
+            )
+            observations.append(
+                {
+                    "tokens": reasoning_tokens,
+                    "model": str(observed_model or "").strip().lower(),
+                    "effort": str(observed_effort or "default").strip().lower(),
+                }
+            )
+
+        target_model = str(model or "").strip().lower()
+        exact = [
+            item
+            for item in observations
+            if item["model"] == target_model and item["effort"] == effort
+        ]
+        effort_matches = [item for item in observations if item["effort"] == effort]
+        if exact:
+            selected = exact
+            basis = "same model and thinking effort"
+        elif effort_matches:
+            selected = effort_matches
+            basis = "same thinking effort across recent models"
+        elif observations:
+            selected = observations
+            basis = "recent calls; no matching effort history"
+        else:
+            return {
+                "average_tokens": 0,
+                "samples": 0,
+                "basis": "no saved reasoning-token history",
+            }
+
+        return {
+            "average_tokens": int(
+                round(sum(item["tokens"] for item in selected) / len(selected))
+            ),
+            "samples": len(selected),
+            "basis": basis,
+        }
+
     def delete_run(self, run_id: int) -> None:
         # ON DELETE CASCADE handles related rows.
         self._exec("DELETE FROM runs WHERE id=?", (int(run_id),))
