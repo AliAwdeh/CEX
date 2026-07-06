@@ -804,6 +804,9 @@ def validate_conversation_level_result(data: dict) -> dict:
 @dataclass
 class RunConfig:
     api: APIConfig = field(default_factory=APIConfig)
+    # Conversation-level calls may use a different model while reusing the
+    # same endpoint, API key, and generation settings.
+    conversation_api: Optional[APIConfig] = None
     max_conversations: Optional[int] = None
     max_agent_messages_per_conv: Optional[int] = None
     truncate_messages: bool = False
@@ -822,6 +825,9 @@ class RunConfig:
     # the active prompts from the DB before each run).
     message_prompt: PromptTemplate = field(default_factory=lambda: DEFAULT_MESSAGE_LEVEL_PROMPT)
     conversation_prompt: PromptTemplate = field(default_factory=lambda: DEFAULT_CONVERSATION_LEVEL_PROMPT)
+
+    def conversation_api_config(self) -> APIConfig:
+        return self.conversation_api or self.api
 
 
 @dataclass
@@ -1112,7 +1118,7 @@ def run_evaluation(
         return ex.submit(
             _eval_conversation_level,
             client=client,
-            api=config.api,
+            api=config.conversation_api_config(),
             conversation_id=conversation_id,
             conversation_metadata=conv_md_for_judge,
             full_transcript=full_transcript,
@@ -1620,7 +1626,7 @@ def run_conversation_level_only(
             fut = ex.submit(
                 _eval_conversation_level,
                 client=client,
-                api=config.api,
+                api=config.conversation_api_config(),
                 conversation_id=conversation_id,
                 conversation_metadata=state["conv_md_for_judge"],
                 full_transcript=state["full_transcript"],

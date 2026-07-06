@@ -769,6 +769,26 @@ class Database:
     def rename_run(self, run_id: int, name: str) -> None:
         self._exec("UPDATE runs SET name=? WHERE id=?", (name, int(run_id)))
 
+    def mark_run_running(self, run_id: int) -> None:
+        self._exec(
+            "UPDATE runs SET status='running', finished_at=NULL WHERE id=?",
+            (int(run_id),),
+        )
+
+    def append_run_event(self, run_id: int, event: dict) -> None:
+        """Append continuation/retry metadata without discarding the original config."""
+        run = self.get_run(int(run_id))
+        if not run:
+            raise ValueError(f"Run {run_id} not found")
+        config = dict(run.get("run_config") or {})
+        history = list(config.get("continuation_history") or [])
+        history.append(dict(event))
+        config["continuation_history"] = history
+        self._exec(
+            "UPDATE runs SET run_config_json=? WHERE id=?",
+            (_json_dump(config), int(run_id)),
+        )
+
     def list_runs(self, limit: int = 200) -> list[dict]:
         rows = self._fetchall(
             "SELECT id, name, csv_name, started_at, finished_at, status, "
@@ -847,6 +867,31 @@ class Database:
         )
         return int(cur.lastrowid)
 
+    def replace_message_result(self, run_id: int, mr: dict) -> int:
+        """Replace one message result while leaving the rest of the run intact."""
+        conversation_id = str(mr.get("thread_id") or mr.get("conversation_id") or "")
+        message_index = mr.get("message_index")
+        self._exec(
+            "DELETE FROM message_results WHERE run_id=? AND conversation_id=? "
+            "AND ((message_index IS NULL AND ? IS NULL) OR message_index=?)",
+            (
+                int(run_id),
+                conversation_id,
+                message_index,
+                int(message_index) if message_index is not None else None,
+            ),
+        )
+        return self.save_message_result(run_id, mr)
+
+    def replace_conversation_result(self, run_id: int, cr: dict) -> int:
+        """Replace one conversation result while leaving other journeys intact."""
+        conversation_id = str(cr.get("thread_id") or cr.get("conversation_id") or "")
+        self._exec(
+            "DELETE FROM conversation_results WHERE run_id=? AND conversation_id=?",
+            (int(run_id), conversation_id),
+        )
+        return self.save_conversation_result(run_id, cr)
+
     def save_error(self, run_id: int, err: dict) -> int:
         cur = self._exec(
             "INSERT INTO run_errors(run_id, level, conversation_id, message_index, error, created_at) "
@@ -861,6 +906,96 @@ class Database:
             ),
         )
         return int(cur.lastrowid)
+
+    def list_run_completed_conversation_ids(self, run_id: int) -> list[str]:
+        """Return journeys with a saved conversation-level row."""
+        rows = self._fetchall(
+            "SELECT DISTINCT conversation_id FROM conversation_results "
+            "WHERE run_id=? ORDER BY id",
+            (int(run_id),),
+        )
+        return [str(row["conversation_id"]) for row in rows]
+
+    def list_run_failed_conversation_ids(self, run_id: int) -> list[str]:
+        """Return journeys containing any failed result or recorded run error."""
+        rows = self._fetchall(
+            "SELECT conversation_id FROM conversation_results "
+            "WHERE run_id=? AND parse_status<>'ok' "
+            "UNION "
+            "SELECT conversation_id FROM message_results "
+            "WHERE run_id=? AND parse_status<>'ok' "
+            "UNION "
+            "SELECT conversation_id FROM run_errors "
+            "WHERE run_id=? AND conversation_id IS NOT NULL "
+            "ORDER BY conversation_id",
+            (int(run_id), int(run_id), int(run_id)),
+        )
+        return [str(row["conversation_id"]) for row in rows if row["conversation_id"]]
+
+    def delete_run_journeys(self, run_id: int, conversation_ids: Iterable[str]) -> None:
+        """Remove result/error rows for selected journeys before a safe retry."""
+        ids = list(dict.fromkeys(str(value) for value in conversation_ids if str(value)))
+        if not ids:
+            return
+        with self._tx() as connection:
+            for start in range(0, len(ids), 500):
+                chunk = ids[start : start + 500]
+                placeholders = ",".join("?" for _ in chunk)
+                params = [int(run_id), *chunk]
+                connection.execute(
+                    f"DELETE FROM run_errors WHERE run_id=? AND conversation_id IN ({placeholders})",
+                    params,
+                )
+                connection.execute(
+                    f"DELETE FROM message_results WHERE run_id=? AND conversation_id IN ({placeholders})",
+                    params,
+                )
+                connection.execute(
+                    f"DELETE FROM conversation_results WHERE run_id=? AND conversation_id IN ({placeholders})",
+                    params,
+                )
+
+    def replace_run_errors_for_journeys(
+        self,
+        run_id: int,
+        conversation_ids: Iterable[str],
+        errors: Iterable[dict],
+    ) -> None:
+        """Replace error rows for a retry/append scope."""
+        ids = list(dict.fromkeys(str(value) for value in conversation_ids if str(value)))
+        with self._tx() as connection:
+            for start in range(0, len(ids), 500):
+                chunk = ids[start : start + 500]
+                placeholders = ",".join("?" for _ in chunk)
+                connection.execute(
+                    f"DELETE FROM run_errors WHERE run_id=? AND conversation_id IN ({placeholders})",
+                    [int(run_id), *chunk],
+                )
+        for error in errors:
+            self.save_error(run_id, error)
+
+    def finish_run_from_saved_results(self, run_id: int, status: str = "completed") -> dict[str, int]:
+        """Recount persisted rows and update the run summary after append/retry."""
+        row = self._fetchone(
+            "SELECT "
+            "(SELECT COUNT(DISTINCT conversation_id) FROM conversation_results WHERE run_id=?) AS conversations, "
+            "(SELECT COUNT(*) FROM message_results WHERE run_id=?) AS messages, "
+            "(SELECT COUNT(*) FROM run_errors WHERE run_id=?) AS errors",
+            (int(run_id), int(run_id), int(run_id)),
+        )
+        counts = {
+            "conversations": int(row["conversations"] or 0),
+            "messages": int(row["messages"] or 0),
+            "errors": int(row["errors"] or 0),
+        }
+        self.finish_run(
+            int(run_id),
+            status,
+            counts["conversations"],
+            counts["messages"],
+            counts["errors"],
+        )
+        return counts
 
     def get_run_result_counts(self, run_id: int) -> dict[str, int]:
         run_id = int(run_id)

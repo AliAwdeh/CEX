@@ -91,6 +91,7 @@ DEFAULT_SELECTED_MODEL = "openai/gpt-5.4-mini"
 DEFAULT_EVALUATION_SETTINGS = {
     "api_base_url": DEFAULT_BASE_URL,
     "selected_model": DEFAULT_SELECTED_MODEL,
+    "conversation_selected_model": DEFAULT_SELECTED_MODEL,
     "temperature": 0.1,
     "top_p": 1.0,
     "max_tokens": 100000,
@@ -109,7 +110,7 @@ DEFAULT_RUN_SETTINGS = {
     "stop_on_error": False,
     "save_raw_responses": True,
 }
-DEFAULT_CHOICES_VERSION = 5
+DEFAULT_CHOICES_VERSION = 6
 DEFAULT_DB_SELECTION_VERSION = 2
 ROLE_MASTER = "master"
 ROLE_ACTIVE = "active"
@@ -266,6 +267,7 @@ def _init_state() -> None:
         "api_base_url": DEFAULT_EVALUATION_SETTINGS["api_base_url"],
         "api_key": "",
         "selected_model": DEFAULT_EVALUATION_SETTINGS["selected_model"],
+        "conversation_selected_model": DEFAULT_EVALUATION_SETTINGS["conversation_selected_model"],
         "temperature": DEFAULT_EVALUATION_SETTINGS["temperature"],
         "top_p": DEFAULT_EVALUATION_SETTINGS["top_p"],
         "max_tokens": DEFAULT_EVALUATION_SETTINGS["max_tokens"],
@@ -317,6 +319,8 @@ def _init_state() -> None:
         st.session_state["_default_choices_version"] = DEFAULT_CHOICES_VERSION
     if not st.session_state.get("selected_model"):
         st.session_state.selected_model = DEFAULT_SELECTED_MODEL
+    if not st.session_state.get("conversation_selected_model"):
+        st.session_state.conversation_selected_model = st.session_state.selected_model
     if not st.session_state.get("api_base_url"):
         st.session_state.api_base_url = DEFAULT_BASE_URL
 
@@ -974,6 +978,24 @@ def _build_api_config() -> APIConfig:
     )
 
 
+def _build_conversation_api_config() -> APIConfig:
+    api = _build_api_config()
+    return APIConfig(
+        base_url=api.base_url,
+        api_key=api.api_key,
+        model=str(
+            st.session_state.get("conversation_selected_model")
+            or st.session_state.selected_model
+        ),
+        temperature=api.temperature,
+        top_p=api.top_p,
+        max_tokens=api.max_tokens,
+        timeout=api.timeout,
+        retries=api.retries,
+        concurrency=api.concurrency,
+    )
+
+
 def _build_run_config() -> tuple[RunConfig, int | None, int | None]:
     """Build a RunConfig using the active prompts from the DB.
 
@@ -990,6 +1012,7 @@ def _build_run_config() -> tuple[RunConfig, int | None, int | None]:
     )
     cfg = RunConfig(
         api=_build_api_config(),
+        conversation_api=_build_conversation_api_config(),
         max_conversations=max_conversations,
         max_agent_messages_per_conv=(
             int(st.session_state.max_agent_messages_per_conv)
@@ -1122,6 +1145,7 @@ def _execute_conversation_only_run(
     bar,
     counter_box,
     current_box,
+    selected_conversation_ids: list[str] | None = None,
 ) -> None:
     source_results = st.session_state.run_results
     source_message_results = list(getattr(source_results, "message_level_results", []) or [])
@@ -1135,6 +1159,9 @@ def _execute_conversation_only_run(
     st.session_state.progress_log = []
 
     config, _, cl_prompt_id = _build_run_config()
+    if selected_conversation_ids is not None:
+        config.selected_conversation_ids = list(selected_conversation_ids)
+        config.max_conversations = None
     client = build_client(config.api.base_url, config.api.api_key)
     source_run_id = st.session_state.current_run_id
 
@@ -1143,6 +1170,8 @@ def _execute_conversation_only_run(
     run_config_serializable = {
         "api_base_url": config.api.base_url,
         "model": config.api.model,
+        "message_model": config.api.model,
+        "conversation_model": config.conversation_api_config().model,
         "temperature": config.api.temperature,
         "top_p": config.api.top_p,
         "max_tokens": config.api.max_tokens,
@@ -1324,6 +1353,250 @@ def _execute_conversation_only_run(
             db.finish_run(run_id, status, n_convs, n_msgs, n_err)
         except Exception:
             pass
+        st.session_state.run_in_progress = False
+        st.session_state.cancel_flag = False
+
+
+def _conversation_rerun_filter_ids(
+    conversation_results: list[dict],
+    *,
+    outcome: str = "All",
+    experience: str = "All",
+    unresolved_status: str = "All",
+    result_status: str = "All",
+) -> list[str]:
+    """Return saved journey IDs matching conversation-level rerun filters."""
+    matched: list[str] = []
+    for raw_result in conversation_results or []:
+        result = _normalize_conversation_result_for_display(dict(raw_result))
+        parsed = result.get("parsed_json") or {}
+        if outcome != "All" and str(parsed.get("handled_status") or "") != outcome:
+            continue
+        if experience != "All" and str(parsed.get("customer_experience") or "") != experience:
+            continue
+        if (
+            unresolved_status != "All"
+            and str(parsed.get("unhandled_resolution_subtype") or "") != unresolved_status
+        ):
+            continue
+        parse_status = str(result.get("parse_status") or "")
+        if result_status == "Successful only" and parse_status != "ok":
+            continue
+        if result_status == "Failed only" and parse_status == "ok":
+            continue
+        conversation_id = str(
+            result.get("conversation_id") or result.get("thread_id") or ""
+        ).strip()
+        if conversation_id:
+            matched.append(conversation_id)
+    return matched
+
+
+def _render_conversation_rerun_scope() -> list[str]:
+    """Render filters for reusing message results from the loaded saved run."""
+    source_results = st.session_state.get("run_results")
+    conversation_results = list(
+        getattr(source_results, "conversation_results", []) or []
+    )
+    if not conversation_results:
+        return []
+
+    st.markdown("### Conversation-level rerun from loaded run")
+    st.caption(
+        "Reuse the saved message-level analysis and run only the conversation layer. "
+        "All filters default to All, which reruns every journey in the loaded run."
+    )
+    filter_columns = st.columns(4)
+    with filter_columns[0]:
+        outcome = st.selectbox(
+            "Outcome",
+            ["All", "handled", "unhandled"],
+            key="conversation_rerun_outcome",
+            format_func=humanize_label,
+        )
+    with filter_columns[1]:
+        experience = st.selectbox(
+            "Customer experience",
+            ["All", "good", "bad"],
+            key="conversation_rerun_experience",
+            format_func=humanize_label,
+        )
+    with filter_columns[2]:
+        unresolved_status = st.selectbox(
+            "Unresolved status",
+            ["All", "pending_unresolved", "totally_unresolved"],
+            key="conversation_rerun_unresolved_status",
+            format_func=humanize_label,
+        )
+    with filter_columns[3]:
+        result_status = st.selectbox(
+            "Current conversation result",
+            ["All", "Successful only", "Failed only"],
+            key="conversation_rerun_result_status",
+        )
+
+    matched = _conversation_rerun_filter_ids(
+        conversation_results,
+        outcome=outcome,
+        experience=experience,
+        unresolved_status=unresolved_status,
+        result_status=result_status,
+    )
+    st.caption(
+        f"{len(matched):,} of {len(conversation_results):,} saved journeys match this rerun scope. "
+        f"Conversation model: `{st.session_state.get('conversation_selected_model') or st.session_state.selected_model}`."
+    )
+    return matched
+
+
+def _execute_full_batch_into_run(
+    *,
+    df: pd.DataFrame,
+    run_id: int,
+    conversation_ids: list[str],
+    mode: str,
+    progress_box,
+    bar,
+    counter_box,
+    current_box,
+) -> None:
+    """Evaluate a selected CSV batch and merge it into an existing saved run."""
+    conversation_ids = list(
+        dict.fromkeys(str(value) for value in conversation_ids if str(value))
+    )
+    if not conversation_ids:
+        progress_box.warning("No journeys are available for this operation.")
+        return
+
+    db = get_active_db()
+    config, message_prompt_id, conversation_prompt_id = _build_run_config()
+    config.selected_conversation_ids = conversation_ids
+    config.max_conversations = None
+    client = build_client(config.api.base_url, config.api.api_key)
+
+    st.session_state.run_in_progress = True
+    st.session_state.cancel_flag = False
+    st.session_state.progress_log = []
+
+    db.mark_run_running(run_id)
+    db.append_run_event(
+        run_id,
+        {
+            "type": mode,
+            "started_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+            "journey_count": len(conversation_ids),
+            "message_model": config.api.model,
+            "conversation_model": config.conversation_api_config().model,
+            "message_prompt_id": message_prompt_id,
+            "conversation_prompt_id": conversation_prompt_id,
+        },
+    )
+
+    estimate = estimate_call_counts(
+        df[df[JOURNEY_ID_COLUMN].astype(str).isin(set(conversation_ids))],
+        max_conversations=None,
+        max_agent_messages_per_conv=config.max_agent_messages_per_conv,
+        target_role=config.message_target_role,
+    )
+    total_conversations = int(estimate["conversations"])
+    total_calls = int(estimate["total_calls"])
+    progress_state = {
+        "conversations": 0,
+        "calls": 0,
+        "successes": 0,
+        "failures": 0,
+    }
+
+    def on_progress(event: dict) -> None:
+        phase = event.get("phase")
+        if phase == "conversation_start":
+            current_box.info(
+                f"Journey {event.get('conversation_index')}/{event.get('total_conversations')} — "
+                f"Customer `{event.get('conversation_id')}`"
+            )
+        elif phase == "message_done":
+            progress_state["calls"] += 1
+            key = "successes" if event.get("status") == "ok" else "failures"
+            progress_state[key] += 1
+        elif phase == "conversation_done":
+            progress_state["conversations"] += 1
+            progress_state["calls"] += 1
+            key = "successes" if event.get("status") == "ok" else "failures"
+            progress_state[key] += 1
+        fraction = min(progress_state["calls"] / max(total_calls, 1), 1.0)
+        bar.progress(
+            fraction,
+            text=(
+                f"Journeys {progress_state['conversations']}/{total_conversations} | "
+                f"Calls {progress_state['calls']}/{total_calls}"
+            ),
+        )
+        counter_box.markdown(
+            f"**Successes:** {progress_state['successes']} | "
+            f"**Failures:** {progress_state['failures']}"
+        )
+        st.session_state.progress_log.append(event)
+
+    persistence_errors: list[str] = []
+
+    def save_message(result: dict) -> None:
+        try:
+            result["run_id"] = run_id
+            db.replace_message_result(run_id, result)
+        except Exception as exc:
+            persistence_errors.append(f"message result: {exc}")
+
+    def save_conversation(result: dict) -> None:
+        try:
+            result["run_id"] = run_id
+            db.replace_conversation_result(run_id, result)
+        except Exception as exc:
+            persistence_errors.append(f"conversation result: {exc}")
+
+    def save_error(error: dict) -> None:
+        try:
+            db.save_error(run_id, error)
+        except Exception as exc:
+            persistence_errors.append(f"run error: {exc}")
+
+    results = None
+    try:
+        progress_box.info(
+            "Retrying failed journeys..." if mode == "retry_failed" else "Appending the next journey batch..."
+        )
+        results = run_evaluation(
+            df=df,
+            client=client,
+            config=config,
+            on_progress=on_progress,
+            cancel_requested=lambda: bool(st.session_state.cancel_flag),
+            on_message_result=save_message,
+            on_conversation_result=save_conversation,
+            on_error=save_error,
+        )
+        db.replace_run_errors_for_journeys(
+            run_id,
+            conversation_ids,
+            results.errors,
+        )
+        status = "completed" if not results.errors else "completed_with_errors"
+        counts = db.finish_run_from_saved_results(run_id, status=status)
+        _load_saved_run_into_session(db, run_id)
+        progress_box.success(
+            f"Saved into run #{run_id}. This batch processed "
+            f"{len(results.conversation_results):,} journeys. The run now contains "
+            f"{counts['conversations']:,} journeys and {counts['errors']:,} recorded errors."
+        )
+        if persistence_errors:
+            st.warning(f"Some live saves failed. First error: {persistence_errors[0]}")
+    except Exception as exc:
+        # Successful rows already emitted by callbacks remain in the database.
+        db.finish_run_from_saved_results(run_id, status="partial")
+        progress_box.error(
+            f"The batch stopped early: {exc}. Completed and failed rows emitted before "
+            "the interruption remain saved and can be retried."
+        )
+    finally:
         st.session_state.run_in_progress = False
         st.session_state.cancel_flag = False
 
@@ -2580,21 +2853,44 @@ def render_sidebar() -> None:
                 current = DEFAULT_SELECTED_MODEL
             default_index = models.index(current) if current in models else 0
             st.selectbox(
-                "Model",
+                "Message-level model",
                 models,
                 index=default_index,
                 key="selected_model",
                 help=f"Default: {DEFAULT_EVALUATION_SETTINGS['selected_model']}",
             )
+            conversation_current = str(
+                st.session_state.get("conversation_selected_model")
+                or st.session_state.selected_model
+            )
+            if conversation_current not in models:
+                conversation_current = (
+                    st.session_state.selected_model
+                    if st.session_state.selected_model in models
+                    else models[0]
+                )
+                st.session_state.conversation_selected_model = conversation_current
+            st.selectbox(
+                "Conversation-level model",
+                models,
+                index=models.index(conversation_current),
+                key="conversation_selected_model",
+                help="Uses the same base URL and API key as the message-level model.",
+            )
         else:
             st.text_input(
-                "Model",
+                "Message-level model",
                 key="selected_model",
                 help=(
                     "Default: "
                     f"{DEFAULT_EVALUATION_SETTINGS['selected_model']}. "
                     "Click 'Load available models' to populate this dropdown."
                 ),
+            )
+            st.text_input(
+                "Conversation-level model",
+                key="conversation_selected_model",
+                help="May differ from the message-level model; it reuses the same API key.",
             )
 
         st.markdown("---")
@@ -3264,6 +3560,7 @@ def tab_run() -> None:
 
     st.subheader("Run CX Evaluation")
 
+    db = get_active_db()
     _render_saved_runs_loader("run", expanded=False)
 
     df = st.session_state.df_norm
@@ -3271,6 +3568,14 @@ def tab_run() -> None:
         st.session_state.run_results
         and getattr(st.session_state.run_results, "message_level_results", [])
     )
+    conversation_rerun_ids: list[str] = []
+    if conversation_only_available:
+        with st.expander(
+            "Conversation-level rerun from the loaded run",
+            expanded=False,
+        ):
+            conversation_rerun_ids = _render_conversation_rerun_scope()
+
     if df is None or df.empty:
         if not conversation_only_available:
             st.info("Upload a valid CSV in the Upload & Settings tab first.")
@@ -3278,9 +3583,9 @@ def tab_run() -> None:
 
         st.info("No CSV is loaded. Full CX evaluation is unavailable, but you can rerun conversation-level from the loaded run.")
 
-        if not st.session_state.selected_model:
+        if not st.session_state.get("conversation_selected_model"):
             st.warning(
-                "Select a model from the sidebar before running. "
+                "Select a conversation-level model from the sidebar before running. "
                 "Click 'Load available models' to populate the list."
             )
 
@@ -3301,8 +3606,12 @@ def tab_run() -> None:
             )
         with convo_only_col:
             convo_only_clicked = st.button(
-                "Run Conversation Only",
-                disabled=st.session_state.run_in_progress or not st.session_state.selected_model,
+                f"Run Conversation Analysis ({len(conversation_rerun_ids):,})",
+                disabled=(
+                    st.session_state.run_in_progress
+                    or not st.session_state.get("conversation_selected_model")
+                    or not conversation_rerun_ids
+                ),
                 use_container_width=True,
             )
         with cancel_col:
@@ -3323,6 +3632,7 @@ def tab_run() -> None:
                 bar=bar,
                 counter_box=counter_box,
                 current_box=current_box,
+                selected_conversation_ids=conversation_rerun_ids,
             )
 
         _render_last_run_summary()
@@ -3611,6 +3921,87 @@ def tab_run() -> None:
                 f"{int(st.session_state.max_conversations):,} customer journeys from the CSV."
             )
 
+    append_clicked = False
+    retry_failed_clicked = False
+    append_ids: list[str] = []
+    retry_failed_ids: list[str] = []
+    continuation_run_id = int(st.session_state.get("current_run_id") or 0)
+    if continuation_run_id:
+        continuation_run = db.get_run(continuation_run_id)
+        uploaded_csv_name = str(st.session_state.get("csv_name") or "")
+        saved_csv_name = str((continuation_run or {}).get("csv_name") or "")
+        csv_matches = not (
+            uploaded_csv_name
+            and saved_csv_name
+            and uploaded_csv_name != saved_csv_name
+        )
+        completed_ids = set(db.list_run_completed_conversation_ids(continuation_run_id))
+        remaining_ids = [journey_id for journey_id in all_ids if journey_id not in completed_ids]
+        failed_ids = set(db.list_run_failed_conversation_ids(continuation_run_id))
+        retry_failed_ids = [journey_id for journey_id in all_ids if journey_id in failed_ids]
+
+        with st.expander(
+            f"Continue or repair loaded run #{continuation_run_id}",
+            expanded=False,
+        ):
+            st.caption(
+                f"CSV journeys: {len(all_ids):,} | Saved conversation results: "
+                f"{len(completed_ids):,} | Remaining: {len(remaining_ids):,} | "
+                f"Failed journeys: {len(retry_failed_ids):,}"
+            )
+            if not csv_matches:
+                st.error(
+                    f"The loaded run used `{saved_csv_name}`, but the uploaded file is "
+                    f"`{uploaded_csv_name}`. Load the matching CSV before continuing it."
+                )
+
+            if remaining_ids:
+                default_batch_size = min(
+                    max(1, int(st.session_state.get("max_conversations") or 50)),
+                    len(remaining_ids),
+                )
+                batch_key = f"continuation_batch_size_{continuation_run_id}"
+                existing_batch_size = int(
+                    st.session_state.get(batch_key) or default_batch_size
+                )
+                st.session_state[batch_key] = min(
+                    max(existing_batch_size, 1),
+                    len(remaining_ids),
+                )
+                batch_size = int(
+                    st.number_input(
+                        "Next batch size",
+                        min_value=1,
+                        max_value=len(remaining_ids),
+                        key=batch_key,
+                        help="Takes the next unprocessed journeys in CSV order.",
+                    )
+                )
+                append_ids = remaining_ids[:batch_size]
+                append_clicked = st.button(
+                    f"Append next {len(append_ids):,} journeys to run #{continuation_run_id}",
+                    key=f"append_run_batch_{continuation_run_id}",
+                    type="primary",
+                    disabled=st.session_state.run_in_progress or not csv_matches,
+                    use_container_width=True,
+                )
+            else:
+                st.success("This run already has a conversation result for every journey in the CSV.")
+
+            if retry_failed_ids:
+                st.caption(
+                    "Retrying replaces results only for failed journeys. Successful journeys "
+                    "already stored in the run remain untouched."
+                )
+                retry_failed_clicked = st.button(
+                    f"Retry {len(retry_failed_ids):,} failed journeys in the same run",
+                    key=f"retry_failed_run_{continuation_run_id}",
+                    disabled=st.session_state.run_in_progress or not csv_matches,
+                    use_container_width=True,
+                )
+            else:
+                st.caption("No persisted failed journeys were found in this run.")
+
     # Build the estimate. When a random selection is active, count over the
     # pinned IDs; otherwise apply the max_conversations slice.
     if selected_ids:
@@ -3651,7 +4042,10 @@ def tab_run() -> None:
         ]
     )
 
-    if is_gpt5_mini(st.session_state.selected_model):
+    if (
+        is_gpt5_mini(st.session_state.selected_model)
+        and is_gpt5_mini(st.session_state.get("conversation_selected_model"))
+    ):
         cost_config, _, _ = _build_run_config()
         cost_estimate = estimate_gpt5_mini_run_cost(df, cost_config)
         st.markdown("#### Estimated GPT-5 mini cost")
@@ -3686,16 +4080,21 @@ def tab_run() -> None:
         run_clicked = st.button(
             "Run CX Evaluation",
             type="primary",
-            disabled=st.session_state.run_in_progress or not st.session_state.selected_model,
+            disabled=(
+                st.session_state.run_in_progress
+                or not st.session_state.selected_model
+                or not st.session_state.get("conversation_selected_model")
+            ),
             use_container_width=True,
         )
     with convo_only_col:
         convo_only_clicked = st.button(
-            "Run Conversation Only",
+            f"Run Conversation Analysis ({len(conversation_rerun_ids):,})",
             disabled=(
                 st.session_state.run_in_progress
-                or not st.session_state.selected_model
+                or not st.session_state.get("conversation_selected_model")
                 or not conversation_only_available
+                or not conversation_rerun_ids
             ),
             use_container_width=True,
         )
@@ -3722,10 +4121,11 @@ def tab_run() -> None:
         client = build_client(config.api.base_url, config.api.api_key)
 
         # Start a DB run record.
-        db = get_active_db()
         run_config_serializable = {
             "api_base_url": config.api.base_url,
             "model": config.api.model,
+            "message_model": config.api.model,
+            "conversation_model": config.conversation_api_config().model,
             "temperature": config.api.temperature,
             "top_p": config.api.top_p,
             "max_tokens": config.api.max_tokens,
@@ -3892,6 +4292,29 @@ def tab_run() -> None:
     if convo_only_clicked:
         _execute_conversation_only_run(
             df=df,
+            progress_box=progress_box,
+            bar=bar,
+            counter_box=counter_box,
+            current_box=current_box,
+            selected_conversation_ids=conversation_rerun_ids,
+        )
+    elif append_clicked:
+        _execute_full_batch_into_run(
+            df=df,
+            run_id=continuation_run_id,
+            conversation_ids=append_ids,
+            mode="append_batch",
+            progress_box=progress_box,
+            bar=bar,
+            counter_box=counter_box,
+            current_box=current_box,
+        )
+    elif retry_failed_clicked:
+        _execute_full_batch_into_run(
+            df=df,
+            run_id=continuation_run_id,
+            conversation_ids=retry_failed_ids,
+            mode="retry_failed",
             progress_box=progress_box,
             bar=bar,
             counter_box=counter_box,
@@ -6060,6 +6483,8 @@ def tab_exports() -> None:
     run_config = {
         "api_base_url": st.session_state.api_base_url,
         "model": st.session_state.selected_model,
+        "message_model": st.session_state.selected_model,
+        "conversation_model": st.session_state.get("conversation_selected_model"),
         "temperature": st.session_state.temperature,
         "top_p": st.session_state.top_p,
         "max_tokens": st.session_state.max_tokens,
@@ -6305,6 +6730,8 @@ def tab_debug() -> None:
     cfg = {
         "api_base_url": st.session_state.api_base_url,
         "model": st.session_state.selected_model,
+        "message_model": st.session_state.selected_model,
+        "conversation_model": st.session_state.get("conversation_selected_model"),
         "temperature": st.session_state.temperature,
         "top_p": st.session_state.top_p,
         "max_tokens": st.session_state.max_tokens,
