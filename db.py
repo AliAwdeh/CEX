@@ -133,6 +133,7 @@ CREATE TABLE IF NOT EXISTS run_errors (
 CREATE TABLE IF NOT EXISTS reviewer_keys (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     reviewer_name TEXT NOT NULL,
+    role TEXT NOT NULL DEFAULT 'read_only',
     key_hash TEXT NOT NULL,
     key_prefix TEXT NOT NULL,
     is_active INTEGER NOT NULL DEFAULT 1,
@@ -353,6 +354,13 @@ class Database:
             if "source_conversation_id" not in cols:
                 self._conn.execute("ALTER TABLE message_results ADD COLUMN source_conversation_id TEXT")
 
+            reviewer_key_cols = {
+                row["name"]
+                for row in self._conn.execute("PRAGMA table_info(reviewer_keys)").fetchall()
+            }
+            if "role" not in reviewer_key_cols:
+                self._conn.execute("ALTER TABLE reviewer_keys ADD COLUMN role TEXT NOT NULL DEFAULT 'read_only'")
+
             review_cols = {
                 row["name"]
                 for row in self._conn.execute("PRAGMA table_info(journey_reviews)").fetchall()
@@ -436,39 +444,54 @@ class Database:
     def verify_master_key(self, master_key: str) -> bool:
         return False
 
-    def create_reviewer_key(self, reviewer_name: str, created_by: str = "master") -> dict:
+    def create_reviewer_key(self, reviewer_name: str, created_by: str = "master", role: str = "read_only") -> dict:
         name = str(reviewer_name or "").strip()
         if not name:
             raise ValueError("Reviewer name is required")
+        normalized_role = self._normalize_reviewer_role(role)
         plain_key = f"rvw_{secrets.token_urlsafe(24)}"
         now = _now_iso()
         cur = self._exec(
             "INSERT INTO reviewer_keys"
-            "(reviewer_name, key_hash, key_prefix, is_active, created_by, created_at)"
-            " VALUES(?, ?, ?, 1, ?, ?)",
-            (name, _hash_secret(plain_key), plain_key[:12], created_by, now),
+            "(reviewer_name, role, key_hash, key_prefix, is_active, created_by, created_at)"
+            " VALUES(?, ?, ?, ?, 1, ?, ?)",
+            (name, normalized_role, _hash_secret(plain_key), plain_key[:12], created_by, now),
         )
         return {
             "id": int(cur.lastrowid),
             "reviewer_name": name,
+            "role": normalized_role,
             "reviewer_key": plain_key,
             "key_prefix": plain_key[:12],
             "created_at": now,
         }
 
+    @staticmethod
+    def _normalize_reviewer_role(role: str) -> str:
+        normalized = str(role or "").strip().lower().replace(" ", "_").replace("-", "_")
+        if normalized in {"active", "operator"}:
+            return "active"
+        return "read_only"
+
     def list_reviewer_keys(self) -> list[dict]:
         rows = self._fetchall(
-            "SELECT id, reviewer_name, key_prefix, is_active, created_by, created_at, revoked_at, last_used_at "
+            "SELECT id, reviewer_name, role, key_prefix, is_active, created_by, created_at, revoked_at, last_used_at "
             "FROM reviewer_keys ORDER BY is_active DESC, reviewer_name ASC, created_at DESC"
         )
         return [dict(row) for row in rows]
+
+    def update_reviewer_role(self, key_id: int, role: str) -> None:
+        self._exec(
+            "UPDATE reviewer_keys SET role=? WHERE id=?",
+            (self._normalize_reviewer_role(role), int(key_id)),
+        )
 
     def verify_reviewer_key(self, reviewer_key: str) -> Optional[dict]:
         key = str(reviewer_key or "").strip()
         if not key:
             return None
         rows = self._fetchall(
-            "SELECT id, reviewer_name, key_hash, key_prefix, is_active FROM reviewer_keys WHERE is_active=1"
+            "SELECT id, reviewer_name, role, key_hash, key_prefix, is_active FROM reviewer_keys WHERE is_active=1"
         )
         for row in rows:
             if _verify_secret(key, row["key_hash"]):
@@ -479,6 +502,7 @@ class Database:
                 return {
                     "id": int(row["id"]),
                     "reviewer_name": row["reviewer_name"],
+                    "role": self._normalize_reviewer_role(row["role"]),
                     "key_prefix": row["key_prefix"],
                 }
         return None

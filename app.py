@@ -111,6 +111,143 @@ DEFAULT_RUN_SETTINGS = {
 }
 DEFAULT_CHOICES_VERSION = 5
 DEFAULT_DB_SELECTION_VERSION = 2
+ROLE_MASTER = "master"
+ROLE_ACTIVE = "active"
+ROLE_READ_ONLY = "read_only"
+ROLE_ALIASES = {
+    "admin": ROLE_MASTER,
+    "master": ROLE_MASTER,
+    "active": ROLE_ACTIVE,
+    "operator": ROLE_ACTIVE,
+    "analyst": ROLE_ACTIVE,
+    "reviewer": ROLE_READ_ONLY,
+    "read_only": ROLE_READ_ONLY,
+    "readonly": ROLE_READ_ONLY,
+    "viewer": ROLE_READ_ONLY,
+}
+PROMPT_EDITING_ENABLED = False
+
+
+def _config_value(name: str, default: str = "") -> str:
+    value = os.environ.get(name, "")
+    if value:
+        return str(value)
+    try:
+        value = st.secrets.get(name, "")
+    except Exception:
+        value = ""
+    return str(value or default)
+
+
+def _config_csv_set(name: str) -> set[str]:
+    raw = _config_value(name)
+    return {part.strip().lower() for part in raw.split(",") if part.strip()}
+
+
+def _sso_auth_enabled() -> bool:
+    return _config_value("CEX_AUTH_MODE", "local").strip().lower() in {"sso", "google", "oidc"}
+
+
+def _sso_provider_name() -> str | None:
+    provider = _config_value("CEX_OIDC_PROVIDER", "").strip()
+    return provider or None
+
+
+def _authlib_available() -> bool:
+    try:
+        return importlib.util.find_spec("authlib") is not None
+    except Exception:
+        return False
+
+
+def _sso_auth_section() -> Any:
+    try:
+        return st.secrets.get("auth", {}) or {}
+    except Exception:
+        return {}
+
+
+def _sso_auth_config_errors() -> list[str]:
+    errors: list[str] = []
+    if not _authlib_available():
+        errors.append("Install Authlib with `pip install Authlib>=1.3.2` or `pip install streamlit[auth]`.")
+
+    auth_section = _sso_auth_section()
+    if not auth_section:
+        errors.append("Add an `[auth]` section to `.streamlit/secrets.toml`.")
+        return errors
+
+    for key in ("redirect_uri", "cookie_secret"):
+        if not str(auth_section.get(key, "") or "").strip():
+            errors.append(f"Set `[auth].{key}` in `.streamlit/secrets.toml`.")
+
+    redirect_uri = str(auth_section.get("redirect_uri", "") or "").strip()
+    if redirect_uri and not redirect_uri.endswith("/oauth2callback"):
+        errors.append("Set `[auth].redirect_uri` to a URL ending in `/oauth2callback`.")
+
+    provider = _sso_provider_name()
+    provider_section = auth_section.get(provider, {}) if provider else auth_section
+    provider_label = f"[auth.{provider}]" if provider else "[auth]"
+    if provider and not provider_section:
+        errors.append(f"Add a `{provider_label}` section to `.streamlit/secrets.toml`.")
+        return errors
+
+    for key in ("client_id", "client_secret", "server_metadata_url"):
+        if not str(provider_section.get(key, "") or "").strip():
+            errors.append(f"Set `{provider_label}.{key}` in `.streamlit/secrets.toml`.")
+    return errors
+
+
+def _role_for_sso_email(email: str) -> str:
+    normalized_email = str(email or "").strip().lower()
+    admin_emails = _config_csv_set("CEX_ADMIN_EMAILS") | _config_csv_set("CEX_MASTER_EMAILS")
+    if normalized_email and normalized_email in admin_emails:
+        return ROLE_MASTER
+    return ROLE_READ_ONLY
+
+
+def _sso_email_allowed(email: str) -> bool:
+    normalized_email = str(email or "").strip().lower()
+    allowed_emails = _config_csv_set("CEX_ALLOWED_EMAILS")
+    allowed_domains = _config_csv_set("CEX_ALLOWED_DOMAINS")
+    if not allowed_emails and not allowed_domains:
+        return True
+    if normalized_email in allowed_emails:
+        return True
+    if "@" not in normalized_email:
+        return False
+    domain = normalized_email.rsplit("@", 1)[-1]
+    return domain in allowed_domains
+
+
+def _normalize_role(value: Any) -> str:
+    return ROLE_ALIASES.get(str(value or "").strip().lower(), ROLE_READ_ONLY)
+
+
+def _current_role() -> str:
+    role = _normalize_role(st.session_state.get("auth_role"))
+    st.session_state.auth_role = role
+    return role
+
+
+def _is_master() -> bool:
+    return _current_role() == ROLE_MASTER
+
+
+def _can_run_evaluations() -> bool:
+    return _current_role() in {ROLE_MASTER, ROLE_ACTIVE}
+
+
+def _can_export_results() -> bool:
+    return _can_run_evaluations()
+
+
+def _can_manage_runs() -> bool:
+    return _is_master()
+
+
+def _is_read_only() -> bool:
+    return _current_role() == ROLE_READ_ONLY
 
 
 # --------- Session state defaults ---------
@@ -225,6 +362,17 @@ def _clear_auth_state(*, clear_sensitive_data: bool = False) -> None:
         st.session_state.loaded_run_label = None
         st.session_state.review_selected_conversation_id = None
         st.session_state._run_results_db_path = None
+
+
+def _logout_current_user() -> None:
+    _clear_auth_state(clear_sensitive_data=True)
+    if _sso_auth_enabled() and hasattr(st, "logout"):
+        try:
+            st.logout()
+            return
+        except Exception:
+            pass
+    st.rerun()
 
 
 def _reset_default_choices() -> None:
@@ -369,7 +517,78 @@ def _render_workspace_header() -> None:
     )
 
 
+def _streamlit_user_field(name: str) -> str:
+    user = getattr(st, "user", None)
+    if user is None:
+        return ""
+    try:
+        value = user.get(name, "")
+    except Exception:
+        value = getattr(user, name, "")
+    return str(value or "")
+
+
+def _streamlit_user_is_logged_in() -> bool:
+    user = getattr(st, "user", None)
+    if user is None:
+        return False
+    try:
+        return bool(user.get("is_logged_in", False))
+    except Exception:
+        return bool(getattr(user, "is_logged_in", False))
+
+
+def _render_sso_auth_gate() -> bool:
+    if not hasattr(st, "login"):
+        _render_auth_intro()
+        st.error(
+            "SSO mode is enabled, but this Streamlit version does not expose st.login. "
+            "Upgrade Streamlit or set CEX_AUTH_MODE=local."
+        )
+        return False
+
+    if _streamlit_user_is_logged_in():
+        email = _streamlit_user_field("email")
+        if not _sso_email_allowed(email):
+            _render_auth_intro()
+            st.error("This Google account is not allowed to access the CX Review Platform.")
+            if st.button("Log out", use_container_width=True):
+                _logout_current_user()
+            return False
+        name = _streamlit_user_field("name") or email or "SSO user"
+        st.session_state.auth_user = name
+        st.session_state.auth_role = _role_for_sso_email(email)
+        st.session_state.auth_reviewer_key_id = None
+        st.session_state.auth_db_path = _active_db_path()
+        return True
+
+    _render_auth_intro()
+    _, auth_col, _ = st.columns([1, 1.1, 1])
+    with auth_col:
+        st.subheader("Google SSO")
+        st.caption("New SSO users open in read-only mode unless their email is configured as an admin.")
+        config_errors = _sso_auth_config_errors()
+        if config_errors:
+            st.error("Google SSO is enabled but not fully configured.")
+            for error in config_errors:
+                st.markdown(f"- {error}")
+            return False
+        if st.button("Sign in with Google", type="primary", use_container_width=True):
+            try:
+                provider = _sso_provider_name()
+                if provider:
+                    st.login(provider)
+                else:
+                    st.login()
+            except Exception as exc:
+                st.error(f"Could not start SSO login: {exc}")
+    return False
+
+
 def _render_auth_gate() -> bool:
+    if _sso_auth_enabled():
+        return _render_sso_auth_gate()
+
     active_db_path = _active_db_path()
     if st.session_state.get("auth_user"):
         return True
@@ -401,7 +620,7 @@ def _render_auth_gate() -> bool:
                         return False
                     st.session_state.session_master_key = master_key
                     st.session_state.auth_user = "Master admin"
-                    st.session_state.auth_role = "master"
+                    st.session_state.auth_role = ROLE_MASTER
                     st.session_state.auth_reviewer_key_id = None
                     st.session_state.auth_db_path = active_db_path
                     st.session_state.run_results = None
@@ -417,7 +636,7 @@ def _render_auth_gate() -> bool:
         if submitted:
             if _verify_master_key_input(secret):
                 st.session_state.auth_user = "Master admin"
-                st.session_state.auth_role = "master"
+                st.session_state.auth_role = ROLE_MASTER
                 st.session_state.auth_reviewer_key_id = None
                 st.session_state.auth_db_path = active_db_path
                 # Force a fresh "load the latest run by date" on every login,
@@ -436,7 +655,7 @@ def _render_auth_gate() -> bool:
                 if reviewer:
                     st.session_state.db_path = reviewer_db_path
                     st.session_state.auth_user = reviewer["reviewer_name"]
-                    st.session_state.auth_role = "reviewer"
+                    st.session_state.auth_role = _normalize_role(reviewer.get("role"))
                     st.session_state.auth_reviewer_key_id = reviewer["id"]
                     st.session_state.auth_db_path = reviewer_db_path
                     st.session_state.run_results = None
@@ -445,6 +664,37 @@ def _render_auth_gate() -> bool:
                 else:
                     st.error("Invalid or revoked access key.")
     return False
+
+
+def _render_read_only_sidebar() -> None:
+    auth_name = st.session_state.get("auth_user") or "Read-only user"
+    auth_role_label = humanize_label(_current_role())
+
+    with st.sidebar:
+        st.markdown(
+            """
+            <div class="cx-sidebar-brand">
+              <span class="cx-brand-mark">m</span>
+              <span class="cx-brand-word">maids.cc</span>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+        st.markdown("## Access")
+        st.markdown(
+            f"""
+            <div class="cx-sidebar-mini">
+              <div>Signed in</div>
+              <div>{html_lib.escape(str(auth_name))} - {html_lib.escape(str(auth_role_label))}</div>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+        st.caption("Read-only access: load saved runs, review dashboards, inspect journeys, and use filters.")
+        st.markdown("---")
+        render_database_selector(in_sidebar=True)
+        if st.button("Log out", use_container_width=True):
+            _logout_current_user()
 
 
 def _available_database_options() -> tuple[list[str], dict[str, str]]:
@@ -485,7 +735,7 @@ def _on_database_source_changed() -> None:
     st.session_state.generated_reviewer_key = None
     st.session_state.auth_db_path = _active_db_path()
     st.session_state._run_results_db_path = None
-    if st.session_state.get("auth_role") == "reviewer":
+    if _is_read_only():
         st.session_state.auth_reviewer_key_id = None
     try:
         get_db.clear()
@@ -2502,7 +2752,7 @@ def render_sidebar() -> None:
 
 def render_auth_sidebar() -> None:
     auth_name = st.session_state.get("auth_user") or "Unknown"
-    auth_role = st.session_state.get("auth_role") or "reviewer"
+    auth_role = _current_role()
     auth_role_label = humanize_label(auth_role)
 
     with st.sidebar:
@@ -2526,8 +2776,7 @@ def render_auth_sidebar() -> None:
             unsafe_allow_html=True,
         )
         if st.button("Log out", use_container_width=True):
-            _clear_auth_state(clear_sensitive_data=True)
-            st.rerun()
+            _logout_current_user()
 
 
 def hide_sidebar() -> None:
@@ -2547,7 +2796,7 @@ def hide_sidebar() -> None:
 
 
 def tab_reviewer_admin() -> None:
-    if st.session_state.get("auth_role") != "master":
+    if not _is_master():
         st.warning("Only master admins can manage reviewer access.")
         return
 
@@ -2587,12 +2836,20 @@ def tab_reviewer_admin() -> None:
         st.markdown("### Add reviewer")
         with st.form("create_reviewer_key_form"):
             reviewer_name = st.text_input("Reviewer name")
+            reviewer_role = st.selectbox(
+                "Initial role",
+                [ROLE_READ_ONLY, ROLE_ACTIVE],
+                index=0,
+                format_func=humanize_label,
+                help="Read-only users can review saved runs. Active users can upload, run evaluations, and export.",
+            )
             created = st.form_submit_button("Generate reviewer key", type="primary")
         if created:
             try:
                 st.session_state.generated_reviewer_key = db.create_reviewer_key(
                     reviewer_name,
                     created_by=auth_name,
+                    role=reviewer_role,
                 )
             except Exception as exc:
                 st.error(str(exc))
@@ -2617,11 +2874,26 @@ def tab_reviewer_admin() -> None:
 
         for key in keys:
             status = "Active" if key["is_active"] else "Revoked"
-            cols = st.columns([3, 1])
+            current_role = _normalize_role(key.get("role"))
+            cols = st.columns([2.2, 1.2, 1])
             with cols[0]:
                 st.markdown(f"**{key['reviewer_name']}**")
                 st.caption(f"{key['key_prefix']}... - {status}")
             with cols[1]:
+                selected_role = st.selectbox(
+                    "Role",
+                    [ROLE_READ_ONLY, ROLE_ACTIVE],
+                    index=0 if current_role == ROLE_READ_ONLY else 1,
+                    key=f"reviewer_role_{key['id']}",
+                    format_func=humanize_label,
+                    disabled=not key["is_active"],
+                    label_visibility="collapsed",
+                )
+                if key["is_active"] and selected_role != current_role:
+                    db.update_reviewer_role(int(key["id"]), selected_role)
+                    st.toast(f"Updated {key['reviewer_name']} to {humanize_label(selected_role)}.")
+                    st.rerun()
+            with cols[2]:
                 if key["is_active"] and st.button("Revoke", key=f"revoke_reviewer_{key['id']}"):
                     db.revoke_reviewer_key(int(key["id"]))
                     st.rerun()
@@ -2631,6 +2903,10 @@ def tab_reviewer_admin() -> None:
 
 
 def tab_upload() -> None:
+    if not _can_run_evaluations():
+        st.warning("Only active users and master admins can upload customer journey CSVs.")
+        return
+
     st.subheader("Upload Customer Journey CSV")
     st.caption(
         "Upload the Snowflake-exported CSV. One row per visible message in the appended customer journey. "
@@ -2868,94 +3144,97 @@ def tab_prompts() -> None:
         _render_prompt_editor("conversation_level", "Conversation-Level Prompt")
 
 
-# --------- Tab: Run Evaluation ---------
-
-
-def tab_run() -> None:
-    st.subheader("Run CX Evaluation")
-
-    # --- Past runs (load from DB) ---
+def _render_saved_runs_loader(key_prefix: str, *, expanded: bool = False) -> None:
     db = get_active_db()
-    with st.expander("Past runs (saved in the database)", expanded=False):
-        if st.button("Refresh saved runs", key="refresh_saved_runs", use_container_width=True):
+    with st.expander("Past runs (saved in the database)", expanded=expanded):
+        if st.button("Refresh saved runs", key=f"{key_prefix}_refresh_saved_runs", use_container_width=True):
             st.rerun()
         runs = db.list_runs(limit=200)
         if not runs:
             st.caption("No saved runs yet.")
-        else:
-            df_runs = _fill_saved_run_counts(db, pd.DataFrame(runs))
-            n_conversations = pd.to_numeric(
-                df_runs["n_conversations"] if "n_conversations" in df_runs else pd.Series(0, index=df_runs.index),
-                errors="coerce",
-            ).fillna(0)
-            saved_conversations = pd.to_numeric(
-                df_runs["saved_conversations"] if "saved_conversations" in df_runs else pd.Series(0, index=df_runs.index),
-                errors="coerce",
-            ).fillna(0)
-            df_runs["is_incomplete"] = (
-                (n_conversations > 0)
-                & (saved_conversations == 0)
-            )
-            df_runs["label"] = df_runs.apply(
-                lambda r: _saved_run_label(r.to_dict())
-                + (" • incomplete: no saved results" if r.get("is_incomplete") else ""),
-                axis=1,
-            )
-            st.caption(f"Newest saved run in this database: #{int(df_runs.iloc[0]['id'])}")
-            st.dataframe(
-                df_runs[[
-                    "id",
-                    "csv_name",
-                    "status",
-                    "n_conversations",
-                    "saved_conversations",
-                    "n_message_calls",
-                    "saved_message_results",
-                    "started_at",
-                ]].head(8),
-                use_container_width=True,
-                hide_index=True,
-            )
-            incomplete_count = int(df_runs["is_incomplete"].sum())
-            show_incomplete = False
-            if incomplete_count:
-                show_incomplete = st.checkbox(
-                    f"Show {incomplete_count} incomplete run(s) with no saved results",
-                    value=False,
-                )
-            display_runs = df_runs if show_incomplete else df_runs[~df_runs["is_incomplete"]]
-            if display_runs.empty:
-                st.caption("No loadable saved runs. Enable incomplete runs above if you want to rename or delete them.")
-                return
+            return
 
-            sel = st.selectbox(
-                "Select a saved run to load",
-                display_runs["label"].tolist(),
-                index=0,
-                key=f"saved_run_select_{int(df_runs.iloc[0]['id'])}_{int(show_incomplete)}",
+        df_runs = _fill_saved_run_counts(db, pd.DataFrame(runs))
+        n_conversations = pd.to_numeric(
+            df_runs["n_conversations"] if "n_conversations" in df_runs else pd.Series(0, index=df_runs.index),
+            errors="coerce",
+        ).fillna(0)
+        saved_conversations = pd.to_numeric(
+            df_runs["saved_conversations"] if "saved_conversations" in df_runs else pd.Series(0, index=df_runs.index),
+            errors="coerce",
+        ).fillna(0)
+        df_runs["is_incomplete"] = (
+            (n_conversations > 0)
+            & (saved_conversations == 0)
+        )
+        df_runs["label"] = df_runs.apply(
+            lambda r: _saved_run_label(r.to_dict())
+            + (" • incomplete: no saved results" if r.get("is_incomplete") else ""),
+            axis=1,
+        )
+        st.caption(f"Newest saved run in this database: #{int(df_runs.iloc[0]['id'])}")
+        st.dataframe(
+            df_runs[[
+                "id",
+                "csv_name",
+                "status",
+                "n_conversations",
+                "saved_conversations",
+                "n_message_calls",
+                "saved_message_results",
+                "started_at",
+            ]].head(8),
+            use_container_width=True,
+            hide_index=True,
+        )
+        incomplete_count = int(df_runs["is_incomplete"].sum())
+        show_incomplete = False
+        if incomplete_count:
+            show_incomplete = st.checkbox(
+                f"Show {incomplete_count} incomplete run(s) with no saved results",
+                value=False,
+                key=f"{key_prefix}_show_incomplete_runs",
             )
-            sel_id = int(display_runs.iloc[display_runs.index[display_runs["label"] == sel][0]]["id"])
-            selected_run = display_runs[display_runs["id"] == sel_id].iloc[0].to_dict()
-            rename_key = f"rename_run_{sel_id}"
+        display_runs = df_runs if show_incomplete else df_runs[~df_runs["is_incomplete"]]
+        if display_runs.empty:
+            message = "No loadable saved runs."
+            if _can_manage_runs():
+                message += " Enable incomplete runs above if you want to rename or delete them."
+            st.caption(message)
+            return
+
+        sel = st.selectbox(
+            "Select a saved run to load",
+            display_runs["label"].tolist(),
+            index=0,
+            key=f"{key_prefix}_saved_run_select_{int(df_runs.iloc[0]['id'])}_{int(show_incomplete)}",
+        )
+        sel_id = int(display_runs.iloc[display_runs.index[display_runs["label"] == sel][0]]["id"])
+        selected_run = display_runs[display_runs["id"] == sel_id].iloc[0].to_dict()
+
+        if _can_manage_runs():
+            rename_key = f"{key_prefix}_rename_run_{sel_id}"
             st.text_input(
                 "Rename selected run",
                 key=rename_key,
                 value=selected_run.get("name") or "",
                 placeholder="Untitled run",
             )
-            col_load, col_rename, col_del = st.columns([1, 1, 1])
-            with col_load:
-                is_incomplete_run = bool(selected_run.get("is_incomplete"))
-                if is_incomplete_run:
-                    st.caption("This run has no saved result rows, so it cannot be loaded.")
-                if st.button("Load this run", use_container_width=True, disabled=is_incomplete_run):
-                    try:
-                        _load_saved_run_into_session(db, sel_id, label=sel)
-                        st.success(f"Loaded run #{sel_id}.")
-                    except Exception as e:
-                        st.error(f"Could not load run: {e}")
+
+        col_load, col_rename, col_del = st.columns([1, 1, 1])
+        with col_load:
+            is_incomplete_run = bool(selected_run.get("is_incomplete"))
+            if is_incomplete_run:
+                st.caption("This run has no saved result rows, so it cannot be loaded.")
+            if st.button("Load this run", key=f"{key_prefix}_load_run", use_container_width=True, disabled=is_incomplete_run):
+                try:
+                    _load_saved_run_into_session(db, sel_id, label=sel)
+                    st.success(f"Loaded run #{sel_id}.")
+                except Exception as e:
+                    st.error(f"Could not load run: {e}")
+        if _can_manage_runs():
             with col_rename:
-                if st.button("Save name", use_container_width=True, type="secondary"):
+                if st.button("Save name", key=f"{key_prefix}_save_run_name", use_container_width=True, type="secondary"):
                     try:
                         db.rename_run(sel_id, (st.session_state.get(rename_key) or "").strip())
                         st.success(f"Renamed run #{sel_id}.")
@@ -2963,7 +3242,7 @@ def tab_run() -> None:
                     except Exception as e:
                         st.error(f"Could not rename run: {e}")
             with col_del:
-                if st.button("Delete this run", use_container_width=True, type="secondary"):
+                if st.button("Delete this run", key=f"{key_prefix}_delete_run", use_container_width=True, type="secondary"):
                     try:
                         db.delete_run(sel_id)
                         if st.session_state.current_run_id == sel_id:
@@ -2973,6 +3252,19 @@ def tab_run() -> None:
                         st.success(f"Deleted run #{sel_id}.")
                     except Exception as e:
                         st.error(f"Could not delete run: {e}")
+
+
+# --------- Tab: Run Evaluation ---------
+
+
+def tab_run() -> None:
+    if not _can_run_evaluations():
+        st.warning("Only active users and master admins can run evaluations.")
+        return
+
+    st.subheader("Run CX Evaluation")
+
+    _render_saved_runs_loader("run", expanded=False)
 
     df = st.session_state.df_norm
     conversation_only_available = bool(
@@ -4669,10 +4961,6 @@ def tab_stats() -> None:
             conversation and check its journey analysis before making a decision.
             """
         ))
-    if not _has_results():
-        st.info("Run an evaluation first.")
-        return
-
     conv_df = _conv_dataframe_from_results()
     if conv_df.empty:
         st.info("No journeys to summarize.")
@@ -4735,8 +5023,9 @@ def tab_overview() -> None:
             read the full conversation.
             """
         ))
+    _render_saved_runs_loader("overview", expanded=not _has_results())
     if not _has_results():
-        st.info("Run an evaluation first.")
+        st.info("Load a saved run above to start reviewing.")
         return
 
     conv_df = _conv_dataframe_from_results()
@@ -5758,6 +6047,10 @@ def tab_review() -> None:
 
 
 def tab_exports() -> None:
+    if not _can_export_results():
+        st.warning("Only active users and master admins can export results.")
+        return
+
     st.subheader("Exports")
     if not _has_results():
         st.info("Run an evaluation first to enable exports.")
@@ -5923,6 +6216,10 @@ def tab_exports() -> None:
 
 
 def tab_debug() -> None:
+    if not _is_master():
+        st.warning("Only master admins can open Debug.")
+        return
+
     st.subheader("Debug")
     if not _has_results():
         st.info("Run an evaluation first.")
@@ -6035,23 +6332,33 @@ def tab_debug() -> None:
 
 def _workspace_tab_specs(auth_role: str) -> list[tuple[str, Any]]:
     """Return the tabs available to the signed-in role."""
+    role = _normalize_role(auth_role)
     review_tabs = [
         ("Overview", tab_overview),
         ("Stats", tab_stats),
         ("Dashboard", tab_dashboard),
         ("Journey Review", tab_review),
     ]
-    if auth_role != "master":
+    if role == ROLE_READ_ONLY:
         return review_tabs
-    return [
+    if role == ROLE_ACTIVE:
+        return [
+            ("Upload & Settings", tab_upload),
+            ("Run Evaluation", tab_run),
+            *review_tabs,
+            ("Exports", tab_exports),
+        ]
+    admin_tabs = [
         ("Reviewer Admin", tab_reviewer_admin),
         ("Upload & Settings", tab_upload),
-        ("Prompts", tab_prompts),
         ("Run Evaluation", tab_run),
         *review_tabs,
         ("Exports", tab_exports),
         ("Debug", tab_debug),
     ]
+    if PROMPT_EDITING_ENABLED:
+        admin_tabs.insert(2, ("Prompts", tab_prompts))
+    return admin_tabs
 
 
 def main() -> None:
@@ -6059,8 +6366,9 @@ def main() -> None:
     if not _render_auth_gate():
         return
 
-    auth_role = str(st.session_state.get("auth_role") or "reviewer")
-    is_master = auth_role == "master"
+    auth_role = _current_role()
+    is_master = auth_role == ROLE_MASTER
+    is_active = auth_role == ROLE_ACTIVE
 
     # Force DB initialization at app start so the seeded defaults exist before
     # the sidebar status or any tab tries to read them.
@@ -6076,8 +6384,15 @@ def main() -> None:
             st.markdown("---")
             render_active_prompt_status()
         render_sidebar()
+    elif is_active:
+        render_auth_sidebar()
+        with st.sidebar:
+            render_database_selector(in_sidebar=True)
+            st.markdown("---")
+            render_active_prompt_status()
+        render_sidebar()
     else:
-        hide_sidebar()
+        _render_read_only_sidebar()
 
     _render_workspace_header()
 

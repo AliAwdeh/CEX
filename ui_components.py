@@ -1021,6 +1021,7 @@ def conversation_filters(
         return {}
 
     sel_journey_starter: list[str] = []
+    sel_culprits: list[str] = []
     with st.expander("Filters", expanded=True):
         c1, c2, c3 = st.columns(3)
         with c1:
@@ -1089,6 +1090,21 @@ def conversation_filters(
                 key=f"{key_prefix}_issue_type",
             )
         with c3:
+            if "culprits" in conv_df.columns:
+                culprit_values: set[str] = set()
+                for raw in conv_df["culprits"].dropna().astype(str):
+                    for value in raw.split("|"):
+                        normalized = value.strip().lower()
+                        if normalized:
+                            culprit_values.add(normalized)
+                sel_culprits = st.multiselect(
+                    "Bad message caused by",
+                    sorted(culprit_values),
+                    default=[],
+                    format_func=humanize_label,
+                    key=f"{key_prefix}_culprits",
+                    help="Filter journeys by the sender entity that materially caused the bad experience or friction.",
+                )
             if include_journey_starter:
                 starters = [
                     value
@@ -1155,6 +1171,7 @@ def conversation_filters(
         "frustration_origin": sel_frustration_origin,
         "main_issue_origin": sel_origin,
         "main_issue_type": sel_issue_type,
+        "culprits": sel_culprits,
         "journey_starter": sel_journey_starter,
         "manual_review": sel_mr,
         "show_broadcast_only_red": show_broadcast_only,
@@ -1182,6 +1199,14 @@ def apply_conversation_filters(conv_df: pd.DataFrame, filters: dict) -> pd.DataF
     in_filter("main_issue_origin", "main_issue_origin")
     in_filter("main_issue_type", "main_issue_type")
     in_filter("journey_starter", "journey_starter")
+    selected_culprits = {str(value).strip().lower() for value in (filters.get("culprits") or []) if value}
+    if selected_culprits and "culprits" in conv_df.columns:
+        mask &= conv_df["culprits"].fillna("").astype(str).map(
+            lambda raw: bool(
+                selected_culprits
+                & {part.strip().lower() for part in raw.split("|") if part.strip()}
+            )
+        )
     mr = filters.get("manual_review")
     manual_review_series = None
     if "manual_review_required" in conv_df.columns:

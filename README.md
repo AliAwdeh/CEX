@@ -106,6 +106,40 @@ Settings live in the sidebar:
 
 ---
 
+## 4a. Hosted authentication
+
+Local mode uses the existing master key / reviewer key login flow. Reviewer keys now map to the read-only role.
+
+For local or hosted Google SSO, configure Streamlit OIDC secrets and set:
+
+```toml
+CEX_AUTH_MODE = "sso"
+CEX_OIDC_PROVIDER = "google"
+CEX_ADMIN_EMAILS = "admin1@example.com,admin2@example.com"
+CEX_ALLOWED_DOMAINS = "example.com"
+
+[auth]
+redirect_uri = "http://localhost:8501/oauth2callback"
+cookie_secret = "replace-with-a-long-random-cookie-secret"
+
+[auth.google]
+client_id = "replace-with-google-oauth-client-id"
+client_secret = "replace-with-google-oauth-client-secret"
+server_metadata_url = "https://accounts.google.com/.well-known/openid-configuration"
+```
+
+For production, change `redirect_uri` to the hosted URL plus `/oauth2callback` and add that same redirect URI in the Google OAuth client.
+
+SSO users default to `read_only` unless their email appears in `CEX_ADMIN_EMAILS` or `CEX_MASTER_EMAILS`. Reviewer-key users also default to `read_only`, but a master admin can promote them to `active` from Reviewer Admin.
+
+Roles:
+
+- `read_only`: load saved runs, view dashboards, inspect journeys, mark reviews, and use filters.
+- `active`: everything read-only can do, plus upload CSVs, run evaluations, run conversation-only reruns, and export results.
+- `master`: full admin access, including reviewer role management, database maintenance, run rename/delete, debug tooling, and active-user capabilities.
+
+---
+
 ## 5. Evaluation logic
 
 For each customer journey, in `APPENDED_MESSAGE_INDEX` order:
@@ -163,13 +197,19 @@ The **Exports** tab produces three files:
 
 ## 7. App tabs
 
-1. **Upload & Settings** Ã¢â‚¬â€ upload the CSV, see the row/journey/source-conversation/message summary, verify required columns.
-2. **Prompts** Ã¢â‚¬â€ edit the system prompt, output structure, and user-prompt template for both evaluators. Save as new versions, switch active version, reset to default. All versions are stored in SQLite.
-3. **Run Evaluation** Ã¢â‚¬â€ see the estimated AI-call count, start the run, watch progress, optionally cancel. Includes a "Past runs" section to load or delete previously saved runs.
-4. **Dashboard** — management metrics, handled/unhandled and good/bad experience breakdowns, top issue types, top frustration causes, agent/skill breakdowns.
-5. **Journey Review** Ã¢â‚¬â€ pick a customer journey, view its summary card, native chat-bubble transcript, and the message-level evaluation card directly under each agent message.
-6. **Exports** Ã¢â‚¬â€ download CSVs and the full JSON.
-7. **Debug** Ã¢â‚¬â€ raw prompts, raw responses, parse errors, failed records, sanitized run config.
+Read-only users see review-focused tabs only: **Overview**, **Stats**, **Dashboard**, and **Journey Review**.
+
+Active users additionally see **Upload & Settings**, **Run Evaluation**, and **Exports**.
+
+Master users additionally see admin-only tabs/actions:
+
+1. **Reviewer Admin** - manage reviewer/local access and database maintenance.
+2. **Upload & Settings** - upload the CSV, see the row/journey/source-conversation/message summary, verify required columns.
+3. **Run Evaluation** - see the estimated AI-call count, start the run, watch progress, optionally cancel. Includes a "Past runs" section to load or delete previously saved runs.
+4. **Exports** - download CSVs and the full JSON.
+5. **Debug** - raw prompts, raw responses, parse errors, failed records, sanitized run config.
+
+The platform prompt editor tab is disabled by default for hosted cleanup. Active default prompts are refreshed from `correct_prompt_files/`.
 
 The main views never expose raw JSON or stack traces Ã¢â‚¬â€ those live only in the Debug tab.
 
