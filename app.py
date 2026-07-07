@@ -69,6 +69,7 @@ from ui_components import (
     conversation_filters,
     metric_row,
     render_conversation_summary_card,
+    render_conversation_transcript_fast,
     render_conversation_transcript_with_evals,
     render_message_evaluation_panel,
     render_transcript,
@@ -255,6 +256,18 @@ def _can_manage_runs() -> bool:
 
 def _is_read_only() -> bool:
     return _current_role() == ROLE_READ_ONLY
+
+
+def _clear_run_derived_caches() -> None:
+    """Clear session caches derived from the currently loaded run."""
+    for key in (
+        "_conv_df_cache",
+        "_msg_df_cache",
+        "_review_filter_index_cache",
+        "_stats_detail_tables_cache",
+        "_conversation_id_map_cache",
+    ):
+        st.session_state.pop(key, None)
 
 
 # --------- Session state defaults ---------
@@ -1049,6 +1062,7 @@ def _available_database_options() -> tuple[list[str], dict[str, str]]:
 
 
 def _on_database_source_changed() -> None:
+    _clear_run_derived_caches()
     st.session_state.current_run_id = None
     st.session_state.loaded_run_label = None
     st.session_state.run_results = None
@@ -1464,6 +1478,7 @@ def _saved_run_is_loadable(row: dict) -> bool:
 
 
 def _load_saved_run_into_session(db: Database, run_id: int, *, label: str | None = None) -> None:
+    _clear_run_derived_caches()
     loaded = db.load_run_results(int(run_id))
     run = loaded.get("run") or db.get_run(int(run_id)) or {}
     if not loaded["conversation_results"] and int(run.get("n_conversations") or 0) > 0:
@@ -1483,6 +1498,7 @@ def _load_saved_run_into_session(db: Database, run_id: int, *, label: str | None
     st.session_state.loaded_run_label = label or _saved_run_label(run)
     st.session_state.review_selected_conversation_id = None
     st.session_state._run_results_db_path = _active_db_path()
+    _clear_run_derived_caches()
 
 
 def _auto_load_latest_run(db: Database) -> None:
@@ -1791,6 +1807,7 @@ def _execute_conversation_only_run(
             on_error=save_err,
         )
         st.session_state.run_results = results
+        _clear_run_derived_caches()
         persist_completed_results()
         completion_message = (
             f"Conversation-only evaluation finished. {len(results.conversation_results)} customer journeys processed, "
@@ -5297,6 +5314,7 @@ def tab_run() -> None:
             )
             st.session_state.run_results = results
             st.session_state._run_results_db_path = _active_db_path()
+            _clear_run_derived_caches()
             persist_completed_results()
             completion_message = (
                 f"Evaluation finished. {len(results.conversation_results)} customer journeys processed, "
@@ -6907,6 +6925,38 @@ def _render_message_flag_stats_table(
     )
 
 
+def _stats_detail_tables_for_results(conversation_results: list[dict]) -> dict[str, pd.DataFrame]:
+    """Cache expensive Stats detail tables for the currently loaded run."""
+    cache_key = _conversation_results_identity_key(conversation_results)
+    cached = st.session_state.get("_stats_detail_tables_cache")
+    if cached is not None and cached.get("key") == cache_key:
+        return cached["value"]
+
+    value = {
+        "sender": _message_flag_stats(conversation_results),
+        "chunk": _message_flag_stats_by_rag_chunk(conversation_results),
+        "agent": _message_flag_stats_by_agent_name(conversation_results),
+        "l2": _message_flag_stats_for_l2_agents(conversation_results),
+    }
+    st.session_state["_stats_detail_tables_cache"] = {"key": cache_key, "value": value}
+    return value
+
+
+def _conversation_result_map(conversation_results: list[dict]) -> dict[str, dict]:
+    """Cache conversation lookup by id for the currently loaded run."""
+    cache_key = _conversation_results_identity_key(conversation_results)
+    cached = st.session_state.get("_conversation_id_map_cache")
+    if cached is not None and cached.get("key") == cache_key:
+        return cached["value"]
+    value = {
+        str(result.get("conversation_id") or result.get("thread_id") or ""): result
+        for result in conversation_results or []
+        if str(result.get("conversation_id") or result.get("thread_id") or "").strip()
+    }
+    st.session_state["_conversation_id_map_cache"] = {"key": cache_key, "value": value}
+    return value
+
+
 def tab_stats() -> None:
     st.subheader("Stats")
     st.caption(
@@ -6952,24 +7002,19 @@ def tab_stats() -> None:
     rows = _stats_summary_rows(conv_df)
     _render_stats_summary_table(rows)
 
-    flag_stats_df = _message_flag_stats(
+    stats_detail_tables = _stats_detail_tables_for_results(
         st.session_state.run_results.conversation_results
     )
+    flag_stats_df = stats_detail_tables["sender"]
     st.markdown("### Message flags by sender origin")
     st.caption(
         "Evaluated message counts using the same red, yellow, and green rules as Journey Review."
     )
     _render_message_flag_stats_table(flag_stats_df)
 
-    chunk_flag_stats_df = _message_flag_stats_by_rag_chunk(
-        st.session_state.run_results.conversation_results
-    )
-    agent_flag_stats_df = _message_flag_stats_by_agent_name(
-        st.session_state.run_results.conversation_results
-    )
-    l2_flag_stats_df = _message_flag_stats_for_l2_agents(
-        st.session_state.run_results.conversation_results
-    )
+    chunk_flag_stats_df = stats_detail_tables["chunk"].copy()
+    agent_flag_stats_df = stats_detail_tables["agent"].copy()
+    l2_flag_stats_df = stats_detail_tables["l2"].copy()
     with st.expander("Flagged bot messages by retrieved RAG chunk", expanded=False):
         st.caption(
             "Counts red and yellow flagged messages for each retrieved chunk. The appearance rate is "
@@ -7684,6 +7729,67 @@ def _message_results_by_index(message_results: list[dict] | None) -> dict[str, d
     }
 
 
+def _conversation_results_identity_key(conversation_results: list[dict]) -> tuple[int, int]:
+    """Cheap identity key for cached derived data from the currently loaded run."""
+    return (id(conversation_results), len(conversation_results or []))
+
+
+def _review_filter_index(conversation_results: list[dict]) -> dict[str, Any]:
+    """Build cached sender/chunk filter indexes for Journey Review.
+
+    Streamlit reruns the script on every widget change. Without this cache, the
+    Journey Review flag filters scan every transcript and rebuild message-index
+    maps repeatedly, which becomes painful once the SQLite-backed run is large.
+    """
+    cache_key = _conversation_results_identity_key(conversation_results)
+    cached = st.session_state.get("_review_filter_index_cache")
+    if cached is not None and cached.get("key") == cache_key:
+        return cached["value"]
+
+    sender_levels_by_id: dict[str, dict[str, set[str]]] = {}
+    chunk_levels_by_id: dict[str, dict[str, set[str]]] = {}
+    chunk_options: set[str] = set()
+
+    for conversation_result in conversation_results or []:
+        conversation_id = str(conversation_result.get("conversation_id") or "")
+        sender_levels = {kind: set() for kind in ("Agent", "L2", "Bot", "Broadcast")}
+        chunk_levels: dict[str, set[str]] = {}
+        transcript = conversation_result.get("transcript") or []
+        eval_by_idx = _message_results_by_index(conversation_result.get("message_level_results"))
+
+        for message in transcript:
+            chunks = _rag_chunks_for_message(message)
+            if chunks:
+                chunk_options.update(chunks)
+
+            message_index = message.get("message_index")
+            if message_index is None:
+                continue
+            result = eval_by_idx.get(str(message_index))
+            sender_type = _flagged_sender_type(message)
+            flag_level = _message_flag_level(result)
+            if sender_type and flag_level:
+                sender_levels[sender_type].add(flag_level)
+                if sender_type == "Agent" and _is_l2_agent_message(message):
+                    sender_levels["L2"].add(flag_level)
+
+            flagged_level = flag_level if flag_level in {"Red", "Yellow"} else None
+            if flagged_level and chunks:
+                for chunk in chunks:
+                    chunk_levels.setdefault(chunk, set()).add(flagged_level)
+
+        sender_levels_by_id[conversation_id] = sender_levels
+        chunk_levels_by_id[conversation_id] = chunk_levels
+
+    value = {
+        "sender_levels_by_id": sender_levels_by_id,
+        "chunk_levels_by_id": chunk_levels_by_id,
+        "chunk_options": sorted(chunk_options, key=lambda value: value.lower()),
+    }
+    st.session_state["_review_filter_index_cache"] = {"key": cache_key, "value": value}
+    return value
+
+
 def _sender_flag_levels_for_journey(conversation_result: dict) -> dict[str, set[str]]:
     """Collect the message flag colors present for each supported sender type."""
     levels = {kind: set() for kind in ("Agent", "L2", "Bot", "Broadcast")}
@@ -7725,11 +7831,7 @@ def _chunk_flag_levels_for_journey(conversation_result: dict) -> dict[str, set[s
 
 def _rag_chunk_options_for_results(conversation_results: list[dict]) -> list[str]:
     """Return sorted unique RAG chunks found in loaded journey transcripts."""
-    chunks: set[str] = set()
-    for conversation_result in conversation_results or []:
-        for message in conversation_result.get("transcript") or []:
-            chunks.update(_rag_chunks_for_message(message))
-    return sorted(chunks, key=lambda value: value.lower())
+    return list(_review_filter_index(conversation_results).get("chunk_options") or [])
 
 
 def _filter_conversations_by_sender_flags(
@@ -7746,16 +7848,16 @@ def _filter_conversations_by_sender_flags(
     if not active_filters or conv_df.empty or "conversation_id" not in conv_df.columns:
         return conv_df
 
+    sender_levels_by_id = _review_filter_index(conversation_results)["sender_levels_by_id"]
     matching_ids: set[str] = set()
-    for conversation_result in conversation_results:
-        levels = _sender_flag_levels_for_journey(conversation_result)
+    for conversation_id, levels in sender_levels_by_id.items():
         if all(
             bool(levels.get(sender_type, set()))
             if flag_level == "__ANY__"
             else flag_level in levels.get(sender_type, set())
             for sender_type, flag_level in active_filters.items()
         ):
-            matching_ids.add(str(conversation_result.get("conversation_id") or ""))
+            matching_ids.add(str(conversation_id))
 
     return conv_df[conv_df["conversation_id"].astype(str).isin(matching_ids)]
 
@@ -7771,13 +7873,13 @@ def _filter_conversations_by_chunk_flag(
     if not selected_chunk or conv_df.empty or "conversation_id" not in conv_df.columns:
         return conv_df
 
+    chunk_levels_by_id = _review_filter_index(conversation_results)["chunk_levels_by_id"]
     matching_ids: set[str] = set()
-    for conversation_result in conversation_results:
-        chunk_levels = _chunk_flag_levels_for_journey(conversation_result)
+    for conversation_id, chunk_levels in chunk_levels_by_id.items():
         levels = chunk_levels.get(selected_chunk, set())
         matched = selected_flag in levels if selected_flag else bool(levels)
         if matched:
-            matching_ids.add(str(conversation_result.get("conversation_id") or ""))
+            matching_ids.add(str(conversation_id))
 
     return conv_df[conv_df["conversation_id"].astype(str).isin(matching_ids)]
 
@@ -8129,8 +8231,9 @@ def tab_review() -> None:
             6. Turn on **Show journey analysis and review metrics**. Check the journey outcome,
                experience, score, frustration, main issue, recommended actions, and flagged
                message summary.
-            7. Read the full conversation. Use the information button beside an evaluated
-               message to understand why it was marked red, yellow, or green.
+            7. Read the full conversation. The default transcript is optimized for quick
+               Previous/Next navigation. Turn on **Detailed message info buttons** when you need
+               the information button beside each evaluated message.
             8. Add a clear review comment and select **Mark as reviewed** when your check is
                complete.
             """
@@ -8141,6 +8244,12 @@ def tab_review() -> None:
         value=False,
         key="review_show_supporting_details",
         help="Filters and conversation transcripts remain visible. Turn this on to show the KPI strip and selected journey analysis.",
+    )
+    show_detailed_message_info = st.toggle(
+        "Detailed message info buttons",
+        value=False,
+        key="review_show_detailed_message_info",
+        help="Off is much faster for Previous/Next. Turn on only when you need the per-message info popovers.",
     )
 
     review_filters = _conversation_filters_with_keys(
@@ -8367,7 +8476,7 @@ def tab_review() -> None:
     current_index = ordered_ids.index(target_id)
 
     render_review_nav("top")
-    target_cr = next((c for c in rr.conversation_results if c.get("conversation_id") == target_id), None)
+    target_cr = _conversation_result_map(rr.conversation_results).get(str(target_id))
     if not target_cr:
         st.error("Customer journey not found.")
         return
@@ -8384,18 +8493,29 @@ def tab_review() -> None:
     _render_journey_chunk_overview(transcript, msgs)
 
     st.markdown("### Full Customer Journey")
-    st.caption(
-        "The full appended customer journey is shown below. Where available, assistant replies also include a short quality check underneath."
-    )
+    if show_detailed_message_info:
+        st.caption(
+            "Detailed mode is on. Message info buttons are available, but Previous/Next will be slower on long journeys."
+        )
+    else:
+        st.caption(
+            "Fast mode is on for quicker Previous/Next navigation. Turn on Detailed message info buttons when you need per-message details."
+        )
     st.markdown("<div id='review-conversation-start'></div>", unsafe_allow_html=True)
     if show_review_details:
         _render_flagged_message_checker(transcript, msgs, target_id)
     _, chat_col, _ = st.columns([0.15, 9.7, 0.15])
     with chat_col:
-        render_conversation_transcript_with_evals(
-            transcript=transcript,
-            message_results=msgs,
-        )
+        if show_detailed_message_info:
+            render_conversation_transcript_with_evals(
+                transcript=transcript,
+                message_results=msgs,
+            )
+        else:
+            render_conversation_transcript_fast(
+                transcript=transcript,
+                message_results=msgs,
+            )
 
     render_review_nav("bottom")
     scroll_to_conversation_start_if_requested()

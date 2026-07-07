@@ -267,6 +267,86 @@ def metric_row(metrics: list[tuple[str, Any, str | None]]) -> None:
                 st.metric(label, value, delta)
 
 
+def render_conversation_transcript_fast(
+    transcript: list[dict],
+    message_results: list[dict] | None,
+) -> None:
+    """Render a fast non-interactive transcript for quick Journey Review navigation.
+
+    This avoids per-message Streamlit columns/popovers. Those are useful for
+    deep review, but slow to rebuild on Next/Previous for long journeys.
+    """
+    if not transcript:
+        st.info("No messages to display.")
+        return
+
+    eval_by_idx = {m.get("message_index"): m for m in (message_results or [])}
+    n_evals = sum(1 for m in (message_results or []) if m.get("parsed_json"))
+    n_major = sum(
+        1 for m in (message_results or [])
+        if (m.get("parsed_json") or {}).get("message_level_effect") == "major_issue"
+    )
+    n_minor = sum(
+        1 for m in (message_results or [])
+        if (m.get("parsed_json") or {}).get("message_level_effect") == "minor_issue"
+    )
+    n_recovered = sum(
+        1 for m in (message_results or [])
+        if (m.get("parsed_json") or {}).get("message_level_effect") == "recovered_issue"
+    )
+    st.caption(
+        f"{len(transcript)} messages • {n_evals} messages evaluated • "
+        f"{n_major} major · {n_minor} minor · {n_recovered} recovered"
+    )
+
+    html_parts = [
+        """
+        <style>
+          .cx-fast-transcript { display:flex; flex-direction:column; gap:4px; }
+          .cx-fast-severity {
+            display:inline-flex; align-items:center; justify-content:center;
+            margin-left:8px; padding:1px 7px; border-radius:999px;
+            font-size:0.68rem; font-weight:900; vertical-align:middle;
+          }
+        </style>
+        <div class="cx-fast-transcript">
+        """
+    ]
+    previous_source = object()
+    for msg in transcript:
+        idx = msg.get("message_index")
+        source_id = msg.get("source_conversation_id")
+        if source_id != previous_source:
+            html_parts.append(_source_divider(source_id))
+            previous_source = source_id
+
+        display_role, align = _message_display_role_and_align(msg)
+        eval_record = eval_by_idx.get(idx)
+        has_rag_context = _message_has_rag_context(msg)
+        severity = _message_severity(eval_record)
+        style = _SEVERITY_STYLES.get(severity, _SEVERITY_STYLES["gray"])
+        accent = style["border"] if eval_record else "#8b5cf6" if has_rag_context else None
+        bubble = _bubble_html(msg, display_role, align=align, accent=accent)
+        if eval_record:
+            badge = (
+                f"<span class=\"cx-fast-severity\" "
+                f"style=\"background:{style['bg']};border:1px solid {style['border']};"
+                f"color:{style['text']};\">{html.escape(style['label'])}</span>"
+            )
+            bubble = bubble.replace("</div></div>", f"{badge}</div></div>", 1)
+        elif has_rag_context:
+            bubble = bubble.replace(
+                "</div></div>",
+                "<span class=\"cx-fast-severity\" "
+                "style=\"background:#312e81;border:1px solid #8b5cf6;color:#ede9fe;\">RAG</span>"
+                "</div></div>",
+                1,
+            )
+        html_parts.append(bubble)
+    html_parts.append("</div>")
+    st.markdown("".join(html_parts), unsafe_allow_html=True)
+
+
 def render_transcript(messages: list[dict]) -> None:
     """Render a clean chat-bubble transcript view."""
     if not messages:
@@ -397,6 +477,29 @@ def _source_divider(source_id: Any) -> str:
         "<div style=\"height:1px;background:#475569;flex:1;\"></div>"
         "</div>"
     )
+
+
+def _message_display_role_and_align(msg: dict) -> tuple[str, str]:
+    """Return the human display role and bubble alignment for a transcript message."""
+    role = (msg.get("sender_role") or "unknown").lower()
+    raw_role = msg.get("raw_sender_role")
+    raw_role_norm = str(raw_role).strip().lower() if raw_role else ""
+
+    if raw_role_norm == "system":
+        display_role = "Broadcast"
+    elif raw_role_norm == "bot":
+        display_role = "Assistant"
+    elif raw_role_norm == "agent":
+        display_role = str(msg.get("agent_full_name") or "").strip() or "Agent"
+    elif role == "customer":
+        display_role = str(raw_role) if raw_role else "Customer"
+    elif role == "agent":
+        display_role = str(msg.get("agent_full_name") or "").strip() or "Assistant"
+    else:
+        display_role = str(raw_role) if raw_role else "Unknown"
+
+    align = "right" if role == "agent" else "left"
+    return display_role, align
 
 
 def _render_message_run_details(message_result: dict) -> None:
