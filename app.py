@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import html as html_lib
+import gc
 import hashlib
 import hmac
 import importlib
@@ -265,7 +266,6 @@ def _clear_run_derived_caches() -> None:
         "_review_filter_index_cache",
         "_stats_detail_tables_cache",
         "_conversation_id_map_cache",
-        "_compact_run_details_cache",
         "_selected_conversation_detail_cache",
     ):
         st.session_state.pop(key, None)
@@ -1484,19 +1484,16 @@ def _run_cache_key(run_id: int | None = None) -> tuple[str, int | None]:
 
 
 def _load_compact_run_details(db: Database | None = None) -> RunResults | None:
-    """Load compact details for the active saved run, excluding huge debug/history blobs.
+    """Load compact details for the active saved run as a temporary object.
 
-    Summary-only saved-run loads keep the app responsive. Pages that need
-    message-level flags/chunks call this on demand; it still avoids
-    ``input_history_json``, raw responses, and debug JSON by default.
+    Callers should immediately reduce this to derived numbers/indexes or a file
+    export and then let it go. It intentionally avoids ``input_history_json``,
+    raw responses, and debug JSON, and it no longer stores the full object in
+    ``st.session_state``.
     """
     run_id = st.session_state.get("current_run_id")
     if run_id is None:
         return None
-    key = _run_cache_key(int(run_id))
-    cached = st.session_state.get("_compact_run_details_cache")
-    if cached is not None and cached.get("key") == key:
-        return cached.get("value")
 
     db = db or get_active_db()
     loaded = db.load_run_results(
@@ -1515,7 +1512,6 @@ def _load_compact_run_details(db: Database | None = None) -> RunResults | None:
         finished_at=loaded["finished_at"],
     )
     rr = _normalize_run_results_for_display(rr)
-    st.session_state["_compact_run_details_cache"] = {"key": key, "value": rr}
     return rr
 
 
@@ -4573,20 +4569,11 @@ def tab_run() -> None:
         )
 
         no_csv_run_id = int(st.session_state.get("current_run_id") or 0)
-        no_csv_failed_plan = _failed_run_repair_plan(_load_compact_run_details() or st.session_state.get("run_results"))
-        no_csv_failed_ids = set(no_csv_failed_plan.get("failed_conversation_ids") or [])
+        no_csv_failed_plan: dict[str, Any] = {}
+        no_csv_failed_ids: set[str] = set()
         if no_csv_run_id:
             db_failed_ids = set(db.list_run_failed_conversation_ids(no_csv_run_id))
-            unplanned_db_failures = db_failed_ids - no_csv_failed_ids
-            if unplanned_db_failures:
-                failed_conversations = set(no_csv_failed_plan.get("failed_conversations") or set())
-                failed_conversations.update(unplanned_db_failures)
-                no_csv_failed_plan["failed_conversations"] = failed_conversations
-                no_csv_failed_plan["conversation_failure_count"] = len(failed_conversations)
-                no_csv_failed_plan["failed_conversation_ids"] = sorted(
-                    no_csv_failed_ids | unplanned_db_failures
-                )
-            no_csv_failed_ids = set(no_csv_failed_plan.get("failed_conversation_ids") or [])
+            no_csv_failed_ids = db_failed_ids
 
         no_csv_run_failed_mode = "Smart repair"
         if no_csv_failed_ids:
@@ -4595,9 +4582,8 @@ def tab_run() -> None:
                 expanded=True,
             ):
                 st.caption(
-                    f"Failed rows found: {int(no_csv_failed_plan.get('message_failure_count') or 0):,} "
-                    f"message-level and {int(no_csv_failed_plan.get('conversation_failure_count') or 0):,} "
-                    "conversation-level. This uses saved transcripts/results from the database."
+                    f"Failed journeys found: {len(no_csv_failed_ids):,}. "
+                    "Details are loaded only after you click Run Failed."
                 )
                 no_csv_run_failed_mode = st.radio(
                     "Run Failed mode",
@@ -4664,10 +4650,12 @@ def tab_run() -> None:
                 selected_conversation_ids=conversation_rerun_ids,
             )
         elif no_csv_run_failed_clicked:
+            detail_rr = _load_compact_run_details() or st.session_state.get("run_results")
+            no_csv_failed_plan = _failed_run_repair_plan(detail_rr)
             if no_csv_run_failed_mode == "Full failed journeys":
                 target_role = str(st.session_state.get("message_target_role") or "agent")
                 no_csv_failed_plan = _full_failed_repair_plan_from_loaded_run(
-                    st.session_state.get("run_results"),
+                    detail_rr,
                     sorted(no_csv_failed_ids),
                     target_role=target_role,
                     max_messages_per_conversation=int(
@@ -4684,6 +4672,8 @@ def tab_run() -> None:
                 counter_box=counter_box,
                 current_box=current_box,
             )
+            del detail_rr
+            gc.collect()
 
         _render_last_run_summary()
         return
@@ -4989,19 +4979,8 @@ def tab_run() -> None:
         )
         completed_ids = set(db.list_run_completed_conversation_ids(continuation_run_id))
         remaining_ids = [journey_id for journey_id in all_ids if journey_id not in completed_ids]
-        failed_repair_plan = _failed_run_repair_plan(_load_compact_run_details() or st.session_state.get("run_results"))
         db_failed_ids = set(db.list_run_failed_conversation_ids(continuation_run_id))
-        planned_failed_ids = set(failed_repair_plan.get("failed_conversation_ids") or [])
-        unplanned_db_failures = db_failed_ids - planned_failed_ids
-        if unplanned_db_failures:
-            failed_conversations = set(failed_repair_plan.get("failed_conversations") or set())
-            failed_conversations.update(unplanned_db_failures)
-            failed_repair_plan["failed_conversations"] = failed_conversations
-            failed_repair_plan["conversation_failure_count"] = len(failed_conversations)
-            failed_repair_plan["failed_conversation_ids"] = sorted(
-                planned_failed_ids | unplanned_db_failures
-            )
-        failed_ids = db_failed_ids | set(failed_repair_plan.get("failed_conversation_ids") or [])
+        failed_ids = db_failed_ids
         run_failed_ids = [journey_id for journey_id in all_ids if journey_id in failed_ids]
 
         with st.expander(
@@ -5053,11 +5032,9 @@ def tab_run() -> None:
                 st.success("This run already has a conversation result for every journey in the CSV.")
 
             if run_failed_ids:
-                msg_failures = int(failed_repair_plan.get("message_failure_count") or 0)
-                conv_failures = int(failed_repair_plan.get("conversation_failure_count") or 0)
                 st.caption(
-                    f"Failed rows found: {msg_failures:,} message-level and "
-                    f"{conv_failures:,} conversation-level. Successful journeys remain untouched."
+                    f"Failed journeys found: {len(run_failed_ids):,}. "
+                    "Details are loaded only after you click Run Failed. Successful journeys remain untouched."
                 )
                 run_failed_mode = st.radio(
                     "Run Failed mode",
@@ -5476,6 +5453,8 @@ def tab_run() -> None:
                 current_box=current_box,
             )
         else:
+            detail_rr = _load_compact_run_details() or st.session_state.get("run_results")
+            failed_repair_plan = _failed_run_repair_plan(detail_rr)
             _execute_smart_failed_repair(
                 df=df,
                 run_id=continuation_run_id,
@@ -5485,6 +5464,8 @@ def tab_run() -> None:
                 counter_box=counter_box,
                 current_box=current_box,
             )
+            del detail_rr
+            gc.collect()
 
     _render_last_run_summary()
 
@@ -7019,21 +7000,23 @@ def _render_message_flag_stats_table(
     )
 
 
-def _stats_detail_tables_for_results(conversation_results: list[dict]) -> dict[str, pd.DataFrame]:
-    """Cache expensive Stats detail tables for the currently loaded run."""
-    cache_key = _conversation_results_identity_key(conversation_results)
-    cached = st.session_state.get("_stats_detail_tables_cache")
-    if cached is not None and cached.get("key") == cache_key:
-        return cached["value"]
-
-    value = {
+def _build_stats_detail_tables(conversation_results: list[dict]) -> dict[str, pd.DataFrame]:
+    """Build small Stats tables from the temporary compact run details."""
+    return {
         "sender": _message_flag_stats(conversation_results),
         "chunk": _message_flag_stats_by_rag_chunk(conversation_results),
         "agent": _message_flag_stats_by_agent_name(conversation_results),
         "l2": _message_flag_stats_for_l2_agents(conversation_results),
     }
-    st.session_state["_stats_detail_tables_cache"] = {"key": cache_key, "value": value}
-    return value
+
+
+def _stats_detail_tables_for_active_run() -> dict[str, pd.DataFrame]:
+    """Return cached numeric Stats tables for the active run."""
+    _ensure_active_run_derived_numbers()
+    cached = st.session_state.get("_stats_detail_tables_cache") or {}
+    if cached.get("key") == _run_cache_key():
+        return cached.get("value") or {}
+    return {}
 
 
 def _conversation_result_map(conversation_results: list[dict]) -> dict[str, dict]:
@@ -7096,13 +7079,7 @@ def tab_stats() -> None:
     rows = _stats_summary_rows(conv_df)
     _render_stats_summary_table(rows)
 
-    detail_rr = _load_compact_run_details()
-    detail_conversation_results = (
-        detail_rr.conversation_results
-        if detail_rr is not None
-        else st.session_state.run_results.conversation_results
-    )
-    stats_detail_tables = _stats_detail_tables_for_results(detail_conversation_results)
+    stats_detail_tables = _stats_detail_tables_for_active_run()
     flag_stats_df = stats_detail_tables["sender"]
     st.markdown("### Message flags by sender origin")
     st.caption(
@@ -7832,18 +7809,12 @@ def _conversation_results_identity_key(conversation_results: list[dict]) -> tupl
     return (id(conversation_results), len(conversation_results or []))
 
 
-def _review_filter_index(conversation_results: list[dict]) -> dict[str, Any]:
-    """Build cached sender/chunk filter indexes for Journey Review.
+def _build_review_filter_index(conversation_results: list[dict]) -> dict[str, Any]:
+    """Build sender/chunk filter indexes for Journey Review.
 
-    Streamlit reruns the script on every widget change. Without this cache, the
-    Journey Review flag filters scan every transcript and rebuild message-index
-    maps repeatedly, which becomes painful once the SQLite-backed run is large.
+    The returned object contains only small derived sets/options, not
+    transcripts or message bodies.
     """
-    cache_key = _conversation_results_identity_key(conversation_results)
-    cached = st.session_state.get("_review_filter_index_cache")
-    if cached is not None and cached.get("key") == cache_key:
-        return cached["value"]
-
     sender_levels_by_id: dict[str, dict[str, set[str]]] = {}
     chunk_levels_by_id: dict[str, dict[str, set[str]]] = {}
     chunk_options: set[str] = set()
@@ -7884,8 +7855,60 @@ def _review_filter_index(conversation_results: list[dict]) -> dict[str, Any]:
         "chunk_levels_by_id": chunk_levels_by_id,
         "chunk_options": sorted(chunk_options, key=lambda value: value.lower()),
     }
-    st.session_state["_review_filter_index_cache"] = {"key": cache_key, "value": value}
     return value
+
+
+def _ensure_active_run_derived_numbers() -> None:
+    """Compute expensive run-wide derived data once, then release heavy rows.
+
+    Streamlit executes all tabs on every rerun. This helper allows Stats and
+    Journey Review to share one temporary compact load and keep only derived
+    numeric tables/filter indexes in session state.
+    """
+    if not _has_results():
+        return
+    key = _run_cache_key()
+    stats_cached = st.session_state.get("_stats_detail_tables_cache")
+    review_cached = st.session_state.get("_review_filter_index_cache")
+    if (
+        stats_cached is not None
+        and stats_cached.get("key") == key
+        and review_cached is not None
+        and review_cached.get("key") == key
+    ):
+        return
+
+    detail_rr = _load_compact_run_details()
+    if detail_rr is None:
+        return
+    try:
+        conversation_results = detail_rr.conversation_results
+        if not (stats_cached is not None and stats_cached.get("key") == key):
+            st.session_state["_stats_detail_tables_cache"] = {
+                "key": key,
+                "value": _build_stats_detail_tables(conversation_results),
+            }
+        if not (review_cached is not None and review_cached.get("key") == key):
+            st.session_state["_review_filter_index_cache"] = {
+                "key": key,
+                "value": _build_review_filter_index(conversation_results),
+            }
+    finally:
+        del detail_rr
+        gc.collect()
+
+
+def _review_filter_index_for_active_run() -> dict[str, Any]:
+    """Return cached Journey Review filter indexes for the active run."""
+    _ensure_active_run_derived_numbers()
+    cached = st.session_state.get("_review_filter_index_cache") or {}
+    if cached.get("key") == _run_cache_key():
+        return cached.get("value") or {}
+    return {
+        "sender_levels_by_id": {},
+        "chunk_levels_by_id": {},
+        "chunk_options": [],
+    }
 
 
 def _sender_flag_levels_for_journey(conversation_result: dict) -> dict[str, set[str]]:
@@ -7927,14 +7950,14 @@ def _chunk_flag_levels_for_journey(conversation_result: dict) -> dict[str, set[s
     return levels
 
 
-def _rag_chunk_options_for_results(conversation_results: list[dict]) -> list[str]:
+def _rag_chunk_options_for_review_index(review_index: dict[str, Any]) -> list[str]:
     """Return sorted unique RAG chunks found in loaded journey transcripts."""
-    return list(_review_filter_index(conversation_results).get("chunk_options") or [])
+    return list(review_index.get("chunk_options") or [])
 
 
 def _filter_conversations_by_sender_flags(
     conv_df: pd.DataFrame,
-    conversation_results: list[dict],
+    review_index: dict[str, Any],
     filters: dict[str, str | None],
 ) -> pd.DataFrame:
     """Keep journeys containing each requested sender/severity combination."""
@@ -7946,7 +7969,7 @@ def _filter_conversations_by_sender_flags(
     if not active_filters or conv_df.empty or "conversation_id" not in conv_df.columns:
         return conv_df
 
-    sender_levels_by_id = _review_filter_index(conversation_results)["sender_levels_by_id"]
+    sender_levels_by_id = review_index.get("sender_levels_by_id") or {}
     matching_ids: set[str] = set()
     for conversation_id, levels in sender_levels_by_id.items():
         if all(
@@ -7962,7 +7985,7 @@ def _filter_conversations_by_sender_flags(
 
 def _filter_conversations_by_chunk_flag(
     conv_df: pd.DataFrame,
-    conversation_results: list[dict],
+    review_index: dict[str, Any],
     chunk_filter: dict[str, str | None],
 ) -> pd.DataFrame:
     """Keep journeys containing the requested chunk and optional red/yellow severity."""
@@ -7971,7 +7994,7 @@ def _filter_conversations_by_chunk_flag(
     if not selected_chunk or conv_df.empty or "conversation_id" not in conv_df.columns:
         return conv_df
 
-    chunk_levels_by_id = _review_filter_index(conversation_results)["chunk_levels_by_id"]
+    chunk_levels_by_id = review_index.get("chunk_levels_by_id") or {}
     matching_ids: set[str] = set()
     for conversation_id, chunk_levels in chunk_levels_by_id.items():
         levels = chunk_levels.get(selected_chunk, set())
@@ -7983,7 +8006,7 @@ def _filter_conversations_by_chunk_flag(
 
 
 def _render_sender_flag_filters(
-    conversation_results: list[dict],
+    review_index: dict[str, Any],
 ) -> tuple[dict[str, str | None], dict[str, str | None]]:
     """Render Agent/Bot/Broadcast and RAG chunk message flag filters."""
     st.markdown("**Message flag filters**")
@@ -8025,7 +8048,7 @@ def _render_sender_flag_filters(
             )
         filters[sender_type] = None if selected == options[0] else selected
 
-    chunk_options = _rag_chunk_options_for_results(conversation_results)
+    chunk_options = _rag_chunk_options_for_review_index(review_index)
     with columns[4]:
         selected_chunk = st.selectbox(
             "RAG chunk",
@@ -8348,21 +8371,16 @@ def tab_review() -> None:
         include_journey_starter=True,
     )
     filtered_df = _apply_conversation_filters_fresh(conv_df, review_filters)
-    detail_rr = _load_compact_run_details()
-    detail_conversation_results = (
-        detail_rr.conversation_results
-        if detail_rr is not None
-        else rr.conversation_results
-    )
-    sender_flag_filters, chunk_flag_filter = _render_sender_flag_filters(detail_conversation_results)
+    review_index = _review_filter_index_for_active_run()
+    sender_flag_filters, chunk_flag_filter = _render_sender_flag_filters(review_index)
     filtered_df = _filter_conversations_by_sender_flags(
         filtered_df,
-        detail_conversation_results,
+        review_index,
         sender_flag_filters,
     )
     filtered_df = _filter_conversations_by_chunk_flag(
         filtered_df,
-        detail_conversation_results,
+        review_index,
         chunk_flag_filter,
     )
 
@@ -8574,7 +8592,7 @@ def tab_review() -> None:
     render_review_nav("top")
     target_cr = _load_selected_conversation_detail(str(target_id))
     if not target_cr:
-        target_cr = _conversation_result_map(detail_conversation_results).get(str(target_id))
+        target_cr = _conversation_result_map(rr.conversation_results).get(str(target_id))
     if not target_cr:
         st.error("Customer journey not found.")
         return
@@ -8617,6 +8635,18 @@ def tab_exports() -> None:
     st.subheader("Exports")
     if not _has_results():
         st.info("Run an evaluation first to enable exports.")
+        return
+
+    prepare_key = f"exports_prepare_{st.session_state.get('current_run_id')}"
+    if st.button(
+        "Prepare export files",
+        key=prepare_key,
+        use_container_width=True,
+        help="Builds CSV/JSON files on demand so the app does not keep export payloads in memory during normal browsing.",
+    ):
+        st.session_state[f"{prepare_key}_ready"] = True
+    if not st.session_state.get(f"{prepare_key}_ready"):
+        st.info("Click **Prepare export files** when you need downloads. Normal browsing keeps export data offloaded.")
         return
 
     rr = _load_compact_run_details() or st.session_state.run_results
@@ -8792,13 +8822,25 @@ def tab_debug() -> None:
     if not _has_results():
         st.info("Run an evaluation first.")
         return
-    rr = _load_compact_run_details() or st.session_state.run_results
+    rr = st.session_state.run_results
 
     st.markdown("### Errors")
     if rr.errors:
         st.dataframe(pd.DataFrame(rr.errors), use_container_width=True)
     else:
         st.success("No errors recorded for this run.")
+
+    debug_key = f"debug_load_details_{st.session_state.get('current_run_id')}"
+    if not st.button(
+        "Load debug details",
+        key=debug_key,
+        use_container_width=True,
+        help="Loads message-level details only when needed.",
+    ):
+        st.info("Debug details are offloaded. Click the button above to inspect message/journey payloads.")
+        return
+
+    rr = _load_compact_run_details() or rr
 
     st.markdown("### Failed message-level evaluations")
     failed_msgs = [m for m in rr.message_level_results if m.get("parse_status") != "ok"]
