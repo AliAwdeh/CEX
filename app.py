@@ -4,9 +4,11 @@ from __future__ import annotations
 
 import json
 import html as html_lib
+import hashlib
 import hmac
 import importlib
 import os
+import secrets as secrets_lib
 import sqlite3
 import textwrap
 import time
@@ -420,14 +422,14 @@ def _local_secrets_path() -> Path:
     return Path(".streamlit") / "secrets.toml"
 
 
-def _read_local_master_key() -> str:
+def _read_local_secret_value(key: str) -> str:
     path = _local_secrets_path()
     if not path.exists():
         return ""
     try:
         for line in path.read_text(encoding="utf-8").splitlines():
             stripped = line.strip()
-            if not stripped or stripped.startswith("#") or not stripped.startswith("CEX_MASTER_KEY"):
+            if not stripped or stripped.startswith("#") or not stripped.startswith(key):
                 continue
             _, raw_value = stripped.split("=", 1)
             raw_value = raw_value.strip()
@@ -440,13 +442,13 @@ def _read_local_master_key() -> str:
     return ""
 
 
-def _write_local_master_key(master_key: str) -> None:
+def _write_local_secret_value(key: str, value: str, *, create_comment: str | None = None) -> None:
     path = _local_secrets_path()
     path.parent.mkdir(parents=True, exist_ok=True)
-    secret_line = f"CEX_MASTER_KEY = {json.dumps(str(master_key))}"
+    secret_line = f"{key} = {json.dumps(str(value))}"
     if not path.exists():
         path.write_text(
-            "# Local Streamlit secrets. This file is ignored by git.\n"
+            f"{create_comment or '# Local Streamlit secrets. This file is ignored by git.'}\n"
             f"{secret_line}\n",
             encoding="utf-8",
         )
@@ -456,7 +458,7 @@ def _write_local_master_key(master_key: str) -> None:
     updated: list[str] = []
     replaced = False
     for line in lines:
-        if line.strip().startswith("CEX_MASTER_KEY"):
+        if line.strip().startswith(key):
             updated.append(secret_line)
             replaced = True
         else:
@@ -466,6 +468,297 @@ def _write_local_master_key(master_key: str) -> None:
             updated.append("")
         updated.append(secret_line)
     path.write_text("\n".join(updated).rstrip() + "\n", encoding="utf-8")
+
+
+def _read_local_master_key() -> str:
+    return _read_local_secret_value("CEX_MASTER_KEY")
+
+
+def _write_local_master_key(master_key: str) -> None:
+    _write_local_secret_value(
+        "CEX_MASTER_KEY",
+        str(master_key),
+        create_comment="# Local Streamlit secrets. This file is ignored by git.",
+    )
+
+
+_LOCAL_REVIEWER_KEYS_SECRET = "CEX_REVIEWER_KEYS_JSON"
+_LOCAL_REVIEWER_HASH_ALGO = "pbkdf2_sha256"
+_LOCAL_REVIEWER_HASH_ITERATIONS = 260_000
+
+
+def _hash_local_reviewer_secret(
+    secret: str,
+    salt_hex: str | None = None,
+    *,
+    iterations: int = _LOCAL_REVIEWER_HASH_ITERATIONS,
+) -> str:
+    if salt_hex is None:
+        salt_hex = secrets_lib.token_hex(16)
+    digest = hashlib.pbkdf2_hmac(
+        "sha256",
+        str(secret).encode("utf-8"),
+        bytes.fromhex(salt_hex),
+        int(iterations),
+    ).hex()
+    return f"{_LOCAL_REVIEWER_HASH_ALGO}${int(iterations)}${salt_hex}${digest}"
+
+
+def _verify_local_reviewer_secret(secret: str, encoded: str) -> bool:
+    try:
+        algo, iterations, salt_hex, digest = str(encoded or "").split("$", 3)
+        if algo != _LOCAL_REVIEWER_HASH_ALGO:
+            return False
+        candidate = _hash_local_reviewer_secret(
+            secret,
+            salt_hex,
+            iterations=int(iterations),
+        ).rsplit("$", 1)[-1]
+        return hmac.compare_digest(candidate, digest)
+    except Exception:
+        return False
+
+
+def _empty_local_reviewer_store() -> dict[str, Any]:
+    return {"version": 1, "next_id": 1, "keys": []}
+
+
+def _read_local_reviewer_key_store() -> dict[str, Any]:
+    raw = _read_local_secret_value(_LOCAL_REVIEWER_KEYS_SECRET)
+    if not raw:
+        return _empty_local_reviewer_store()
+    try:
+        data = json.loads(raw)
+    except Exception:
+        return _empty_local_reviewer_store()
+    if not isinstance(data, dict):
+        return _empty_local_reviewer_store()
+    keys = data.get("keys")
+    if not isinstance(keys, list):
+        keys = []
+    next_id = data.get("next_id")
+    if not isinstance(next_id, int) or next_id < 1:
+        existing_ids = [
+            int(row.get("id") or 0)
+            for row in keys
+            if isinstance(row, dict) and str(row.get("id") or "").isdigit()
+        ]
+        next_id = (max(existing_ids) + 1) if existing_ids else 1
+    return {"version": 1, "next_id": next_id, "keys": [row for row in keys if isinstance(row, dict)]}
+
+
+def _write_local_reviewer_key_store(store: dict[str, Any]) -> None:
+    normalized = {
+        "version": 1,
+        "next_id": int(store.get("next_id") or 1),
+        "keys": list(store.get("keys") or []),
+    }
+    _write_local_secret_value(
+        _LOCAL_REVIEWER_KEYS_SECRET,
+        json.dumps(normalized, ensure_ascii=False, separators=(",", ":")),
+        create_comment="# Local Streamlit secrets. This file is ignored by git.",
+    )
+
+
+def _create_local_reviewer_key(reviewer_name: str, created_by: str = "master", role: str = ROLE_READ_ONLY) -> dict[str, Any]:
+    name = str(reviewer_name or "").strip()
+    if not name:
+        raise ValueError("Reviewer name is required")
+    normalized_role = _normalize_role(role)
+    plain_key = f"rvw_{secrets_lib.token_urlsafe(24)}"
+    now = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+    store = _read_local_reviewer_key_store()
+    key_id = int(store.get("next_id") or 1)
+    row = {
+        "id": key_id,
+        "reviewer_name": name,
+        "role": normalized_role,
+        "key_hash": _hash_local_reviewer_secret(plain_key),
+        "key_prefix": plain_key[:12],
+        "is_active": True,
+        "created_by": str(created_by or "master"),
+        "created_at": now,
+        "revoked_at": None,
+        "last_used_at": None,
+    }
+    store.setdefault("keys", []).append(row)
+    store["next_id"] = key_id + 1
+    _write_local_reviewer_key_store(store)
+    return {
+        "id": key_id,
+        "reviewer_name": name,
+        "role": normalized_role,
+        "reviewer_key": plain_key,
+        "key_prefix": plain_key[:12],
+        "created_at": now,
+    }
+
+
+def _list_local_reviewer_keys() -> list[dict[str, Any]]:
+    keys = list(_read_local_reviewer_key_store().get("keys") or [])
+    rows: list[dict[str, Any]] = []
+    for row in keys:
+        rows.append(
+            {
+                "id": int(row.get("id") or 0),
+                "reviewer_name": str(row.get("reviewer_name") or "Unknown"),
+                "role": _normalize_role(row.get("role")),
+                "key_prefix": str(row.get("key_prefix") or ""),
+                "is_active": bool(row.get("is_active")),
+                "created_by": str(row.get("created_by") or ""),
+                "created_at": str(row.get("created_at") or ""),
+                "revoked_at": row.get("revoked_at"),
+                "last_used_at": row.get("last_used_at"),
+            }
+        )
+    return sorted(
+        rows,
+        key=lambda row: (not row["is_active"], row["reviewer_name"].lower(), str(row["created_at"])),
+    )
+
+
+def _update_local_reviewer_role(key_id: int, role: str) -> None:
+    store = _read_local_reviewer_key_store()
+    for row in store.get("keys") or []:
+        if int(row.get("id") or 0) == int(key_id):
+            row["role"] = _normalize_role(role)
+            break
+    _write_local_reviewer_key_store(store)
+
+
+def _revoke_local_reviewer_key(key_id: int) -> None:
+    store = _read_local_reviewer_key_store()
+    now = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+    for row in store.get("keys") or []:
+        if int(row.get("id") or 0) == int(key_id):
+            row["is_active"] = False
+            row["revoked_at"] = now
+            break
+    _write_local_reviewer_key_store(store)
+
+
+def _verify_local_reviewer_key(reviewer_key: str) -> dict[str, Any] | None:
+    key = str(reviewer_key or "").strip()
+    if not key:
+        return None
+    store = _read_local_reviewer_key_store()
+    now = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+    matched: dict[str, Any] | None = None
+    for row in store.get("keys") or []:
+        if not row.get("is_active"):
+            continue
+        if _verify_local_reviewer_secret(key, str(row.get("key_hash") or "")):
+            row["last_used_at"] = now
+            matched = {
+                "id": int(row.get("id") or 0),
+                "reviewer_name": str(row.get("reviewer_name") or "Reviewer"),
+                "role": _normalize_role(row.get("role")),
+                "key_prefix": str(row.get("key_prefix") or ""),
+                "source": "local_secrets",
+            }
+            break
+    if matched:
+        _write_local_reviewer_key_store(store)
+    return matched
+
+
+def _database_paths_for_reviewer_key_migration() -> list[Path]:
+    paths: list[Path] = []
+    seen: set[Path] = set()
+    candidates = [
+        _resolve_db_path(DEFAULT_DB_PATH),
+        _resolve_db_path(REVIEW_DB_PATH),
+        _resolve_db_path(_active_db_path()),
+        *sorted(Path.cwd().glob("*.db")),
+    ]
+    for path in candidates:
+        resolved = path.resolve()
+        if resolved in seen or not resolved.exists() or resolved.suffix.lower() != ".db":
+            continue
+        paths.append(path)
+        seen.add(resolved)
+    return paths
+
+
+def _migrate_reviewer_keys_from_databases_to_local_secrets() -> dict[str, Any]:
+    """Copy hashed reviewer keys from local SQLite DB files into local secrets."""
+    store = _read_local_reviewer_key_store()
+    local_keys = store.setdefault("keys", [])
+    existing_hashes = {
+        str(row.get("key_hash") or "")
+        for row in local_keys
+        if isinstance(row, dict) and row.get("key_hash")
+    }
+    next_id = int(store.get("next_id") or 1)
+    scanned = imported = skipped = errors = 0
+    db_summaries: list[dict[str, Any]] = []
+
+    for db_path in _database_paths_for_reviewer_key_migration():
+        db_imported = db_skipped = 0
+        try:
+            with sqlite3.connect(str(db_path)) as con:
+                con.row_factory = sqlite3.Row
+                table_exists = con.execute(
+                    "SELECT 1 FROM sqlite_master WHERE type='table' AND name='reviewer_keys'"
+                ).fetchone()
+                if not table_exists:
+                    db_summaries.append(
+                        {"database": db_path.name, "imported": 0, "skipped": 0, "error": "No reviewer_keys table"}
+                    )
+                    continue
+                rows = con.execute(
+                    "SELECT id, reviewer_name, role, key_hash, key_prefix, is_active, "
+                    "created_by, created_at, revoked_at, last_used_at FROM reviewer_keys"
+                ).fetchall()
+        except Exception as exc:
+            errors += 1
+            db_summaries.append(
+                {"database": db_path.name, "imported": 0, "skipped": 0, "error": str(exc)}
+            )
+            continue
+
+        for row in rows:
+            scanned += 1
+            key_hash = str(row["key_hash"] or "").strip()
+            if not key_hash or key_hash in existing_hashes:
+                skipped += 1
+                db_skipped += 1
+                continue
+            now = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+            local_keys.append(
+                {
+                    "id": next_id,
+                    "reviewer_name": str(row["reviewer_name"] or "Reviewer"),
+                    "role": _normalize_role(row["role"]),
+                    "key_hash": key_hash,
+                    "key_prefix": str(row["key_prefix"] or ""),
+                    "is_active": bool(row["is_active"]),
+                    "created_by": str(row["created_by"] or f"migrated:{db_path.name}"),
+                    "created_at": str(row["created_at"] or now),
+                    "revoked_at": row["revoked_at"],
+                    "last_used_at": row["last_used_at"],
+                    "migrated_from_db": db_path.name,
+                    "migrated_from_id": int(row["id"]),
+                    "migrated_at": now,
+                }
+            )
+            existing_hashes.add(key_hash)
+            next_id += 1
+            imported += 1
+            db_imported += 1
+        db_summaries.append(
+            {"database": db_path.name, "imported": db_imported, "skipped": db_skipped, "error": ""}
+        )
+
+    store["next_id"] = next_id
+    _write_local_reviewer_key_store(store)
+    return {
+        "scanned": scanned,
+        "imported": imported,
+        "skipped": skipped,
+        "errors": errors,
+        "databases": db_summaries,
+    }
 
 
 def _configured_master_key() -> str:
@@ -668,18 +961,26 @@ def _render_auth_gate() -> bool:
                 st.session_state._run_results_db_path = None
                 st.rerun()
             else:
-                reviewer_db = db
+                reviewer = _verify_local_reviewer_key(secret)
                 reviewer_db_path = active_db_path
-                if REVIEW_DB_PATH.exists():
-                    reviewer_db_path = str(REVIEW_DB_PATH)
-                    reviewer_db = get_db(reviewer_db_path)
-                reviewer = reviewer_db.verify_reviewer_key(secret)
+                if not reviewer:
+                    reviewer_db = db
+                    reviewer_db_path = active_db_path
+                    if REVIEW_DB_PATH.exists():
+                        reviewer_db_path = str(REVIEW_DB_PATH)
+                        reviewer_db = get_db(reviewer_db_path)
+                    reviewer = reviewer_db.verify_reviewer_key(secret)
                 if reviewer:
-                    st.session_state.db_path = reviewer_db_path
+                    if reviewer.get("source") != "local_secrets":
+                        st.session_state.db_path = reviewer_db_path
                     st.session_state.auth_user = reviewer["reviewer_name"]
                     st.session_state.auth_role = _normalize_role(reviewer.get("role"))
-                    st.session_state.auth_reviewer_key_id = reviewer["id"]
-                    st.session_state.auth_db_path = reviewer_db_path
+                    # Local reviewer keys live outside SQLite. Keep DB FK empty
+                    # when recording reviews so switching DBs cannot break auth.
+                    st.session_state.auth_reviewer_key_id = (
+                        None if reviewer.get("source") == "local_secrets" else reviewer["id"]
+                    )
+                    st.session_state.auth_db_path = _active_db_path()
                     st.session_state.run_results = None
                     st.session_state._run_results_db_path = None
                     st.rerun()
@@ -3686,7 +3987,31 @@ def tab_reviewer_admin() -> None:
     st.divider()
 
     st.subheader("Reviewer Access")
-    st.caption("Generate reviewer keys and revoke access from the workspace.")
+    st.caption(
+        "Generate reviewer keys and revoke access from the workspace. "
+        "Reviewer keys are stored in local Streamlit secrets, so they stay the same when you switch or pull databases."
+    )
+    with st.expander("Temporary migration", expanded=False):
+        st.caption(
+            "Copies existing hashed reviewer keys from every local `.db` file into `.streamlit/secrets.toml`. "
+            "The original plaintext keys cannot be shown, but existing keys should continue to work after migration."
+        )
+        if st.button("Migrate reviewer keys from all databases to secrets", type="secondary", use_container_width=True):
+            try:
+                migration = _migrate_reviewer_keys_from_databases_to_local_secrets()
+            except Exception as exc:
+                st.error(f"Could not migrate reviewer keys: {exc}")
+            else:
+                st.success(
+                    f"Migrated {int(migration['imported']):,} reviewer key(s). "
+                    f"Skipped {int(migration['skipped']):,} duplicate/existing key(s). "
+                    f"Scanned {int(migration['scanned']):,} key row(s)."
+                )
+                db_rows = migration.get("databases") or []
+                if db_rows:
+                    st.dataframe(pd.DataFrame(db_rows), width="stretch", hide_index=True)
+                if int(migration.get("errors") or 0):
+                    st.warning(f"{int(migration['errors']):,} database file(s) could not be read.")
 
     create_col, keys_col = st.columns([1, 1.4])
     with create_col:
@@ -3703,7 +4028,7 @@ def tab_reviewer_admin() -> None:
             created = st.form_submit_button("Generate reviewer key", type="primary")
         if created:
             try:
-                st.session_state.generated_reviewer_key = db.create_reviewer_key(
+                st.session_state.generated_reviewer_key = _create_local_reviewer_key(
                     reviewer_name,
                     created_by=auth_name,
                     role=reviewer_role,
@@ -3724,7 +4049,7 @@ def tab_reviewer_admin() -> None:
 
     with keys_col:
         st.markdown("### Existing reviewers")
-        keys = db.list_reviewer_keys()
+        keys = _list_local_reviewer_keys()
         if not keys:
             st.info("No reviewer keys yet.")
             return
@@ -3747,12 +4072,12 @@ def tab_reviewer_admin() -> None:
                     label_visibility="collapsed",
                 )
                 if key["is_active"] and selected_role != current_role:
-                    db.update_reviewer_role(int(key["id"]), selected_role)
+                    _update_local_reviewer_role(int(key["id"]), selected_role)
                     st.toast(f"Updated {key['reviewer_name']} to {humanize_label(selected_role)}.")
                     st.rerun()
             with cols[2]:
                 if key["is_active"] and st.button("Revoke", key=f"revoke_reviewer_{key['id']}"):
-                    db.revoke_reviewer_key(int(key["id"]))
+                    _revoke_local_reviewer_key(int(key["id"]))
                     st.rerun()
 
 
