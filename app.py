@@ -69,7 +69,6 @@ from ui_components import (
     conversation_filters,
     metric_row,
     render_conversation_summary_card,
-    render_conversation_transcript_fast,
     render_conversation_transcript_with_evals,
     render_message_evaluation_panel,
     render_transcript,
@@ -266,6 +265,8 @@ def _clear_run_derived_caches() -> None:
         "_review_filter_index_cache",
         "_stats_detail_tables_cache",
         "_conversation_id_map_cache",
+        "_compact_run_details_cache",
+        "_selected_conversation_detail_cache",
     ):
         st.session_state.pop(key, None)
 
@@ -1379,6 +1380,21 @@ def _has_results() -> bool:
     )
 
 
+def _loaded_run_saved_counts() -> dict[str, int]:
+    run_id = st.session_state.get("current_run_id")
+    if run_id is None:
+        return {"conversation_results": 0, "message_results": 0, "run_errors": 0}
+    try:
+        return get_active_db().get_run_result_counts(int(run_id))
+    except Exception:
+        rr = st.session_state.run_results
+        return {
+            "conversation_results": len(getattr(rr, "conversation_results", []) or []),
+            "message_results": len(getattr(rr, "message_level_results", []) or []),
+            "run_errors": len(getattr(rr, "errors", []) or []),
+        }
+
+
 def _show_live_run_failure(
     failure_box,
     failures: list[dict],
@@ -1463,6 +1479,80 @@ def _normalize_run_results_for_display(rr: RunResults) -> RunResults:
     return rr
 
 
+def _run_cache_key(run_id: int | None = None) -> tuple[str, int | None]:
+    return (_active_db_path(), int(run_id) if run_id is not None else st.session_state.get("current_run_id"))
+
+
+def _load_compact_run_details(db: Database | None = None) -> RunResults | None:
+    """Load compact details for the active saved run, excluding huge debug/history blobs.
+
+    Summary-only saved-run loads keep the app responsive. Pages that need
+    message-level flags/chunks call this on demand; it still avoids
+    ``input_history_json``, raw responses, and debug JSON by default.
+    """
+    run_id = st.session_state.get("current_run_id")
+    if run_id is None:
+        return None
+    key = _run_cache_key(int(run_id))
+    cached = st.session_state.get("_compact_run_details_cache")
+    if cached is not None and cached.get("key") == key:
+        return cached.get("value")
+
+    db = db or get_active_db()
+    loaded = db.load_run_results(
+        int(run_id),
+        include_transcripts=True,
+        include_message_details=True,
+        include_raw=False,
+        include_debug=False,
+        include_input_history=False,
+    )
+    rr = RunResults(
+        conversation_results=loaded["conversation_results"],
+        message_level_results=loaded["message_level_results"],
+        errors=loaded["errors"],
+        started_at=loaded["started_at"],
+        finished_at=loaded["finished_at"],
+    )
+    rr = _normalize_run_results_for_display(rr)
+    st.session_state["_compact_run_details_cache"] = {"key": key, "value": rr}
+    return rr
+
+
+def _load_selected_conversation_detail(
+    conversation_id: str,
+    *,
+    include_raw: bool = False,
+    include_debug: bool = False,
+) -> dict | None:
+    """Load one selected journey detail from SQLite without full-run inflation."""
+    run_id = st.session_state.get("current_run_id")
+    if run_id is None:
+        return None
+    key = (
+        _active_db_path(),
+        int(run_id),
+        str(conversation_id),
+        bool(include_raw),
+        bool(include_debug),
+    )
+    cached = st.session_state.get("_selected_conversation_detail_cache")
+    if cached is not None and cached.get("key") == key:
+        return cached.get("value")
+
+    result = get_active_db().load_conversation_result(
+        int(run_id),
+        str(conversation_id),
+        include_raw=include_raw,
+        include_debug=include_debug,
+        include_input_history=False,
+    )
+    if result is not None:
+        result = _normalize_conversation_result_for_display(result)
+    st.session_state["_selected_conversation_detail_cache"] = {"key": key, "value": result}
+    return result
+
+
 def _saved_run_label(row: dict) -> str:
     return (
         f"#{row.get('id')} • {row.get('name') or 'Untitled run'} • "
@@ -1479,7 +1569,7 @@ def _saved_run_is_loadable(row: dict) -> bool:
 
 def _load_saved_run_into_session(db: Database, run_id: int, *, label: str | None = None) -> None:
     _clear_run_derived_caches()
-    loaded = db.load_run_results(int(run_id))
+    loaded = db.load_run_summary_results(int(run_id))
     run = loaded.get("run") or db.get_run(int(run_id)) or {}
     if not loaded["conversation_results"] and int(run.get("n_conversations") or 0) > 0:
         raise ValueError(
@@ -1525,6 +1615,7 @@ def _render_last_run_summary() -> None:
     if not _has_results():
         return
     rr = st.session_state.run_results
+    saved_counts = _loaded_run_saved_counts()
     rerun_rows: list[dict] = []
     for result in rr.message_level_results:
         debug = result.get("debug") or {}
@@ -1595,11 +1686,11 @@ def _render_last_run_summary() -> None:
     st.markdown("### Last run")
     metric_row(
         [
-            ("Customer journeys", f"{len(rr.conversation_results):,}", None),
-            ("Message calls", f"{len(rr.message_level_results):,}", None),
+            ("Customer journeys", f"{int(saved_counts.get('conversation_results') or len(rr.conversation_results)):,}", None),
+            ("Message calls", f"{int(saved_counts.get('message_results') or len(rr.message_level_results)):,}", None),
             ("Automatic reruns", f"{total_reruns:,}", None),
             ("Recovered calls", f"{recovered:,}", None),
-            ("Errors", f"{len(rr.errors):,}", None),
+            ("Errors", f"{int(saved_counts.get('run_errors') or len(rr.errors)):,}", None),
             ("Duration (s)", f"{(rr.finished_at or 0) - (rr.started_at or 0):.1f}", None),
         ]
     )
@@ -1622,6 +1713,8 @@ def _execute_conversation_only_run(
     selected_conversation_ids: list[str] | None = None,
 ) -> None:
     source_results = st.session_state.run_results
+    if source_results and not getattr(source_results, "message_level_results", []):
+        source_results = _load_compact_run_details()
     source_message_results = list(getattr(source_results, "message_level_results", []) or [])
     source_conversation_results = list(getattr(source_results, "conversation_results", []) or [])
     if not source_message_results:
@@ -2472,7 +2565,7 @@ def _conv_dataframe_from_results() -> pd.DataFrame:
 
 
 def _msg_dataframe_from_results() -> pd.DataFrame:
-    rr = st.session_state.run_results
+    rr = _load_compact_run_details() or st.session_state.run_results
     if not rr:
         return pd.DataFrame()
     cache_key = len(rr.message_level_results)
@@ -4446,9 +4539,10 @@ def tab_run() -> None:
     _render_saved_runs_loader("run", expanded=False)
 
     df = st.session_state.df_norm
+    saved_counts = _loaded_run_saved_counts()
     conversation_only_available = bool(
         st.session_state.run_results
-        and getattr(st.session_state.run_results, "message_level_results", [])
+        and int(saved_counts.get("message_results") or 0) > 0
     )
     conversation_rerun_ids: list[str] = []
     if conversation_only_available:
@@ -4479,7 +4573,7 @@ def tab_run() -> None:
         )
 
         no_csv_run_id = int(st.session_state.get("current_run_id") or 0)
-        no_csv_failed_plan = _failed_run_repair_plan(st.session_state.get("run_results"))
+        no_csv_failed_plan = _failed_run_repair_plan(_load_compact_run_details() or st.session_state.get("run_results"))
         no_csv_failed_ids = set(no_csv_failed_plan.get("failed_conversation_ids") or [])
         if no_csv_run_id:
             db_failed_ids = set(db.list_run_failed_conversation_ids(no_csv_run_id))
@@ -4895,7 +4989,7 @@ def tab_run() -> None:
         )
         completed_ids = set(db.list_run_completed_conversation_ids(continuation_run_id))
         remaining_ids = [journey_id for journey_id in all_ids if journey_id not in completed_ids]
-        failed_repair_plan = _failed_run_repair_plan(st.session_state.get("run_results"))
+        failed_repair_plan = _failed_run_repair_plan(_load_compact_run_details() or st.session_state.get("run_results"))
         db_failed_ids = set(db.list_run_failed_conversation_ids(continuation_run_id))
         planned_failed_ids = set(failed_repair_plan.get("failed_conversation_ids") or [])
         unplanned_db_failures = db_failed_ids - planned_failed_ids
@@ -7002,9 +7096,13 @@ def tab_stats() -> None:
     rows = _stats_summary_rows(conv_df)
     _render_stats_summary_table(rows)
 
-    stats_detail_tables = _stats_detail_tables_for_results(
-        st.session_state.run_results.conversation_results
+    detail_rr = _load_compact_run_details()
+    detail_conversation_results = (
+        detail_rr.conversation_results
+        if detail_rr is not None
+        else st.session_state.run_results.conversation_results
     )
+    stats_detail_tables = _stats_detail_tables_for_results(detail_conversation_results)
     flag_stats_df = stats_detail_tables["sender"]
     st.markdown("### Message flags by sender origin")
     st.caption(
@@ -8231,9 +8329,8 @@ def tab_review() -> None:
             6. Turn on **Show journey analysis and review metrics**. Check the journey outcome,
                experience, score, frustration, main issue, recommended actions, and flagged
                message summary.
-            7. Read the full conversation. The default transcript is optimized for quick
-               Previous/Next navigation. Turn on **Detailed message info buttons** when you need
-               the information button beside each evaluated message.
+            7. Read the full conversation. Use the information button beside evaluated
+               messages when you need the message-level details.
             8. Add a clear review comment and select **Mark as reviewed** when your check is
                complete.
             """
@@ -8245,28 +8342,27 @@ def tab_review() -> None:
         key="review_show_supporting_details",
         help="Filters and conversation transcripts remain visible. Turn this on to show the KPI strip and selected journey analysis.",
     )
-    show_detailed_message_info = st.toggle(
-        "Detailed message info buttons",
-        value=False,
-        key="review_show_detailed_message_info",
-        help="Off is much faster for Previous/Next. Turn on only when you need the per-message info popovers.",
-    )
-
     review_filters = _conversation_filters_with_keys(
         conv_df,
         "review_filters",
         include_journey_starter=True,
     )
     filtered_df = _apply_conversation_filters_fresh(conv_df, review_filters)
-    sender_flag_filters, chunk_flag_filter = _render_sender_flag_filters(rr.conversation_results)
+    detail_rr = _load_compact_run_details()
+    detail_conversation_results = (
+        detail_rr.conversation_results
+        if detail_rr is not None
+        else rr.conversation_results
+    )
+    sender_flag_filters, chunk_flag_filter = _render_sender_flag_filters(detail_conversation_results)
     filtered_df = _filter_conversations_by_sender_flags(
         filtered_df,
-        rr.conversation_results,
+        detail_conversation_results,
         sender_flag_filters,
     )
     filtered_df = _filter_conversations_by_chunk_flag(
         filtered_df,
-        rr.conversation_results,
+        detail_conversation_results,
         chunk_flag_filter,
     )
 
@@ -8476,7 +8572,9 @@ def tab_review() -> None:
     current_index = ordered_ids.index(target_id)
 
     render_review_nav("top")
-    target_cr = _conversation_result_map(rr.conversation_results).get(str(target_id))
+    target_cr = _load_selected_conversation_detail(str(target_id))
+    if not target_cr:
+        target_cr = _conversation_result_map(detail_conversation_results).get(str(target_id))
     if not target_cr:
         st.error("Customer journey not found.")
         return
@@ -8493,29 +8591,16 @@ def tab_review() -> None:
     _render_journey_chunk_overview(transcript, msgs)
 
     st.markdown("### Full Customer Journey")
-    if show_detailed_message_info:
-        st.caption(
-            "Detailed mode is on. Message info buttons are available, but Previous/Next will be slower on long journeys."
-        )
-    else:
-        st.caption(
-            "Fast mode is on for quicker Previous/Next navigation. Turn on Detailed message info buttons when you need per-message details."
-        )
+    st.caption("Use the information button beside evaluated messages to see message-level details.")
     st.markdown("<div id='review-conversation-start'></div>", unsafe_allow_html=True)
     if show_review_details:
         _render_flagged_message_checker(transcript, msgs, target_id)
     _, chat_col, _ = st.columns([0.15, 9.7, 0.15])
     with chat_col:
-        if show_detailed_message_info:
-            render_conversation_transcript_with_evals(
-                transcript=transcript,
-                message_results=msgs,
-            )
-        else:
-            render_conversation_transcript_fast(
-                transcript=transcript,
-                message_results=msgs,
-            )
+        render_conversation_transcript_with_evals(
+            transcript=transcript,
+            message_results=msgs,
+        )
 
     render_review_nav("bottom")
     scroll_to_conversation_start_if_requested()
@@ -8534,7 +8619,7 @@ def tab_exports() -> None:
         st.info("Run an evaluation first to enable exports.")
         return
 
-    rr = st.session_state.run_results
+    rr = _load_compact_run_details() or st.session_state.run_results
     run_config = {
         "api_base_url": st.session_state.api_base_url,
         "model": st.session_state.selected_model,
@@ -8707,7 +8792,7 @@ def tab_debug() -> None:
     if not _has_results():
         st.info("Run an evaluation first.")
         return
-    rr = st.session_state.run_results
+    rr = _load_compact_run_details() or st.session_state.run_results
 
     st.markdown("### Errors")
     if rr.errors:

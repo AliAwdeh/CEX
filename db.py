@@ -1168,7 +1168,176 @@ class Database:
         )
         return [str(r["conversation_id"]) for r in rows]
 
-    def load_run_results(self, run_id: int) -> dict:
+    @staticmethod
+    def _iso_to_epoch(iso: Optional[str]) -> float:
+        if not iso:
+            return 0.0
+        try:
+            if iso.endswith("Z"):
+                iso = iso[:-1]
+            return datetime.fromisoformat(iso).timestamp()
+        except Exception:
+            return 0.0
+
+    def _conversation_result_from_row(
+        self,
+        row: sqlite3.Row | dict,
+        run_id: int,
+        *,
+        include_transcript: bool,
+        include_raw: bool,
+        include_debug: bool,
+    ) -> dict:
+        d = dict(row)
+        pj = _json_load(d.get("parsed_json"))
+        _backfill_conversation_parsed_json(pj)
+        result = {
+            "thread_id": d["conversation_id"],
+            "conversation_id": d["conversation_id"],
+            "run_id": int(run_id),
+            "parse_status": d["parse_status"],
+            "error_message": d.get("error_message"),
+            "raw_model_response": d.get("raw_response") if include_raw else None,
+            "parsed_json": pj,
+            "evaluation_output": pj,
+            "conversation_metadata": _json_load(d.get("conversation_metadata")) or {},
+            "computed_metadata": _json_load(d.get("computed_metadata")) or {},
+            "transcript": (_json_load(d.get("transcript_json")) or []) if include_transcript else [],
+            "debug": _json_load(d.get("debug_json")) if include_debug else None,
+            "message_level_results": [],
+        }
+        return result
+
+    def _message_result_from_row(
+        self,
+        row: sqlite3.Row | dict,
+        run_id: int,
+        *,
+        include_raw: bool,
+        include_debug: bool,
+        include_input_history: bool,
+    ) -> dict:
+        d = dict(row)
+        parsed_json = _json_load(d.get("parsed_json"))
+        return {
+            "thread_id": d["conversation_id"],
+            "conversation_id": d["conversation_id"],
+            "run_id": int(run_id),
+            "target_message_id": d.get("target_message_id"),
+            "message_index": d.get("message_index"),
+            "appended_message_index": d.get("message_index"),
+            "source_conversation_id": d.get("source_conversation_id"),
+            "message_time": d.get("message_time"),
+            "target_message_text": d.get("target_message_text"),
+            "parse_status": d.get("parse_status"),
+            "error_message": d.get("error_message"),
+            "raw_model_response": d.get("raw_response") if include_raw else None,
+            "parsed_json": parsed_json,
+            "evaluation_output": parsed_json,
+            "debug": _json_load(d.get("debug_json")) if include_debug else None,
+            "input_history": _json_load(d.get("input_history_json")) if include_input_history else None,
+        }
+
+    def load_run_summary_results(self, run_id: int) -> dict:
+        """Load a saved run without large transcript/message/debug blobs.
+
+        This is the default UI loader. It keeps Overview/Dashboard/Review lists
+        fast and avoids inflating huge ``message_results.input_history_json``
+        values into Streamlit session state.
+        """
+        run = self.get_run(run_id)
+        if not run:
+            raise ValueError(f"Run {run_id} not found")
+
+        conv_rows = self._fetchall(
+            "SELECT id, run_id, conversation_id, parse_status, error_message, "
+            "parsed_json, conversation_metadata, computed_metadata, created_at "
+            "FROM conversation_results WHERE run_id=? ORDER BY id ASC",
+            (int(run_id),),
+        )
+        conversation_results = [
+            self._conversation_result_from_row(
+                row,
+                int(run_id),
+                include_transcript=False,
+                include_raw=False,
+                include_debug=False,
+            )
+            for row in conv_rows
+        ]
+
+        err_rows = self._fetchall(
+            "SELECT level, conversation_id, message_index, error FROM run_errors WHERE run_id=? ORDER BY id ASC",
+            (int(run_id),),
+        )
+        errors = [dict(r) for r in err_rows]
+        return {
+            "run": run,
+            "conversation_results": conversation_results,
+            "message_level_results": [],
+            "errors": errors,
+            "started_at": self._iso_to_epoch(run.get("started_at")),
+            "finished_at": self._iso_to_epoch(run.get("finished_at")),
+            "summary_only": True,
+        }
+
+    def load_conversation_result(
+        self,
+        run_id: int,
+        conversation_id: str,
+        *,
+        include_raw: bool = False,
+        include_debug: bool = False,
+        include_input_history: bool = False,
+    ) -> dict | None:
+        """Load one journey with its transcript and message evaluations."""
+        conv_row = self._fetchone(
+            "SELECT * FROM conversation_results WHERE run_id=? AND conversation_id=? "
+            "ORDER BY id DESC LIMIT 1",
+            (int(run_id), str(conversation_id)),
+        )
+        if not conv_row:
+            return None
+        result = self._conversation_result_from_row(
+            conv_row,
+            int(run_id),
+            include_transcript=True,
+            include_raw=include_raw,
+            include_debug=include_debug,
+        )
+        msg_rows = self._fetchall(
+            "SELECT id, run_id, conversation_id, target_message_id, message_index, "
+            "source_conversation_id, message_time, target_message_text, parse_status, "
+            "error_message, parsed_json, created_at"
+            + (", raw_response" if include_raw else ", NULL AS raw_response")
+            + (", debug_json" if include_debug else ", NULL AS debug_json")
+            + (", input_history_json" if include_input_history else ", NULL AS input_history_json")
+            + " FROM message_results WHERE run_id=? AND conversation_id=? "
+            "ORDER BY message_index ASC, id ASC",
+            (int(run_id), str(conversation_id)),
+        )
+        result["message_level_results"] = [
+            self._message_result_from_row(
+                row,
+                int(run_id),
+                include_raw=include_raw,
+                include_debug=include_debug,
+                include_input_history=include_input_history,
+            )
+            for row in msg_rows
+        ]
+        return result
+
+    def load_run_results(
+        self,
+        run_id: int,
+        *,
+        include_transcripts: bool = True,
+        include_message_details: bool = True,
+        include_raw: bool = False,
+        include_debug: bool = False,
+        include_input_history: bool = False,
+    ) -> dict:
         """Reconstruct the structures the rest of the app uses for a saved run.
 
         Returns a dict with keys ``conversation_results``, ``message_level_results``,
@@ -1178,61 +1347,50 @@ class Database:
         if not run:
             raise ValueError(f"Run {run_id} not found")
 
-        conv_rows = self._fetchall(
-            "SELECT * FROM conversation_results WHERE run_id=? ORDER BY id ASC",
-            (int(run_id),),
+        conv_select = (
+            "SELECT id, run_id, conversation_id, parse_status, error_message, "
+            "parsed_json, conversation_metadata, computed_metadata, created_at"
+            + (", transcript_json" if include_transcripts else ", NULL AS transcript_json")
+            + (", raw_response" if include_raw else ", NULL AS raw_response")
+            + (", debug_json" if include_debug else ", NULL AS debug_json")
+            + " FROM conversation_results WHERE run_id=? ORDER BY id ASC"
         )
+        conv_rows = self._fetchall(conv_select, (int(run_id),))
         conversation_results: list[dict] = []
         for r in conv_rows:
-            d = dict(r)
-            pj = _json_load(d.get("parsed_json"))
-            _backfill_conversation_parsed_json(pj)
             conversation_results.append(
-                {
-                    "thread_id": d["conversation_id"],
-                    "conversation_id": d["conversation_id"],
-                    "run_id": int(run_id),
-                    "parse_status": d["parse_status"],
-                    "error_message": d.get("error_message"),
-                    "raw_model_response": d.get("raw_response"),
-                    "parsed_json": pj,
-                    "evaluation_output": pj,
-                    "conversation_metadata": _json_load(d.get("conversation_metadata")) or {},
-                    "computed_metadata": _json_load(d.get("computed_metadata")) or {},
-                    "transcript": _json_load(d.get("transcript_json")) or [],
-                    "debug": _json_load(d.get("debug_json")),
-                    "message_level_results": [],  # filled below
-                }
+                self._conversation_result_from_row(
+                    r,
+                    int(run_id),
+                    include_transcript=include_transcripts,
+                    include_raw=include_raw,
+                    include_debug=include_debug,
+                )
             )
 
-        msg_rows = self._fetchall(
-            "SELECT * FROM message_results WHERE run_id=? ORDER BY conversation_id, message_index ASC",
-            (int(run_id),),
-        )
         message_level_results: list[dict] = []
         by_conv: dict[str, list[dict]] = {}
-        for r in msg_rows:
-            d = dict(r)
-            mr = {
-                "thread_id": d["conversation_id"],
-                "conversation_id": d["conversation_id"],
-                "run_id": int(run_id),
-                "target_message_id": d.get("target_message_id"),
-                "message_index": d.get("message_index"),
-                "appended_message_index": d.get("message_index"),
-                "source_conversation_id": d.get("source_conversation_id"),
-                "message_time": d.get("message_time"),
-                "target_message_text": d.get("target_message_text"),
-                "parse_status": d.get("parse_status"),
-                "error_message": d.get("error_message"),
-                "raw_model_response": d.get("raw_response"),
-                "parsed_json": _json_load(d.get("parsed_json")),
-                "evaluation_output": _json_load(d.get("parsed_json")),
-                "debug": _json_load(d.get("debug_json")),
-                "input_history": _json_load(d.get("input_history_json")),
-            }
-            message_level_results.append(mr)
-            by_conv.setdefault(mr["conversation_id"], []).append(mr)
+        if include_message_details:
+            msg_select = (
+                "SELECT id, run_id, conversation_id, target_message_id, message_index, "
+                "source_conversation_id, message_time, target_message_text, parse_status, "
+                "error_message, parsed_json, created_at"
+                + (", raw_response" if include_raw else ", NULL AS raw_response")
+                + (", debug_json" if include_debug else ", NULL AS debug_json")
+                + (", input_history_json" if include_input_history else ", NULL AS input_history_json")
+                + " FROM message_results WHERE run_id=? ORDER BY conversation_id, message_index ASC"
+            )
+            msg_rows = self._fetchall(msg_select, (int(run_id),))
+            for r in msg_rows:
+                mr = self._message_result_from_row(
+                    r,
+                    int(run_id),
+                    include_raw=include_raw,
+                    include_debug=include_debug,
+                    include_input_history=include_input_history,
+                )
+                message_level_results.append(mr)
+                by_conv.setdefault(mr["conversation_id"], []).append(mr)
 
         for c in conversation_results:
             c["message_level_results"] = by_conv.get(c["conversation_id"], [])
@@ -1243,22 +1401,12 @@ class Database:
         )
         errors = [dict(r) for r in err_rows]
 
-        # Convert started/finished ISO strings to epoch floats so RunResults.duration math works.
-        def _to_epoch(iso: Optional[str]) -> float:
-            if not iso:
-                return 0.0
-            try:
-                if iso.endswith("Z"):
-                    iso = iso[:-1]
-                return datetime.fromisoformat(iso).timestamp()
-            except Exception:
-                return 0.0
-
         return {
             "run": run,
             "conversation_results": conversation_results,
             "message_level_results": message_level_results,
             "errors": errors,
-            "started_at": _to_epoch(run.get("started_at")),
-            "finished_at": _to_epoch(run.get("finished_at")),
+            "started_at": self._iso_to_epoch(run.get("started_at")),
+            "finished_at": self._iso_to_epoch(run.get("finished_at")),
+            "summary_only": not include_transcripts and not include_message_details,
         }
