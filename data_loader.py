@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import io
+import json
 import random
+import re
 from typing import Any
 
 import pandas as pd
@@ -12,6 +14,11 @@ import pandas as pd
 JOURNEY_ID_COLUMN = "CUSTOMER_PHONE"
 MESSAGE_ORDER_COLUMN = "APPENDED_MESSAGE_INDEX"
 LEGACY_MESSAGE_ORDER_COLUMN = "MESSAGE_INDEX"
+RAG_CONTEXT_MARKER = "RAG context used for this bot response:"
+_RAG_CONTEXT_FOOTER_RE = re.compile(
+    rf"\s*{re.escape(RAG_CONTEXT_MARKER)}\s*\n?\s*\{{.*?\}}\s*$",
+    re.DOTALL,
+)
 
 REQUIRED_COLUMNS = [
     JOURNEY_ID_COLUMN,
@@ -110,6 +117,73 @@ def generate_message_id(conversation_id: str, message_index: Any) -> str:
     except (TypeError, ValueError):
         idx = message_index
     return f"{conversation_id}-{idx}"
+
+
+def _clean_optional(value: Any) -> Any:
+    """Return a plain Python value for optional CSV cells."""
+    if value is None:
+        return None
+    try:
+        if pd.isna(value):
+            return None
+    except (TypeError, ValueError):
+        pass
+    if isinstance(value, str):
+        stripped = value.strip()
+        return stripped if stripped else None
+    return value
+
+
+def _truthy_cell(value: Any) -> bool:
+    cleaned = _clean_optional(value)
+    if cleaned is None:
+        return False
+    if isinstance(cleaned, bool):
+        return cleaned
+    if isinstance(cleaned, (int, float)):
+        return bool(cleaned)
+    return str(cleaned).strip().lower() in {"1", "true", "yes", "y"}
+
+
+def _json_list_cell(value: Any) -> list[Any]:
+    cleaned = _clean_optional(value)
+    if cleaned is None:
+        return []
+    if isinstance(cleaned, list):
+        return cleaned
+    if isinstance(cleaned, tuple):
+        return list(cleaned)
+    if not isinstance(cleaned, str):
+        return [cleaned]
+    try:
+        parsed = json.loads(cleaned)
+    except json.JSONDecodeError:
+        return [cleaned]
+    if isinstance(parsed, list):
+        return parsed
+    if parsed is None:
+        return []
+    return [parsed]
+
+
+def _is_mv_resolver_bot_message(row: dict) -> bool:
+    """True for BOT-origin GPT_MV_RESOLVERS messages only."""
+    raw_role = str(_clean_optional(row.get("RAW_SENDER_ROLE")) or "").strip().lower()
+    skill = str(_clean_optional(row.get("MESSAGE_SKILL")) or "").strip().upper()
+    return raw_role == "bot" and skill == "GPT_MV_RESOLVERS"
+
+
+def strip_inline_rag_context(text: Any) -> str:
+    """Remove the appended resolver RAG footer from customer-visible text."""
+    if text is None:
+        return ""
+    cleaned = str(text)
+    if RAG_CONTEXT_MARKER not in cleaned:
+        return cleaned
+    stripped = _RAG_CONTEXT_FOOTER_RE.sub("", cleaned).rstrip()
+    if RAG_CONTEXT_MARKER in stripped:
+        stripped = stripped.split(RAG_CONTEXT_MARKER, 1)[0].rstrip()
+    return stripped
 
 
 def summarize_dataframe(df: pd.DataFrame) -> dict:
@@ -295,37 +369,68 @@ def message_records_from_group(group: pd.DataFrame, conversation_id: str) -> lis
     has_conv_id = "CONVERSATION_ID" in group.columns
     has_raw_role = "RAW_SENDER_ROLE" in group.columns
     has_agent_name = "MESSAGE_AGENT_FULL_NAME" in group.columns
+    has_message_skill = "MESSAGE_SKILL" in group.columns
     records: list[dict] = []
     # to_dict("records") avoids the per-row Series construction that makes
     # iterrows() slow on wide frames, which matters here since this runs once
     # per customer journey.
     for row in group.to_dict("records"):
         msg_index = row.get(MESSAGE_ORDER_COLUMN, row.get(LEGACY_MESSAGE_ORDER_COLUMN))
-        records.append(
-            {
-                "message_id": generate_message_id(conversation_id, msg_index),
-                "message_index": int(msg_index) if pd.notna(msg_index) else None,
-                "appended_message_index": int(msg_index) if pd.notna(msg_index) else None,
-                "source_conversation_id": (
-                    str(row.get("CONVERSATION_ID"))
-                    if has_conv_id and pd.notna(row.get("CONVERSATION_ID"))
-                    else None
-                ),
-                "message_time": str(row.get("MESSAGE_TIME", "")) if pd.notna(row.get("MESSAGE_TIME")) else "",
-                "sender_role": str(row.get("SENDER_ROLE", "unknown")),
-                "raw_sender_role": (
-                    str(row.get("RAW_SENDER_ROLE"))
-                    if has_raw_role and pd.notna(row.get("RAW_SENDER_ROLE"))
-                    else None
-                ),
-                "message_text": str(row.get("MESSAGE_TEXT", "") or ""),
-                "agent_full_name": (
-                    str(row.get("MESSAGE_AGENT_FULL_NAME"))
-                    if has_agent_name and pd.notna(row.get("MESSAGE_AGENT_FULL_NAME"))
-                    else None
-                ),
-            }
-        )
+        record = {
+            "message_id": generate_message_id(conversation_id, msg_index),
+            "message_index": int(msg_index) if pd.notna(msg_index) else None,
+            "appended_message_index": int(msg_index) if pd.notna(msg_index) else None,
+            "source_conversation_id": (
+                str(row.get("CONVERSATION_ID"))
+                if has_conv_id and pd.notna(row.get("CONVERSATION_ID"))
+                else None
+            ),
+            "message_time": str(row.get("MESSAGE_TIME", "")) if pd.notna(row.get("MESSAGE_TIME")) else "",
+            "sender_role": str(row.get("SENDER_ROLE", "unknown")),
+            "raw_sender_role": (
+                str(row.get("RAW_SENDER_ROLE"))
+                if has_raw_role and pd.notna(row.get("RAW_SENDER_ROLE"))
+                else None
+            ),
+            "message_text": strip_inline_rag_context(row.get("MESSAGE_TEXT", "") or ""),
+            "agent_full_name": (
+                str(row.get("MESSAGE_AGENT_FULL_NAME"))
+                if has_agent_name and pd.notna(row.get("MESSAGE_AGENT_FULL_NAME"))
+                else None
+            ),
+        }
+        if has_message_skill:
+            message_skill = _clean_optional(row.get("MESSAGE_SKILL"))
+            if message_skill is not None:
+                record["message_skill"] = str(message_skill)
+
+        if _is_mv_resolver_bot_message(row):
+            rag_retrievals = _json_list_cell(row.get("RAG_RETRIEVALS"))
+            chunks_fetched = _json_list_cell(row.get("CHUNKS_FETCHED"))
+            chunk_justification = _clean_optional(row.get("CHUNK_JUSTIFICATION"))
+            chunk_time = _clean_optional(row.get("CHUNK_TIME"))
+            has_rag_retrieval = _truthy_cell(row.get("HAS_RAG_RETRIEVAL")) or bool(
+                rag_retrievals or chunks_fetched or chunk_justification
+            )
+            try:
+                rag_retrieval_count = int(float(row.get("RAG_RETRIEVAL_COUNT") or 0))
+            except (TypeError, ValueError):
+                rag_retrieval_count = len(rag_retrievals)
+
+            record.update(
+                {
+                    "has_rag_retrieval": has_rag_retrieval,
+                    "rag_retrieval_count": rag_retrieval_count,
+                    "rag_retrievals": rag_retrievals,
+                    "chunk_time": str(chunk_time) if chunk_time is not None else None,
+                    "chunks_fetched": chunks_fetched,
+                    "chunk_justification": (
+                        str(chunk_justification) if chunk_justification is not None else None
+                    ),
+                }
+            )
+
+        records.append(record)
     return records
 
 

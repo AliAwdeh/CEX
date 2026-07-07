@@ -17,12 +17,32 @@ on the Prompts page and save new versions.
 from __future__ import annotations
 
 import json
+import re
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
 
 # --------- PromptTemplate ---------
+
+RAG_CONTEXT_MARKER = "RAG context used for this bot response:"
+_RAG_CONTEXT_FOOTER_RE = re.compile(
+    rf"\s*{re.escape(RAG_CONTEXT_MARKER)}\s*\n?\s*\{{.*?\}}\s*$",
+    re.DOTALL,
+)
+
+
+def strip_inline_rag_context(text: Any) -> str:
+    """Remove inline resolver RAG footers before sending text to evaluators."""
+    if text is None:
+        return ""
+    cleaned = str(text)
+    if RAG_CONTEXT_MARKER not in cleaned:
+        return cleaned
+    stripped = _RAG_CONTEXT_FOOTER_RE.sub("", cleaned).rstrip()
+    if RAG_CONTEXT_MARKER in stripped:
+        stripped = stripped.split(RAG_CONTEXT_MARKER, 1)[0].rstrip()
+    return stripped
 
 
 @dataclass
@@ -994,7 +1014,7 @@ def build_message_level_payload(
     def trim(text: Any) -> str:
         if text is None:
             return ""
-        text = str(text)
+        text = strip_inline_rag_context(text)
         if truncate_chars and len(text) > truncate_chars:
             return text[:truncate_chars] + "...[truncated]"
         return text
@@ -1009,6 +1029,7 @@ def build_message_level_payload(
         "message_time": str(target_message.get("message_time", "")),
         "message_text": trim(target_message.get("message_text", "")),
     }
+
     history_clean = []
     for m in history:
         history_clean.append(
@@ -1047,7 +1068,7 @@ def build_conversation_level_payload(
     def trim(text: Any) -> str:
         if text is None:
             return ""
-        text = str(text)
+        text = strip_inline_rag_context(text)
         if truncate_chars and len(text) > truncate_chars:
             return text[:truncate_chars] + "...[truncated]"
         return text

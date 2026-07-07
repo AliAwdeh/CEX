@@ -6,6 +6,8 @@ __pycache__/
 .Python
 *.egg-info/
 bk/
+#ali
+merge_2026-07-07-1301.csv
 
 # Virtual environments
 .venv/

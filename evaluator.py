@@ -30,6 +30,7 @@ from data_loader import (
     conversation_metadata_from_group,
     get_conversation_groups,
     message_records_from_group,
+    strip_inline_rag_context,
 )
 
 
@@ -870,7 +871,7 @@ def _eval_message_level(
         "appended_message_index": target_record.get("appended_message_index", target_record.get("message_index")),
         "source_conversation_id": target_record.get("source_conversation_id"),
         "message_time": target_record.get("message_time", ""),
-        "target_message_text": target_record.get("message_text", ""),
+        "target_message_text": strip_inline_rag_context(target_record.get("message_text", "")),
         "input_history": history_records if save_raw else None,
         "raw_model_response": None,
         "parsed_json": None,
@@ -1022,22 +1023,96 @@ def _eval_conversation_level(
         "debug": None,
     }
 
-    try:
-        raw, debug = chat_completion(client, api, system_prompt, user_prompt)
-        if save_raw:
-            record["raw_model_response"] = raw
-            record["debug"] = debug
+    max_evaluation_attempts = max(1, int(api.retries) + 1)
+    attempt_history: list[dict[str, Any]] = []
+    final_debug: dict[str, Any] = {}
+
+    for evaluation_attempt in range(1, max_evaluation_attempts + 1):
+        record["raw_model_response"] = None
+        record["parsed_json"] = None
+        record["evaluation_output"] = None
+        record["parse_status"] = "ok"
+        record["error_message"] = None
+        raw = ""
+        call_debug: dict[str, Any] = {}
         try:
-            obj = extract_json_object(raw)
-            validated = validate_conversation_level_result(obj)
-            record["parsed_json"] = validated
-            record["evaluation_output"] = validated
-        except Exception as je:
-            record["parse_status"] = "failed"
-            record["error_message"] = f"JSON parse failed: {je}"
-    except Exception as e:
-        record["parse_status"] = "api_error"
-        record["error_message"] = f"API call failed: {e}"
+            raw, call_debug = chat_completion(client, api, system_prompt, user_prompt)
+            if save_raw:
+                record["raw_model_response"] = raw
+            try:
+                obj = extract_json_object(raw)
+                validated = validate_conversation_level_result(obj)
+                record["parsed_json"] = validated
+                record["evaluation_output"] = validated
+            except Exception as je:
+                record["parse_status"] = "failed"
+                record["error_message"] = f"JSON parse failed: {je}"
+        except Exception as e:
+            record["parse_status"] = "api_error"
+            record["error_message"] = f"API call failed: {e}"
+
+        final_debug = dict(call_debug or {})
+        attempt_history.append(
+            {
+                "evaluation_attempt": evaluation_attempt,
+                "status": record["parse_status"],
+                "error": record["error_message"],
+                "api_attempts": call_debug.get("attempts"),
+                "usage": call_debug.get("usage"),
+            }
+        )
+        if record["parse_status"] == "ok":
+            break
+        # API exceptions already use APIConfig.retries inside chat_completion.
+        # Only response/JSON failures need a fresh evaluation request here.
+        if record["parse_status"] == "api_error":
+            break
+
+    automatic_reruns = max(0, len(attempt_history) - 1)
+    recovered_after_rerun = (
+        automatic_reruns > 0 and record.get("parse_status") == "ok"
+    )
+    total_usage = {
+        "prompt_tokens": 0,
+        "completion_tokens": 0,
+        "total_tokens": 0,
+        "completion_tokens_details": {"reasoning_tokens": 0},
+    }
+    has_usage = False
+    for attempt in attempt_history:
+        usage = attempt.get("usage") or {}
+        if not usage:
+            continue
+        has_usage = True
+        for key in ("prompt_tokens", "completion_tokens", "total_tokens"):
+            try:
+                total_usage[key] += int(usage.get(key) or 0)
+            except (TypeError, ValueError):
+                pass
+        details = usage.get("completion_tokens_details") or {}
+        try:
+            total_usage["completion_tokens_details"]["reasoning_tokens"] += int(
+                details.get("reasoning_tokens") or 0
+            )
+        except (TypeError, ValueError):
+            pass
+
+    final_debug.update(
+        {
+            "evaluation_attempts": len(attempt_history),
+            "automatic_reruns": automatic_reruns,
+            "recovered_after_rerun": recovered_after_rerun,
+            "evaluation_attempt_history": attempt_history,
+        }
+    )
+    if has_usage:
+        final_debug["total_usage_including_reruns"] = total_usage
+    record["debug"] = final_debug
+    record["automatic_reruns"] = automatic_reruns
+    record["recovered_after_rerun"] = recovered_after_rerun
+    record["rerun_errors"] = [
+        attempt["error"] for attempt in attempt_history if attempt.get("error")
+    ]
 
     return record
 
@@ -1315,7 +1390,7 @@ def run_evaluation(
                             "appended_message_index": target.get("appended_message_index", target.get("message_index")),
                             "source_conversation_id": target.get("source_conversation_id"),
                             "message_time": target.get("message_time", ""),
-                            "target_message_text": target.get("message_text", ""),
+                            "target_message_text": strip_inline_rag_context(target.get("message_text", "")),
                             "input_history": None,
                             "raw_model_response": None,
                             "parsed_json": None,
@@ -1428,6 +1503,9 @@ def run_evaluation(
                                 "conversation_id": conversation_id,
                                 "total_conversations": total_conversations,
                                 "status": cr.get("parse_status"),
+                                "automatic_reruns": int(cr.get("automatic_reruns") or 0),
+                                "recovered_after_rerun": bool(cr.get("recovered_after_rerun")),
+                                "rerun_errors": cr.get("rerun_errors") or [],
                             }
                         )
 
@@ -1470,6 +1548,285 @@ def run_evaluation(
             ]
         results.message_level_results.extend(ordered)
 
+    results.finished_at = time.time()
+    if on_progress:
+        on_progress({"phase": "done", "total_conversations": total_conversations})
+    return results
+
+
+def run_message_level_repair(
+    df: pd.DataFrame | None,
+    client,
+    config: RunConfig,
+    selected_message_indices_by_conversation: dict[str, list[Any]],
+    existing_conversation_results: Optional[list[dict]] = None,
+    on_progress: Optional[Callable[[dict], None]] = None,
+    cancel_requested: Optional[Callable[[], bool]] = None,
+    on_message_result: Optional[Callable[[dict], None]] = None,
+    on_error: Optional[Callable[[dict], None]] = None,
+) -> RunResults:
+    """Rerun only selected message-level rows from an existing run."""
+    results = RunResults(started_at=time.time())
+    truncate_chars = config.max_chars_per_message if config.truncate_messages else None
+    workers = max(1, int(getattr(config.api, "concurrency", 1) or 1))
+
+    target_role = (config.message_target_role or "agent").strip().lower()
+    if target_role not in ("agent", "customer"):
+        target_role = "agent"
+
+    wanted: dict[str, set[Any]] = {}
+    for conversation_id, raw_indices in (selected_message_indices_by_conversation or {}).items():
+        normalized: set[Any] = set()
+        for idx in raw_indices or []:
+            try:
+                normalized.add(int(idx))
+            except (TypeError, ValueError):
+                normalized.add(idx)
+        if normalized:
+            wanted[str(conversation_id)] = normalized
+
+    sources: list[tuple[str, list[dict], dict]] = []
+    if df is not None and not df.empty:
+        for conversation_id, group in get_conversation_groups(df):
+            conversation_id = str(conversation_id)
+            if conversation_id not in wanted:
+                continue
+            sources.append(
+                (
+                    conversation_id,
+                    message_records_from_group(group, conversation_id),
+                    conversation_metadata_from_group(group),
+                )
+            )
+    else:
+        for loaded in existing_conversation_results or []:
+            conversation_id = str(loaded.get("conversation_id") or loaded.get("thread_id") or "")
+            if not conversation_id or conversation_id not in wanted:
+                continue
+            sources.append(
+                (
+                    conversation_id,
+                    list(loaded.get("transcript") or []),
+                    dict(loaded.get("conversation_metadata") or {}),
+                )
+            )
+
+    total_conversations = len(sources)
+
+    if on_progress:
+        on_progress(
+            {
+                "phase": "start",
+                "total_conversations": total_conversations,
+                "workers": workers,
+            }
+        )
+
+    def visible_history_of(records: list[dict], up_to_index: Any) -> list[dict]:
+        out = []
+        for r in records:
+            idx = r["message_index"]
+            if idx is None:
+                continue
+            if idx > up_to_index:
+                break
+            role = r.get("sender_role", "unknown")
+            if role == "unknown" and not config.include_unknown_in_history:
+                continue
+            out.append(r)
+        return out
+
+    tasks: list[tuple[str, int, dict, list[dict], dict]] = []
+    conversation_index: dict[str, int] = {}
+    found_conversation_ids: set[str] = set()
+    for ci, (conversation_id, records, metadata) in enumerate(sources, start=1):
+        found_conversation_ids.add(conversation_id)
+        conversation_index[conversation_id] = ci
+        wanted_indices = wanted.get(conversation_id, set())
+        targets: list[dict] = []
+        for record in records:
+            if record.get("sender_role") != target_role:
+                continue
+            idx = record.get("message_index")
+            try:
+                normalized_idx: Any = int(idx)
+            except (TypeError, ValueError):
+                normalized_idx = idx
+            if normalized_idx in wanted_indices:
+                targets.append(record)
+
+        missing = set(wanted_indices)
+        for target in targets:
+            try:
+                normalized_idx = int(target.get("message_index"))
+            except (TypeError, ValueError):
+                normalized_idx = target.get("message_index")
+            missing.discard(normalized_idx)
+        if missing:
+            err = {
+                "level": "message",
+                "conversation_id": conversation_id,
+                "error": (
+                    "Message repair skipped missing or non-target message_index "
+                    f"values: {sorted(str(x) for x in missing)[:10]}"
+                ),
+            }
+            results.errors.append(err)
+            if on_error:
+                try:
+                    on_error(err)
+                except Exception:
+                    pass
+
+        if on_progress:
+            on_progress(
+                {
+                    "phase": "conversation_start",
+                    "conversation_index": ci,
+                    "conversation_id": conversation_id,
+                    "agent_messages": len(targets),
+                    "target_messages": len(targets),
+                    "target_role": target_role,
+                    "total_conversations": total_conversations,
+                    "workers": workers,
+                }
+            )
+
+        for target in targets:
+            tasks.append(
+                (
+                    conversation_id,
+                    ci,
+                    target,
+                    visible_history_of(records, target["message_index"]),
+                    metadata,
+                )
+            )
+
+    for conversation_id in sorted(set(wanted) - found_conversation_ids):
+        err = {
+            "level": "message",
+            "conversation_id": conversation_id,
+            "error": "Message repair skipped because the saved transcript was not available.",
+        }
+        results.errors.append(err)
+        if on_error:
+            try:
+                on_error(err)
+            except Exception:
+                pass
+
+    completed_by_conv: dict[str, int] = {conversation_id: 0 for conversation_id, _, _ in sources}
+    total_calls = len(tasks)
+    if on_progress:
+        on_progress(
+            {
+                "phase": "message_repair_start",
+                "total_message_calls": total_calls,
+                "total_conversations": total_conversations,
+            }
+        )
+
+    fut_info: dict[cf.Future, dict] = {}
+    pending: set[cf.Future] = set()
+    with cf.ThreadPoolExecutor(max_workers=workers) as ex:
+        for conversation_id, ci, target, history, metadata in tasks:
+            fut = ex.submit(
+                _eval_message_level,
+                client=client,
+                api=config.api,
+                conversation_id=conversation_id,
+                target_record=target,
+                history_records=history,
+                conversation_metadata=metadata,
+                save_raw=config.save_raw_responses,
+                truncate_chars=truncate_chars,
+                prompt=config.message_prompt,
+            )
+            pending.add(fut)
+            fut_info[fut] = {
+                "conversation_id": conversation_id,
+                "conversation_index": ci,
+                "target": target,
+            }
+
+        while pending:
+            done, _ = cf.wait(pending, return_when=cf.FIRST_COMPLETED)
+            for fut in done:
+                pending.discard(fut)
+                info = fut_info.pop(fut)
+                conversation_id = info["conversation_id"]
+                target = info["target"]
+                try:
+                    mr = fut.result()
+                except Exception as e:  # noqa: BLE001
+                    mr = {
+                        "conversation_id": conversation_id,
+                        "target_message_id": target.get("message_id", ""),
+                        "message_index": target.get("message_index"),
+                        "appended_message_index": target.get("appended_message_index", target.get("message_index")),
+                        "source_conversation_id": target.get("source_conversation_id"),
+                        "message_time": target.get("message_time", ""),
+                        "target_message_text": strip_inline_rag_context(target.get("message_text", "")),
+                        "input_history": None,
+                        "raw_model_response": None,
+                        "parsed_json": None,
+                        "parse_status": "api_error",
+                        "error_message": f"Worker raised: {e}",
+                        "debug": None,
+                    }
+
+                completed_by_conv[conversation_id] = completed_by_conv.get(conversation_id, 0) + 1
+                results.message_level_results.append(mr)
+                if on_message_result:
+                    try:
+                        on_message_result(mr)
+                    except Exception:
+                        pass
+
+                if mr.get("parse_status") != "ok":
+                    err = {
+                        "level": "message",
+                        "conversation_id": conversation_id,
+                        "message_index": target.get("message_index"),
+                        "error": mr.get("error_message"),
+                    }
+                    results.errors.append(err)
+                    if on_error:
+                        try:
+                            on_error(err)
+                        except Exception:
+                            pass
+
+                if on_progress:
+                    on_progress(
+                        {
+                            "phase": "message_done",
+                            "conversation_index": info["conversation_index"],
+                            "conversation_id": conversation_id,
+                            "message_index": target.get("message_index"),
+                            "message_in_conversation": completed_by_conv[conversation_id],
+                            "total_in_conversation": len(wanted.get(conversation_id, set())),
+                            "status": mr.get("parse_status"),
+                            "automatic_reruns": int(mr.get("automatic_reruns") or 0),
+                            "recovered_after_rerun": bool(mr.get("recovered_after_rerun")),
+                            "rerun_errors": list(mr.get("rerun_errors") or []),
+                        }
+                    )
+
+            if cancel_requested and cancel_requested():
+                for fut in list(pending):
+                    if not fut.done():
+                        fut.cancel()
+                    pending.discard(fut)
+                break
+
+    results.message_level_results.sort(
+        key=lambda mr: (
+            conversation_index.get(str(mr.get("conversation_id") or mr.get("thread_id") or ""), 0),
+            str(mr.get("message_index") if mr.get("message_index") is not None else ""),
+        )
+    )
     results.finished_at = time.time()
     if on_progress:
         on_progress({"phase": "done", "total_conversations": total_conversations})
@@ -1783,6 +2140,9 @@ def run_conversation_level_only(
                             "conversation_id": conversation_id,
                             "total_conversations": total_conversations,
                             "status": cr.get("parse_status"),
+                            "automatic_reruns": int(cr.get("automatic_reruns") or 0),
+                            "recovered_after_rerun": bool(cr.get("recovered_after_rerun")),
+                            "rerun_errors": cr.get("rerun_errors") or [],
                         }
                     )
 

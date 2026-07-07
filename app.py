@@ -38,6 +38,7 @@ from db import DEFAULT_DB_PATH, Database
 from evaluator import (
     RunConfig,
     RunResults,
+    run_message_level_repair,
     run_conversation_level_only,
     run_evaluation,
     validate_conversation_level_result,
@@ -114,7 +115,7 @@ DEFAULT_RUN_SETTINGS = {
     "save_raw_responses": True,
 }
 DEFAULT_CHOICES_VERSION = 6
-DEFAULT_DB_SELECTION_VERSION = 2
+DEFAULT_DB_SELECTION_VERSION = 3
 ROLE_MASTER = "master"
 ROLE_ACTIVE = "active"
 ROLE_READ_ONLY = "read_only"
@@ -298,7 +299,7 @@ def _init_state() -> None:
         "progress_log": [],
         "cancel_flag": False,
         # DB integration
-        "db_path": str(REVIEW_DB_PATH if REVIEW_DB_PATH.exists() else DEFAULT_DB_PATH),
+        "db_path": str(DEFAULT_DB_PATH),
         "current_run_id": None,        # id of the run we're writing to (or loaded from)
         "loaded_run_label": None,
         "review_selected_conversation_id": None,
@@ -314,8 +315,13 @@ def _init_state() -> None:
         if k not in st.session_state:
             st.session_state[k] = v
     if st.session_state.get("_default_db_selection_version") != DEFAULT_DB_SELECTION_VERSION:
-        if REVIEW_DB_PATH.exists() and st.session_state.get("db_path") in {None, "", str(DEFAULT_DB_PATH)}:
-            st.session_state.db_path = str(REVIEW_DB_PATH)
+        if st.session_state.get("db_path") in {
+            None,
+            "",
+            str(DEFAULT_DB_PATH),
+            str(REVIEW_DB_PATH),
+        }:
+            st.session_state.db_path = str(DEFAULT_DB_PATH)
         st.session_state["_default_db_selection_version"] = DEFAULT_DB_SELECTION_VERSION
     if st.session_state.get("_default_choices_version") != DEFAULT_CHOICES_VERSION:
         for key, value in DEFAULT_EVALUATION_SETTINGS.items():
@@ -724,9 +730,9 @@ def _available_database_options() -> tuple[list[str], dict[str, str]]:
         options.append(value)
         labels[value] = label
 
+    add_option(DEFAULT_DB_PATH, "Local working DB - cx_evaluator.db")
     if REVIEW_DB_PATH.exists():
         add_option(REVIEW_DB_PATH, "Review DB - runs 5, 59, 57, 55")
-    add_option(DEFAULT_DB_PATH, "Local working DB - cx_evaluator.db")
 
     known = {Path(str(DEFAULT_DB_PATH)).name, REVIEW_DB_PATH.name}
     for path in sorted(Path.cwd().glob("*.db")):
@@ -1104,13 +1110,17 @@ def _show_live_message_rerun(
         outcome = "Recovered successfully" if recovered else "Still failed"
         errors = [str(value) for value in (rerun.get("rerun_errors") or []) if value]
         detail = errors[-1] if errors else "The original response could not be parsed."
+        if rerun.get("message_index") is not None:
+            target = f"message #{rerun.get('message_index')}"
+        else:
+            target = "conversation-level analysis"
         lines.append(
             f"**{outcome}** — Customer `{rerun.get('conversation_id')}`, "
-            f"message #{rerun.get('message_index')} — "
+            f"{target} — "
             f"{int(rerun.get('automatic_reruns') or 0)} automatic rerun(s)\n\n"
             f"Initial failure: {detail}"
         )
-    prefix = f"**{len(rerun_events):,} message evaluation(s) automatically rerun.**"
+    prefix = f"**{len(rerun_events):,} evaluation call(s) automatically rerun.**"
     if len(rerun_events) > len(visible):
         prefix += " Showing the latest 5."
     rerun_box.warning(prefix + "\n\n" + "\n\n---\n\n".join(lines))
@@ -1211,8 +1221,41 @@ def _render_last_run_summary() -> None:
         history = debug.get("evaluation_attempt_history") or []
         rerun_rows.append(
             {
+                "level": "message",
                 "customer": result.get("conversation_id") or result.get("thread_id"),
                 "message_index": result.get("message_index"),
+                "automatic_reruns": automatic_reruns,
+                "outcome": (
+                    "recovered"
+                    if result.get("recovered_after_rerun")
+                    or debug.get("recovered_after_rerun")
+                    else "failed"
+                ),
+                "initial_failure": next(
+                    (
+                        attempt.get("error")
+                        for attempt in history
+                        if isinstance(attempt, dict) and attempt.get("error")
+                    ),
+                    "",
+                ),
+            }
+        )
+    for result in rr.conversation_results:
+        debug = result.get("debug") or {}
+        automatic_reruns = int(
+            result.get("automatic_reruns")
+            or debug.get("automatic_reruns")
+            or 0
+        )
+        if automatic_reruns <= 0:
+            continue
+        history = debug.get("evaluation_attempt_history") or []
+        rerun_rows.append(
+            {
+                "level": "conversation",
+                "customer": result.get("conversation_id") or result.get("thread_id"),
+                "message_index": "",
                 "automatic_reruns": automatic_reruns,
                 "outcome": (
                     "recovered"
@@ -1238,14 +1281,14 @@ def _render_last_run_summary() -> None:
             ("Customer journeys", f"{len(rr.conversation_results):,}", None),
             ("Message calls", f"{len(rr.message_level_results):,}", None),
             ("Automatic reruns", f"{total_reruns:,}", None),
-            ("Recovered messages", f"{recovered:,}", None),
+            ("Recovered calls", f"{recovered:,}", None),
             ("Errors", f"{len(rr.errors):,}", None),
             ("Duration (s)", f"{(rr.finished_at or 0) - (rr.started_at or 0):.1f}", None),
         ]
     )
 
     if rerun_rows:
-        with st.expander(f"View {len(rerun_rows):,} automatically rerun messages"):
+        with st.expander(f"View {len(rerun_rows):,} automatically rerun calls"):
             st.dataframe(pd.DataFrame(rerun_rows), use_container_width=True)
 
     if rr.errors:
@@ -1516,6 +1559,117 @@ def _conversation_rerun_filter_ids(
     return matched
 
 
+def _normalize_message_index(value: Any) -> Any:
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return value
+
+
+def _failed_run_repair_plan(rr: RunResults | None) -> dict[str, Any]:
+    """Separate failed message rows from failed conversation rows."""
+    failed_messages: dict[str, set[Any]] = {}
+    failed_conversations: set[str] = set()
+
+    if rr is None:
+        return {
+            "failed_messages": {},
+            "failed_conversations": set(),
+            "failed_conversation_ids": [],
+            "message_failure_count": 0,
+            "conversation_failure_count": 0,
+        }
+
+    for result in getattr(rr, "message_level_results", []) or []:
+        if str(result.get("parse_status") or "ok") == "ok":
+            continue
+        conversation_id = str(result.get("conversation_id") or result.get("thread_id") or "").strip()
+        idx = result.get("message_index")
+        if conversation_id and idx is not None:
+            failed_messages.setdefault(conversation_id, set()).add(_normalize_message_index(idx))
+
+    for result in getattr(rr, "conversation_results", []) or []:
+        if str(result.get("parse_status") or "ok") == "ok":
+            continue
+        conversation_id = str(result.get("conversation_id") or result.get("thread_id") or "").strip()
+        if conversation_id:
+            failed_conversations.add(conversation_id)
+
+    for error in getattr(rr, "errors", []) or []:
+        conversation_id = str(error.get("conversation_id") or "").strip()
+        if not conversation_id:
+            continue
+        level = str(error.get("level") or "").strip().lower()
+        if level == "message":
+            idx = error.get("message_index")
+            if idx is not None:
+                failed_messages.setdefault(conversation_id, set()).add(_normalize_message_index(idx))
+            else:
+                failed_conversations.add(conversation_id)
+        elif level == "conversation":
+            failed_conversations.add(conversation_id)
+
+    failed_conversation_ids = sorted(set(failed_messages) | failed_conversations)
+    message_failure_count = sum(len(indices) for indices in failed_messages.values())
+    return {
+        "failed_messages": {
+            conversation_id: sorted(indices, key=lambda value: (str(type(value)), str(value)))
+            for conversation_id, indices in failed_messages.items()
+        },
+        "failed_conversations": failed_conversations,
+        "failed_conversation_ids": failed_conversation_ids,
+        "message_failure_count": message_failure_count,
+        "conversation_failure_count": len(failed_conversations),
+    }
+
+
+def _full_failed_repair_plan_from_loaded_run(
+    rr: RunResults | None,
+    failed_conversation_ids: list[str],
+    *,
+    target_role: str = "agent",
+    max_messages_per_conversation: int | None = None,
+) -> dict[str, Any]:
+    """Build a repair plan that reruns every target message plus conversation layer."""
+    failed_ids = {str(value) for value in failed_conversation_ids if str(value)}
+    failed_messages: dict[str, list[Any]] = {}
+    target_role = (target_role or "agent").strip().lower()
+    if target_role not in {"agent", "customer"}:
+        target_role = "agent"
+
+    if rr is not None:
+        for result in getattr(rr, "conversation_results", []) or []:
+            conversation_id = str(result.get("conversation_id") or result.get("thread_id") or "").strip()
+            if conversation_id not in failed_ids:
+                continue
+            records = list(result.get("transcript") or [])
+            indices: list[Any] = [
+                record.get("message_index")
+                for record in records
+                if record.get("message_index") is not None
+                and str(record.get("sender_role") or "").strip().lower() == target_role
+            ]
+            if max_messages_per_conversation is not None:
+                indices = indices[: max(0, int(max_messages_per_conversation))]
+            if indices:
+                failed_messages[conversation_id] = [_normalize_message_index(idx) for idx in indices]
+
+        # Fallback for older/sparse runs where transcript was not loaded.
+        for result in getattr(rr, "message_level_results", []) or []:
+            conversation_id = str(result.get("conversation_id") or result.get("thread_id") or "").strip()
+            idx = result.get("message_index")
+            if conversation_id in failed_ids and conversation_id not in failed_messages and idx is not None:
+                failed_messages.setdefault(conversation_id, []).append(_normalize_message_index(idx))
+
+    return {
+        "failed_messages": failed_messages,
+        "failed_conversations": set(failed_ids),
+        "failed_conversation_ids": sorted(failed_ids),
+        "message_failure_count": sum(len(indices) for indices in failed_messages.values()),
+        "conversation_failure_count": len(failed_ids),
+    }
+
+
 def _render_conversation_rerun_scope() -> list[str]:
     """Render filters for reusing message results from the loaded saved run."""
     source_results = st.session_state.get("run_results")
@@ -1662,6 +1816,12 @@ def _execute_full_batch_into_run(
             progress_state["calls"] += 1
             key = "successes" if event.get("status") == "ok" else "failures"
             progress_state[key] += 1
+            automatic_reruns = int(event.get("automatic_reruns") or 0)
+            if automatic_reruns:
+                progress_state["reruns"] += automatic_reruns
+                if event.get("recovered_after_rerun"):
+                    progress_state["recovered"] += 1
+                _show_live_message_rerun(rerun_box, live_reruns, event)
         fraction = min(progress_state["calls"] / max(total_calls, 1), 1.0)
         bar.progress(
             fraction,
@@ -1704,7 +1864,11 @@ def _execute_full_batch_into_run(
     results = None
     try:
         progress_box.info(
-            "Retrying failed journeys..." if mode == "retry_failed" else "Appending the next journey batch..."
+            (
+                "Running failed journeys..."
+                if mode in {"retry_failed", "run_failed_full"}
+                else "Appending the next journey batch..."
+            )
         )
         results = run_evaluation(
             df=df,
@@ -1740,6 +1904,220 @@ def _execute_full_batch_into_run(
         db.finish_run_from_saved_results(run_id, status="partial")
         progress_box.error(
             f"The batch stopped early: {exc}. Completed and failed rows emitted before "
+            "the interruption remain saved and can be retried."
+        )
+    finally:
+        st.session_state.run_in_progress = False
+        st.session_state.cancel_flag = False
+
+
+def _execute_smart_failed_repair(
+    *,
+    df: pd.DataFrame | None,
+    run_id: int,
+    plan: dict[str, Any],
+    progress_box,
+    bar,
+    counter_box,
+    current_box,
+) -> None:
+    """Repair failed rows in-place without rerunning successful journey layers."""
+    failed_messages: dict[str, list[Any]] = {
+        str(conversation_id): list(indices or [])
+        for conversation_id, indices in (plan.get("failed_messages") or {}).items()
+        if indices
+    }
+    failed_conversations: set[str] = {
+        str(value) for value in (plan.get("failed_conversations") or set()) if str(value)
+    }
+    repair_conversation_ids = sorted(set(failed_messages) | failed_conversations)
+    if not repair_conversation_ids:
+        progress_box.info("No failed rows were found to repair.")
+        return
+
+    db = get_active_db()
+    config, message_prompt_id, conversation_prompt_id = _build_run_config()
+    client = build_client(config.api.base_url, config.api.api_key)
+
+    st.session_state.run_in_progress = True
+    st.session_state.cancel_flag = False
+    st.session_state.progress_log = []
+
+    total_message_calls = sum(len(indices) for indices in failed_messages.values())
+    total_conversation_calls = len(failed_conversations)
+    total_calls = total_message_calls + total_conversation_calls
+    progress_state = {
+        "messages_done": 0,
+        "conversations_done": 0,
+        "calls_done": 0,
+        "successes": 0,
+        "failures": 0,
+        "reruns": 0,
+        "recovered": 0,
+    }
+    live_failures: list[dict] = []
+    live_reruns: list[dict] = []
+    failure_box = st.empty()
+    rerun_box = st.empty()
+    persistence_errors: list[str] = []
+    new_errors: list[dict] = []
+
+    def record_progress(evt: dict) -> None:
+        phase = evt.get("phase")
+        if phase == "conversation_start":
+            current_box.info(
+                f"Repairing `{evt.get('conversation_id')}` — "
+                f"{evt.get('target_messages', evt.get('agent_messages', 0))} target message(s)"
+            )
+        elif phase == "message_done":
+            progress_state["messages_done"] += 1
+            progress_state["calls_done"] += 1
+            if evt.get("status") == "ok":
+                progress_state["successes"] += 1
+            else:
+                progress_state["failures"] += 1
+            automatic_reruns = int(evt.get("automatic_reruns") or 0)
+            if automatic_reruns:
+                progress_state["reruns"] += automatic_reruns
+                if evt.get("recovered_after_rerun"):
+                    progress_state["recovered"] += 1
+                _show_live_message_rerun(rerun_box, live_reruns, evt)
+        elif phase == "conversation_done":
+            progress_state["conversations_done"] += 1
+            progress_state["calls_done"] += 1
+            if evt.get("status") == "ok":
+                progress_state["successes"] += 1
+            else:
+                progress_state["failures"] += 1
+            automatic_reruns = int(evt.get("automatic_reruns") or 0)
+            if automatic_reruns:
+                progress_state["reruns"] += automatic_reruns
+                if evt.get("recovered_after_rerun"):
+                    progress_state["recovered"] += 1
+                _show_live_message_rerun(rerun_box, live_reruns, evt)
+
+        frac = min(progress_state["calls_done"] / max(total_calls, 1), 1.0)
+        bar.progress(
+            frac,
+            text=(
+                f"Messages {progress_state['messages_done']}/{total_message_calls} | "
+                f"Journeys {progress_state['conversations_done']}/{total_conversation_calls}"
+            ),
+        )
+        counter_box.markdown(
+            f"**Successes:** {progress_state['successes']} | "
+            f"**Failures:** {progress_state['failures']} | "
+            f"**Automatic reruns:** {progress_state['reruns']} | "
+            f"**Recovered:** {progress_state['recovered']}"
+        )
+        st.session_state.progress_log.append(evt)
+
+    def save_message(result: dict) -> None:
+        try:
+            result["run_id"] = run_id
+            db.replace_message_result(run_id, result)
+        except Exception as exc:
+            persistence_errors.append(f"message result: {exc}")
+
+    def save_conversation(result: dict) -> None:
+        try:
+            result["run_id"] = run_id
+            db.replace_conversation_result(run_id, result)
+        except Exception as exc:
+            persistence_errors.append(f"conversation result: {exc}")
+
+    def save_error(error: dict) -> None:
+        new_errors.append(dict(error))
+        _show_live_run_failure(failure_box, live_failures, error)
+
+    def cancel_requested() -> bool:
+        return bool(st.session_state.cancel_flag)
+
+    db.mark_run_running(run_id)
+    db.append_run_event(
+        run_id,
+        {
+            "type": "run_failed_smart",
+            "started_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+            "journey_count": len(repair_conversation_ids),
+            "message_failure_count": total_message_calls,
+            "conversation_failure_count": total_conversation_calls,
+            "message_model": config.api.model,
+            "conversation_model": config.conversation_api_config().model,
+            "service_tier": config.api.service_tier,
+            "message_thinking_effort": config.api.thinking_effort,
+            "conversation_thinking_effort": config.conversation_api_config().thinking_effort,
+            "message_prompt_id": message_prompt_id,
+            "conversation_prompt_id": conversation_prompt_id,
+        },
+    )
+
+    message_results = None
+    conversation_results = None
+    try:
+        progress_box.info("Running failed repair...")
+        loaded_for_repair = db.load_run_results(run_id)
+        source_conversation_results = list(loaded_for_repair.get("conversation_results") or [])
+        if failed_messages:
+            config.selected_conversation_ids = sorted(failed_messages)
+            config.max_conversations = None
+            message_results = run_message_level_repair(
+                df=df,
+                client=client,
+                config=config,
+                selected_message_indices_by_conversation=failed_messages,
+                existing_conversation_results=source_conversation_results,
+                on_progress=record_progress,
+                cancel_requested=cancel_requested,
+                on_message_result=save_message,
+                on_error=save_error,
+            )
+            for result in message_results.message_level_results:
+                save_message(result)
+
+        if failed_conversations and not cancel_requested():
+            loaded = db.load_run_results(run_id)
+            source_message_results = list(loaded.get("message_level_results") or [])
+            source_conversation_results = list(loaded.get("conversation_results") or [])
+            config.selected_conversation_ids = sorted(failed_conversations)
+            config.max_conversations = None
+            conversation_results = run_conversation_level_only(
+                existing_message_level_results=source_message_results,
+                existing_conversation_results=source_conversation_results,
+                df=df,
+                client=client,
+                config=config,
+                on_progress=record_progress,
+                cancel_requested=cancel_requested,
+                on_conversation_result=save_conversation,
+                on_error=save_error,
+            )
+            for result in conversation_results.conversation_results:
+                save_conversation(result)
+
+        db.replace_run_errors_for_journeys(run_id, repair_conversation_ids, new_errors)
+        counts = db.finish_run_from_saved_results(
+            run_id,
+            status="completed" if not new_errors else "completed_with_errors",
+        )
+        _load_saved_run_into_session(db, run_id)
+        if new_errors:
+            progress_box.warning(
+                f"Run Failed finished with {len(new_errors):,} remaining error(s). "
+                f"Run #{run_id} now has {counts['conversations']:,} journeys and "
+                f"{counts['errors']:,} recorded errors."
+            )
+        else:
+            progress_box.success(
+                f"Run Failed repaired {len(repair_conversation_ids):,} journey/journeys. "
+                f"Run #{run_id} now has {counts['conversations']:,} journeys and no recorded errors."
+            )
+        if persistence_errors:
+            st.warning(f"Some live saves failed. First error: {persistence_errors[0]}")
+    except Exception as exc:
+        db.finish_run_from_saved_results(run_id, status="partial")
+        progress_box.error(
+            f"Run Failed stopped early: {exc}. Completed repair rows emitted before "
             "the interruption remain saved and can be retried."
         )
     finally:
@@ -3779,7 +4157,47 @@ def tab_run() -> None:
             help="Saved with this run and shown in Past runs.",
         )
 
-        run_col, convo_only_col, cancel_col, _ = st.columns([1, 1, 1, 3])
+        no_csv_run_id = int(st.session_state.get("current_run_id") or 0)
+        no_csv_failed_plan = _failed_run_repair_plan(st.session_state.get("run_results"))
+        no_csv_failed_ids = set(no_csv_failed_plan.get("failed_conversation_ids") or [])
+        if no_csv_run_id:
+            db_failed_ids = set(db.list_run_failed_conversation_ids(no_csv_run_id))
+            unplanned_db_failures = db_failed_ids - no_csv_failed_ids
+            if unplanned_db_failures:
+                failed_conversations = set(no_csv_failed_plan.get("failed_conversations") or set())
+                failed_conversations.update(unplanned_db_failures)
+                no_csv_failed_plan["failed_conversations"] = failed_conversations
+                no_csv_failed_plan["conversation_failure_count"] = len(failed_conversations)
+                no_csv_failed_plan["failed_conversation_ids"] = sorted(
+                    no_csv_failed_ids | unplanned_db_failures
+                )
+            no_csv_failed_ids = set(no_csv_failed_plan.get("failed_conversation_ids") or [])
+
+        no_csv_run_failed_mode = "Smart repair"
+        if no_csv_failed_ids:
+            with st.expander(
+                f"Run Failed from loaded run #{no_csv_run_id}",
+                expanded=True,
+            ):
+                st.caption(
+                    f"Failed rows found: {int(no_csv_failed_plan.get('message_failure_count') or 0):,} "
+                    f"message-level and {int(no_csv_failed_plan.get('conversation_failure_count') or 0):,} "
+                    "conversation-level. This uses saved transcripts/results from the database."
+                )
+                no_csv_run_failed_mode = st.radio(
+                    "Run Failed mode",
+                    ["Smart repair", "Full failed journeys"],
+                    key=f"run_failed_mode_no_csv_{no_csv_run_id}",
+                    horizontal=True,
+                    help=(
+                        "Smart repair reruns only failed message rows, and reruns the "
+                        "conversation layer only for journeys whose conversation result failed. "
+                        "Full failed journeys reruns every target message plus conversation "
+                        "analysis for each failed journey using the saved transcript."
+                    ),
+                )
+
+        run_col, convo_only_col, failed_col, cancel_col, _ = st.columns([1, 1, 1, 1, 2])
         with run_col:
             st.button(
                 "Run CX Evaluation",
@@ -3796,6 +4214,19 @@ def tab_run() -> None:
                     or not conversation_rerun_ids
                 ),
                 use_container_width=True,
+            )
+        with failed_col:
+            no_csv_run_failed_clicked = st.button(
+                f"Run Failed ({len(no_csv_failed_ids):,})",
+                disabled=(
+                    st.session_state.run_in_progress
+                    or not no_csv_run_id
+                    or not no_csv_failed_ids
+                    or not st.session_state.selected_model
+                    or not st.session_state.get("conversation_selected_model")
+                ),
+                use_container_width=True,
+                help="Repair failed rows in the loaded run using saved DB transcripts/results.",
             )
         with cancel_col:
             if st.session_state.run_in_progress:
@@ -3816,6 +4247,27 @@ def tab_run() -> None:
                 counter_box=counter_box,
                 current_box=current_box,
                 selected_conversation_ids=conversation_rerun_ids,
+            )
+        elif no_csv_run_failed_clicked:
+            if no_csv_run_failed_mode == "Full failed journeys":
+                target_role = str(st.session_state.get("message_target_role") or "agent")
+                no_csv_failed_plan = _full_failed_repair_plan_from_loaded_run(
+                    st.session_state.get("run_results"),
+                    sorted(no_csv_failed_ids),
+                    target_role=target_role,
+                    max_messages_per_conversation=int(
+                        st.session_state.get("max_agent_messages_per_conv") or 0
+                    )
+                    or None,
+                )
+            _execute_smart_failed_repair(
+                df=None,
+                run_id=no_csv_run_id,
+                plan=no_csv_failed_plan,
+                progress_box=progress_box,
+                bar=bar,
+                counter_box=counter_box,
+                current_box=current_box,
             )
 
         _render_last_run_summary()
@@ -4105,9 +4557,11 @@ def tab_run() -> None:
             )
 
     append_clicked = False
-    retry_failed_clicked = False
+    run_failed_clicked = False
     append_ids: list[str] = []
-    retry_failed_ids: list[str] = []
+    run_failed_ids: list[str] = []
+    run_failed_mode = "Smart repair"
+    failed_repair_plan: dict[str, Any] = {}
     continuation_run_id = int(st.session_state.get("current_run_id") or 0)
     if continuation_run_id:
         continuation_run = db.get_run(continuation_run_id)
@@ -4120,8 +4574,20 @@ def tab_run() -> None:
         )
         completed_ids = set(db.list_run_completed_conversation_ids(continuation_run_id))
         remaining_ids = [journey_id for journey_id in all_ids if journey_id not in completed_ids]
-        failed_ids = set(db.list_run_failed_conversation_ids(continuation_run_id))
-        retry_failed_ids = [journey_id for journey_id in all_ids if journey_id in failed_ids]
+        failed_repair_plan = _failed_run_repair_plan(st.session_state.get("run_results"))
+        db_failed_ids = set(db.list_run_failed_conversation_ids(continuation_run_id))
+        planned_failed_ids = set(failed_repair_plan.get("failed_conversation_ids") or [])
+        unplanned_db_failures = db_failed_ids - planned_failed_ids
+        if unplanned_db_failures:
+            failed_conversations = set(failed_repair_plan.get("failed_conversations") or set())
+            failed_conversations.update(unplanned_db_failures)
+            failed_repair_plan["failed_conversations"] = failed_conversations
+            failed_repair_plan["conversation_failure_count"] = len(failed_conversations)
+            failed_repair_plan["failed_conversation_ids"] = sorted(
+                planned_failed_ids | unplanned_db_failures
+            )
+        failed_ids = db_failed_ids | set(failed_repair_plan.get("failed_conversation_ids") or [])
+        run_failed_ids = [journey_id for journey_id in all_ids if journey_id in failed_ids]
 
         with st.expander(
             f"Continue or repair loaded run #{continuation_run_id}",
@@ -4130,7 +4596,7 @@ def tab_run() -> None:
             st.caption(
                 f"CSV journeys: {len(all_ids):,} | Saved conversation results: "
                 f"{len(completed_ids):,} | Remaining: {len(remaining_ids):,} | "
-                f"Failed journeys: {len(retry_failed_ids):,}"
+                f"Failed journeys: {len(run_failed_ids):,}"
             )
             if not csv_matches:
                 st.error(
@@ -4171,14 +4637,31 @@ def tab_run() -> None:
             else:
                 st.success("This run already has a conversation result for every journey in the CSV.")
 
-            if retry_failed_ids:
+            if run_failed_ids:
+                msg_failures = int(failed_repair_plan.get("message_failure_count") or 0)
+                conv_failures = int(failed_repair_plan.get("conversation_failure_count") or 0)
                 st.caption(
-                    "Retrying replaces results only for failed journeys. Successful journeys "
-                    "already stored in the run remain untouched."
+                    f"Failed rows found: {msg_failures:,} message-level and "
+                    f"{conv_failures:,} conversation-level. Successful journeys remain untouched."
                 )
-                retry_failed_clicked = st.button(
-                    f"Retry {len(retry_failed_ids):,} failed journeys in the same run",
-                    key=f"retry_failed_run_{continuation_run_id}",
+                run_failed_mode = st.radio(
+                    "Run Failed mode",
+                    [
+                        "Smart repair",
+                        "Full failed journeys",
+                    ],
+                    key=f"run_failed_mode_{continuation_run_id}",
+                    horizontal=True,
+                    help=(
+                        "Smart repair reruns only failed message rows, and reruns the "
+                        "conversation layer only for journeys whose conversation result failed. "
+                        "Full failed journeys reruns every target message plus conversation "
+                        "analysis for each failed journey."
+                    ),
+                )
+                run_failed_clicked = st.button(
+                    f"Run Failed ({len(run_failed_ids):,})",
+                    key=f"run_failed_run_{continuation_run_id}",
                     disabled=st.session_state.run_in_progress or not csv_matches,
                     use_container_width=True,
                 )
@@ -4423,6 +4906,12 @@ def tab_run() -> None:
                     progress_state["successes"] += 1
                 else:
                     progress_state["failures"] += 1
+                automatic_reruns = int(evt.get("automatic_reruns") or 0)
+                if automatic_reruns:
+                    progress_state["reruns"] += automatic_reruns
+                    if evt.get("recovered_after_rerun"):
+                        progress_state["recovered"] += 1
+                    _show_live_message_rerun(rerun_box, live_reruns, evt)
 
             if total_msg > 0:
                 frac = min(progress_state["calls_done"] / max(total_msg, 1), 1.0)
@@ -4558,17 +5047,28 @@ def tab_run() -> None:
             counter_box=counter_box,
             current_box=current_box,
         )
-    elif retry_failed_clicked:
-        _execute_full_batch_into_run(
-            df=df,
-            run_id=continuation_run_id,
-            conversation_ids=retry_failed_ids,
-            mode="retry_failed",
-            progress_box=progress_box,
-            bar=bar,
-            counter_box=counter_box,
-            current_box=current_box,
-        )
+    elif run_failed_clicked:
+        if run_failed_mode == "Full failed journeys":
+            _execute_full_batch_into_run(
+                df=df,
+                run_id=continuation_run_id,
+                conversation_ids=run_failed_ids,
+                mode="run_failed_full",
+                progress_box=progress_box,
+                bar=bar,
+                counter_box=counter_box,
+                current_box=current_box,
+            )
+        else:
+            _execute_smart_failed_repair(
+                df=df,
+                run_id=continuation_run_id,
+                plan=failed_repair_plan,
+                progress_box=progress_box,
+                bar=bar,
+                counter_box=counter_box,
+                current_box=current_box,
+            )
 
     _render_last_run_summary()
 
@@ -5445,7 +5945,7 @@ def _render_stats_summary_table(rows: list[dict[str, Any]]) -> None:
 
 def _message_flag_stats(conversation_results: list[dict]) -> pd.DataFrame:
     """Count evaluated message flag colors by sender origin."""
-    sender_types = ("Agent", "Bot", "Broadcast")
+    sender_types = ("Agent - L2", "Agent - Other", "Bot", "Broadcast")
     flag_levels = ("Red", "Yellow", "Green")
     counts = {
         sender_type: {flag_level: 0 for flag_level in flag_levels}
@@ -5462,6 +5962,8 @@ def _message_flag_stats(conversation_results: list[dict]) -> pd.DataFrame:
             if message_index is None:
                 continue
             sender_type = _flagged_sender_type(message)
+            if sender_type == "Agent":
+                sender_type = "Agent - L2" if _is_l2_agent_message(message) else "Agent - Other"
             flag_level = _message_flag_level(eval_by_idx.get(str(message_index)))
             if sender_type in counts and flag_level in flag_levels:
                 counts[sender_type][flag_level] += 1
@@ -5509,8 +6011,499 @@ def _message_flag_stats(conversation_results: list[dict]) -> pd.DataFrame:
     return pd.DataFrame([*rows, total_row])
 
 
-def _render_message_flag_stats_table(flag_stats_df: pd.DataFrame) -> None:
+def _stats_conversation_id(conversation_result: dict) -> str:
+    """Return the stable journey/conversation id used for distinct Stats counts."""
+    return str(
+        conversation_result.get("conversation_id")
+        or conversation_result.get("thread_id")
+        or ""
+    ).strip()
+
+
+def _agent_name_for_stats(message: dict) -> str:
+    """Return a normalized lower-case agent name for Stats grouping."""
+    for key in (
+        "agent_full_name",
+        "message_agent_full_name",
+        "agent_name",
+        "agent_login_name",
+        "conversation_agent_full_name",
+        "conversation_agent_login_name",
+    ):
+        value = str(message.get(key) or "").strip()
+        if value:
+            return value.lower()
+    return "unknown agent"
+
+
+def _message_flag_stats_by_agent_name(conversation_results: list[dict]) -> pd.DataFrame:
+    """Count agent appearances and red/yellow flags by lower-cased distinct agent name."""
+    counts: dict[str, dict[str, int]] = {}
+    appeared_conversation_sets: dict[str, set[str]] = {}
+    flagged_conversation_sets: dict[str, set[str]] = {}
+    all_appeared_conversations: set[str] = set()
+    all_flagged_conversations: set[str] = set()
+
+    for conversation_result in conversation_results:
+        conversation_id = _stats_conversation_id(conversation_result)
+        transcript = conversation_result.get("transcript") or []
+        eval_by_idx = _message_results_by_index(
+            conversation_result.get("message_level_results")
+        )
+        for message in transcript:
+            if _flagged_sender_type(message) != "Agent":
+                continue
+
+            agent_name = _agent_name_for_stats(message)
+            counts.setdefault(agent_name, {"Red": 0, "Yellow": 0, "Appearances": 0})
+            counts[agent_name]["Appearances"] += 1
+            if conversation_id:
+                appeared_conversation_sets.setdefault(agent_name, set()).add(conversation_id)
+                all_appeared_conversations.add(conversation_id)
+
+            message_index = message.get("message_index")
+            if message_index is None:
+                continue
+            flag_level = _flagged_message_level(eval_by_idx.get(str(message_index)))
+            if flag_level not in {"Red", "Yellow"}:
+                continue
+
+            counts[agent_name][flag_level] += 1
+            if conversation_id:
+                flagged_conversation_sets.setdefault(agent_name, set()).add(conversation_id)
+                all_flagged_conversations.add(conversation_id)
+
+    rows = []
+    for agent_name, agent_counts in counts.items():
+        red = int(agent_counts.get("Red") or 0)
+        yellow = int(agent_counts.get("Yellow") or 0)
+        flagged = red + yellow
+        appearances = int(agent_counts.get("Appearances") or 0)
+        distinct_flagged = len(flagged_conversation_sets.get(agent_name, set()))
+        distinct_appeared = len(appeared_conversation_sets.get(agent_name, set()))
+        rows.append(
+            {
+                "Agent name": agent_name,
+                "Red": red,
+                "Yellow": yellow,
+                "Flagged (red + yellow)": flagged,
+                "Total appearances": appearances,
+                "Flagged appearance rate": f"{_pct(flagged, appearances):.1f}%",
+                "Distinct conversations flagged": distinct_flagged,
+                "Distinct conversations appeared": distinct_appeared,
+                "Distinct conversation flagged rate": f"{_pct(distinct_flagged, distinct_appeared):.1f}%",
+            }
+        )
+
+    if not rows:
+        return pd.DataFrame(
+            columns=[
+                "Agent name",
+                "Red",
+                "Yellow",
+                "Flagged (red + yellow)",
+                "Total appearances",
+                "Flagged appearance rate",
+                "Distinct conversations flagged",
+                "Distinct conversations appeared",
+                "Distinct conversation flagged rate",
+                "Share of flagged agent messages",
+            ]
+        )
+
+    rows = sorted(
+        rows,
+        key=lambda row: (
+            -int(row["Flagged (red + yellow)"]),
+            -int(row["Distinct conversations flagged"]),
+            -int(row["Red"]),
+            str(row["Agent name"]),
+        ),
+    )
+    total_flagged_agent_messages = sum(
+        int(row["Flagged (red + yellow)"]) for row in rows
+    )
+    total_agent_appearances = sum(int(row["Total appearances"]) for row in rows)
+    total_distinct_flagged = len(all_flagged_conversations)
+    total_distinct_appeared = len(all_appeared_conversations)
+    for row in rows:
+        row["Share of flagged agent messages"] = (
+            f"{_pct(int(row['Flagged (red + yellow)']), total_flagged_agent_messages):.1f}%"
+        )
+    total_row = {
+        "Agent name": "Total",
+        "Red": sum(int(row["Red"]) for row in rows),
+        "Yellow": sum(int(row["Yellow"]) for row in rows),
+        "Flagged (red + yellow)": total_flagged_agent_messages,
+        "Total appearances": total_agent_appearances,
+        "Flagged appearance rate": (
+            f"{_pct(total_flagged_agent_messages, total_agent_appearances):.1f}%"
+        ),
+        "Distinct conversations flagged": total_distinct_flagged,
+        "Distinct conversations appeared": total_distinct_appeared,
+        "Distinct conversation flagged rate": (
+            f"{_pct(total_distinct_flagged, total_distinct_appeared):.1f}%"
+        ),
+        "Share of flagged agent messages": (
+            f"{_pct(total_flagged_agent_messages, total_flagged_agent_messages):.1f}%"
+        ),
+    }
+    return pd.DataFrame([*rows, total_row])
+
+
+L2_AGENT_ALIASES: dict[str, tuple[str, ...]] = {
+    "Wissam Malaeb": ("Wissam Malaeb",),
+    "Katia Daher": ("Katia Daher",),
+    "Aline Al Moghrabi": ("Aline Al Moghrabi", "Aline AlMoghrabi"),
+    "Ali Moussa": ("Ali Moussa",),
+    "Asmaa Al Kadri": ("Asmaa Al Kadri", "Asmaa  El Kadri", "Asmaa El Kadri"),
+    "Mai Mahmoud": ("Mai Mahmoud",),
+    "Lara Ajami": ("Lara Ajami",),
+    "Bruna Sleiman": ("Bruna Sleiman",),
+    "Ahmad El Haj": ("Ahmad El Haj", "Ahmad AlHaaj"),
+    "Ali Ibrahim": ("Ali Ibrahim",),
+    "Habiba Ibrahim": ("Habiba Ibrahim", "Habiba Ebrahim"),
+    "Alaa Sabra": ("Alaa Sabra", "Alaa  Sabra"),
+    "Ali Fares": ("Ali Fares",),
+    "Reem Itaoui": ("Reem Itaoui",),
+}
+
+
+def _normalize_agent_alias(value: str) -> str:
+    return " ".join(str(value or "").strip().lower().split())
+
+
+def _l2_agent_alias_keys() -> set[str]:
+    return {
+        _normalize_agent_alias(alias)
+        for aliases in L2_AGENT_ALIASES.values()
+        for alias in aliases
+    }
+
+
+def _is_l2_agent_message(message: dict) -> bool:
+    """Return whether a transcript message belongs to the configured L2 agent list."""
+    for key in (
+        "agent_full_name",
+        "message_agent_full_name",
+        "agent_name",
+        "agent_login_name",
+        "conversation_agent_full_name",
+        "conversation_agent_login_name",
+    ):
+        value = str(message.get(key) or "").strip()
+        if value and _normalize_agent_alias(value) in _l2_agent_alias_keys():
+            return True
+    return False
+
+
+def _message_flag_stats_for_l2_agents(conversation_results: list[dict]) -> pd.DataFrame:
+    """Count message flags for the configured L2 agent list."""
+    alias_to_l2_name = {
+        _normalize_agent_alias(alias): l2_name
+        for l2_name, aliases in L2_AGENT_ALIASES.items()
+        for alias in aliases
+    }
+    rows_by_name: dict[str, dict[str, Any]] = {
+        l2_name: {
+            "Agent name": l2_name,
+            "DB spelling found": set(),
+            "Red": 0,
+            "Yellow": 0,
+            "Green": 0,
+            "Total appearances": 0,
+            "_appeared_conversations": set(),
+            "_flagged_conversations": set(),
+        }
+        for l2_name in L2_AGENT_ALIASES
+    }
+
+    for conversation_result in conversation_results:
+        conversation_id = _stats_conversation_id(conversation_result)
+        transcript = conversation_result.get("transcript") or []
+        eval_by_idx = _message_results_by_index(
+            conversation_result.get("message_level_results")
+        )
+        for message in transcript:
+            if _flagged_sender_type(message) != "Agent":
+                continue
+            raw_agent_name = str(
+                message.get("agent_full_name")
+                or message.get("message_agent_full_name")
+                or ""
+            ).strip()
+            l2_name = alias_to_l2_name.get(_normalize_agent_alias(raw_agent_name))
+            if not l2_name:
+                continue
+
+            row = rows_by_name[l2_name]
+            row["DB spelling found"].add(raw_agent_name)
+            row["Total appearances"] += 1
+            if conversation_id:
+                row["_appeared_conversations"].add(conversation_id)
+
+            message_index = message.get("message_index")
+            if message_index is None:
+                continue
+            flag_level = _message_flag_level(eval_by_idx.get(str(message_index)))
+            if flag_level in {"Red", "Yellow", "Green"}:
+                row[flag_level] += 1
+            if flag_level in {"Red", "Yellow"} and conversation_id:
+                row["_flagged_conversations"].add(conversation_id)
+
+    rows: list[dict[str, Any]] = []
+    total_red = total_yellow = total_green = total_appearances = 0
+    all_appeared_conversations: set[str] = set()
+    all_flagged_conversations: set[str] = set()
+    for l2_name, row in rows_by_name.items():
+        red = int(row["Red"])
+        yellow = int(row["Yellow"])
+        green = int(row["Green"])
+        flagged = red + yellow
+        appearances = int(row["Total appearances"])
+        appeared_conversations = row["_appeared_conversations"]
+        flagged_conversations = row["_flagged_conversations"]
+        total_red += red
+        total_yellow += yellow
+        total_green += green
+        total_appearances += appearances
+        all_appeared_conversations.update(appeared_conversations)
+        all_flagged_conversations.update(flagged_conversations)
+        rows.append(
+            {
+                "Agent name": l2_name,
+                "DB spelling found": ", ".join(sorted(row["DB spelling found"])) or "Not found",
+                "Red": red,
+                "Yellow": yellow,
+                "Green": green,
+                "Flagged (red + yellow)": flagged,
+                "Total appearances": appearances,
+                "Flagged appearance rate": f"{_pct(flagged, appearances):.1f}%",
+                "Distinct conversations flagged": len(flagged_conversations),
+                "Distinct conversations appeared": len(appeared_conversations),
+                "Distinct conversation flagged rate": (
+                    f"{_pct(len(flagged_conversations), len(appeared_conversations)):.1f}%"
+                ),
+            }
+        )
+
+    total_flagged = total_red + total_yellow
+    total_row = {
+        "Agent name": "Total",
+        "DB spelling found": f"{sum(1 for row in rows if row['Total appearances']):,} of {len(L2_AGENT_ALIASES):,} L2 agents found",
+        "Red": total_red,
+        "Yellow": total_yellow,
+        "Green": total_green,
+        "Flagged (red + yellow)": total_flagged,
+        "Total appearances": total_appearances,
+        "Flagged appearance rate": f"{_pct(total_flagged, total_appearances):.1f}%",
+        "Distinct conversations flagged": len(all_flagged_conversations),
+        "Distinct conversations appeared": len(all_appeared_conversations),
+        "Distinct conversation flagged rate": (
+            f"{_pct(len(all_flagged_conversations), len(all_appeared_conversations)):.1f}%"
+        ),
+    }
+    return pd.DataFrame([*rows, total_row])
+
+
+def _rag_chunks_for_message(message: dict) -> list[str]:
+    """Return unique retrieved RAG chunk names attached to a transcript message."""
+    chunks: list[str] = []
+
+    def add_chunk(value: Any) -> None:
+        chunk = str(value or "").strip()
+        if chunk and chunk not in chunks:
+            chunks.append(chunk)
+
+    retrievals = message.get("rag_retrievals")
+    if isinstance(retrievals, list):
+        for retrieval in retrievals:
+            if not isinstance(retrieval, dict):
+                continue
+            fetched = retrieval.get("chunks_fetched") or []
+            if isinstance(fetched, (list, tuple, set)):
+                for chunk in fetched:
+                    add_chunk(chunk)
+            else:
+                add_chunk(fetched)
+
+    fetched = message.get("chunks_fetched") or []
+    if isinstance(fetched, (list, tuple, set)):
+        for chunk in fetched:
+            add_chunk(chunk)
+    else:
+        add_chunk(fetched)
+
+    return chunks
+
+
+def _message_flag_stats_by_rag_chunk(conversation_results: list[dict]) -> pd.DataFrame:
+    """Count RAG chunk appearances and red/yellow flagged messages by retrieved chunk."""
+    counts: dict[str, dict[str, int]] = {}
+    appeared_conversation_sets: dict[str, set[str]] = {}
+    flagged_conversation_sets: dict[str, set[str]] = {}
+    all_appeared_chunk_conversations: set[str] = set()
+    all_flagged_chunk_conversations: set[str] = set()
+
+    for conversation_result in conversation_results:
+        conversation_id = _stats_conversation_id(conversation_result)
+        transcript = conversation_result.get("transcript") or []
+        eval_by_idx = _message_results_by_index(
+            conversation_result.get("message_level_results")
+        )
+        for message in transcript:
+            chunks = _rag_chunks_for_message(message)
+            if not chunks:
+                continue
+            message_index = message.get("message_index")
+            flag_level = (
+                _flagged_message_level(eval_by_idx.get(str(message_index)))
+                if message_index is not None
+                else None
+            )
+            is_flagged_standalone = flag_level in {"Red", "Yellow"} and len(chunks) == 1
+            for chunk in chunks:
+                counts.setdefault(
+                    chunk,
+                    {"Red": 0, "Yellow": 0, "Appearances": 0, "Flagged standalone": 0},
+                )
+                counts[chunk]["Appearances"] += 1
+                if conversation_id:
+                    appeared_conversation_sets.setdefault(chunk, set()).add(conversation_id)
+                    all_appeared_chunk_conversations.add(conversation_id)
+                if flag_level not in {"Red", "Yellow"}:
+                    continue
+                counts[chunk][flag_level] += 1
+                if is_flagged_standalone:
+                    counts[chunk]["Flagged standalone"] += 1
+                if conversation_id:
+                    flagged_conversation_sets.setdefault(chunk, set()).add(conversation_id)
+                    all_flagged_chunk_conversations.add(conversation_id)
+
+    rows = []
+    for chunk, chunk_counts in counts.items():
+        red = int(chunk_counts.get("Red") or 0)
+        yellow = int(chunk_counts.get("Yellow") or 0)
+        flagged = red + yellow
+        appearances = int(chunk_counts.get("Appearances") or 0)
+        standalone_flagged = int(chunk_counts.get("Flagged standalone") or 0)
+        distinct_flagged = len(flagged_conversation_sets.get(chunk, set()))
+        distinct_appeared = len(appeared_conversation_sets.get(chunk, set()))
+        rows.append(
+            {
+                "Chunk retrieved": chunk,
+                "Red": red,
+                "Yellow": yellow,
+                "Flagged (red + yellow)": flagged,
+                "Flagged standalone": standalone_flagged,
+                "Total appearances": appearances,
+                "Flagged appearance rate": f"{_pct(flagged, appearances):.1f}%",
+                "Distinct conversations flagged": distinct_flagged,
+                "Distinct conversations appeared": distinct_appeared,
+                "Distinct conversation flagged rate": f"{_pct(distinct_flagged, distinct_appeared):.1f}%",
+            }
+        )
+
+    if not rows:
+        return pd.DataFrame(
+            columns=[
+                "Chunk retrieved",
+                "Red",
+                "Yellow",
+                "Flagged (red + yellow)",
+                "Flagged standalone",
+                "Total appearances",
+                "Flagged appearance rate",
+                "Distinct conversations flagged",
+                "Distinct conversations appeared",
+                "Distinct conversation flagged rate",
+                "Share of flagged chunk hits",
+            ]
+        )
+
+    rows = sorted(
+        rows,
+        key=lambda row: (
+            -int(row["Flagged (red + yellow)"]),
+            -int(row["Distinct conversations flagged"]),
+            -int(row["Red"]),
+            str(row["Chunk retrieved"]),
+        ),
+    )
+    total_flagged_chunk_hits = sum(int(row["Flagged (red + yellow)"]) for row in rows)
+    total_chunk_appearances = sum(int(row["Total appearances"]) for row in rows)
+    total_distinct_flagged = len(all_flagged_chunk_conversations)
+    total_distinct_appeared = len(all_appeared_chunk_conversations)
+    for row in rows:
+        row["Share of flagged chunk hits"] = (
+            f"{_pct(int(row['Flagged (red + yellow)']), total_flagged_chunk_hits):.1f}%"
+        )
+    total_row = {
+        "Chunk retrieved": "Total",
+        "Red": sum(int(row["Red"]) for row in rows),
+        "Yellow": sum(int(row["Yellow"]) for row in rows),
+        "Flagged (red + yellow)": total_flagged_chunk_hits,
+        "Flagged standalone": sum(int(row["Flagged standalone"]) for row in rows),
+        "Total appearances": total_chunk_appearances,
+        "Flagged appearance rate": (
+            f"{_pct(total_flagged_chunk_hits, total_chunk_appearances):.1f}%"
+        ),
+        "Distinct conversations flagged": total_distinct_flagged,
+        "Distinct conversations appeared": total_distinct_appeared,
+        "Distinct conversation flagged rate": (
+            f"{_pct(total_distinct_flagged, total_distinct_appeared):.1f}%"
+        ),
+        "Share of flagged chunk hits": f"{_pct(total_flagged_chunk_hits, total_flagged_chunk_hits):.1f}%",
+    }
+    return pd.DataFrame([*rows, total_row])
+
+
+def _sort_flag_stats_with_total(
+    flag_stats_df: pd.DataFrame,
+    *,
+    label_column: str,
+    ascending: bool,
+    primary_column: str = "Flagged (red + yellow)",
+) -> pd.DataFrame:
+    """Sort Stats detail tables while keeping the Total row pinned at the bottom."""
+    if flag_stats_df.empty or primary_column not in flag_stats_df.columns:
+        return flag_stats_df
+
+    label_values = flag_stats_df[label_column].astype(str)
+    total_mask = label_values == "Total"
+    body_df = flag_stats_df.loc[~total_mask].copy()
+    total_df = flag_stats_df.loc[total_mask].copy()
+    if body_df.empty:
+        return flag_stats_df
+
+    sort_columns = [primary_column]
+    sort_ascending = [ascending]
+    for tie_column in ("Distinct conversations flagged", "Red"):
+        if tie_column in body_df.columns:
+            sort_columns.append(tie_column)
+            sort_ascending.append(ascending)
+    sort_columns.append(label_column)
+    sort_ascending.append(True)
+
+    body_df = body_df.sort_values(
+        by=sort_columns,
+        ascending=sort_ascending,
+        kind="mergesort",
+    )
+    return pd.concat([body_df, total_df], ignore_index=True)
+
+
+def _render_message_flag_stats_table(
+    flag_stats_df: pd.DataFrame,
+    *,
+    label_column: str = "Sender origin",
+    max_width_px: int = 1180,
+) -> None:
     """Render message flag stats with the same visual system as the summary table."""
+    if flag_stats_df.empty:
+        st.caption("No matching message flag data.")
+        return
+
     header_bg = "#24272d"
     total_bg = "#202329"
     row_bg = "#17191d"
@@ -5519,6 +6512,8 @@ def _render_message_flag_stats_table(flag_stats_df: pd.DataFrame) -> None:
     muted = _DASH_COLORS["muted"]
     accent_by_sender = {
         "Agent": _DASH_COLORS["handled"],
+        "Agent - L2": _DASH_COLORS["handled"],
+        "Agent - Other": _DASH_COLORS["dim"],
         "Bot": _DASH_COLORS["calm"],
         "Broadcast": _DASH_COLORS["many"],
         "Total": _DASH_COLORS["calm"],
@@ -5531,15 +6526,15 @@ def _render_message_flag_stats_table(flag_stats_df: pd.DataFrame) -> None:
 
     body = []
     for row in flag_stats_df.to_dict(orient="records"):
-        sender = str(row["Sender origin"])
-        is_total = sender == "Total"
+        label = str(row[label_column])
+        is_total = label == "Total"
         bg = total_bg if is_total else row_bg
         weight = "700" if is_total else "500"
-        accent = accent_by_sender.get(sender, _DASH_COLORS["dim"])
+        accent = accent_by_sender.get(label, _DASH_COLORS["calm"] if is_total else _DASH_COLORS["dim"])
 
         cells = [
             (
-                sender,
+                label,
                 text,
                 f"border-left:4px solid {accent};",
             )
@@ -5548,7 +6543,7 @@ def _render_message_flag_stats_table(flag_stats_df: pd.DataFrame) -> None:
             value = row[column]
             if column in {"Red", "Yellow", "Green"}:
                 color = value_colors[column]
-            elif column in {"Flagged rate", "Share of all flagged"}:
+            elif "rate" in str(column).lower() or str(column).startswith("Share of"):
                 color = accent
             else:
                 color = muted if not is_total else text
@@ -5574,7 +6569,7 @@ def _render_message_flag_stats_table(flag_stats_df: pd.DataFrame) -> None:
         f"""
         <style>
         .message-flag-stats-table {{
-            width: min(1180px, 100%);
+            width: min({int(max_width_px)}px, 100%);
             border-collapse: separate;
             border-spacing: 0;
             color: {text};
@@ -5596,6 +6591,7 @@ def _render_message_flag_stats_table(flag_stats_df: pd.DataFrame) -> None:
         }}
         .message-flag-stats-table td:first-child {{
             min-width: 145px;
+            white-space: normal !important;
         }}
         </style>
         <table class="message-flag-stats-table">
@@ -5622,12 +6618,23 @@ def tab_stats() -> None:
               means more work or follow-up was still needed. **Totally unresolved** means the
               request was not solved.
             - The message table separates replies from a human **Agent**, an automated **Bot**,
-              and a system **Broadcast**.
+              and a system **Broadcast**. Agent messages are subdivided into **Agent - L2** and
+              **Agent - Other**.
             - **Red** messages need attention, **Yellow** messages may need improvement, and
               **Green** messages were assessed as acceptable.
             - **Flagged rate** is the share of that sender's evaluated messages that were red or
               yellow. **Share of all flagged** shows how much that sender contributed to all red
               and yellow messages.
+            - **Flagged messages by retrieved chunk** shows which resolver knowledge chunks appeared
+              on bot messages that were flagged red or yellow, including how many distinct journeys
+              were affected for each chunk. The same appearance-rate logic is shown for chunks.
+            - **L2** is a separate table for the configured L2 agent list. It uses known DB spelling
+              variants where needed and shows how many of those agents appeared in the run.
+            - **Flagged agent messages by agent name** groups human agent messages by the same
+              lower-case agent name, so spelling case does not split the same person into separate
+              rows. **Distinct conversations flagged** shows how many journeys had at least one
+              red or yellow message for that agent. The appearance rates show flagged messages out
+              of all messages/first-level conversations where that agent appeared.
 
             Use these totals to spot patterns, then open **Journey Review** to read the actual
             conversation and check its journey analysis before making a decision.
@@ -5650,6 +6657,92 @@ def tab_stats() -> None:
     )
     _render_message_flag_stats_table(flag_stats_df)
 
+    chunk_flag_stats_df = _message_flag_stats_by_rag_chunk(
+        st.session_state.run_results.conversation_results
+    )
+    agent_flag_stats_df = _message_flag_stats_by_agent_name(
+        st.session_state.run_results.conversation_results
+    )
+    l2_flag_stats_df = _message_flag_stats_for_l2_agents(
+        st.session_state.run_results.conversation_results
+    )
+    with st.expander("Flagged bot messages by retrieved RAG chunk", expanded=False):
+        st.caption(
+            "Counts red and yellow flagged messages for each retrieved chunk. The appearance rate is "
+            "flagged chunk hits ÷ all chunk appearances; the distinct rate is flagged journeys ÷ "
+            "journeys where that chunk appeared."
+        )
+        chunk_sort_order = st.selectbox(
+            "Sort order",
+            ["Descending", "Ascending"],
+            key="stats_chunk_flag_sort_order",
+        )
+        chunk_flag_stats_df = _sort_flag_stats_with_total(
+            chunk_flag_stats_df,
+            label_column="Chunk retrieved",
+            ascending=chunk_sort_order == "Ascending",
+        )
+        _render_message_flag_stats_table(
+            chunk_flag_stats_df,
+            label_column="Chunk retrieved",
+            max_width_px=1480,
+        )
+
+    with st.expander("L2", expanded=False):
+        l2_total = l2_flag_stats_df[l2_flag_stats_df["Agent name"].astype(str) == "Total"]
+        l2_body = l2_flag_stats_df[l2_flag_stats_df["Agent name"].astype(str) != "Total"]
+        l2_found_count = int((pd.to_numeric(l2_body["Total appearances"], errors="coerce").fillna(0) > 0).sum())
+        l2_total_row = l2_total.iloc[0].to_dict() if not l2_total.empty else {}
+        st.caption(
+            "Configured L2 agent list, including known DB spelling variants. "
+            "Counts use the same red/yellow/green rules as Journey Review."
+        )
+        metric_row(
+            [
+                ("L2 agents", f"{len(L2_AGENT_ALIASES):,}", None),
+                ("Found in run", f"{l2_found_count:,}", None),
+                ("Shown messages", f"{int(l2_total_row.get('Total appearances') or 0):,}", None),
+                ("Total flagged", f"{int(l2_total_row.get('Flagged (red + yellow)') or 0):,}", None),
+            ]
+        )
+        l2_sort_order = st.selectbox(
+            "Sort order",
+            ["Descending", "Ascending"],
+            key="stats_l2_flag_sort_order",
+        )
+        l2_flag_stats_df = _sort_flag_stats_with_total(
+            l2_flag_stats_df,
+            label_column="Agent name",
+            ascending=l2_sort_order == "Ascending",
+        )
+        _render_message_flag_stats_table(
+            l2_flag_stats_df,
+            label_column="Agent name",
+            max_width_px=1580,
+        )
+
+    with st.expander("Flagged agent messages by agent name", expanded=False):
+        st.caption(
+            "Groups human agent messages by lower-case agent name. The appearance rate is flagged "
+            "messages ÷ all messages by that agent; the distinct rate is flagged journeys ÷ journeys "
+            "where that agent appeared."
+        )
+        agent_sort_order = st.selectbox(
+            "Sort order",
+            ["Descending", "Ascending"],
+            key="stats_agent_flag_sort_order",
+        )
+        agent_flag_stats_df = _sort_flag_stats_with_total(
+            agent_flag_stats_df,
+            label_column="Agent name",
+            ascending=agent_sort_order == "Ascending",
+        )
+        _render_message_flag_stats_table(
+            agent_flag_stats_df,
+            label_column="Agent name",
+            max_width_px=1480,
+        )
+
     stats_df = pd.DataFrame(
         [
             {k: v for k, v in row.items() if not k.startswith("_")}
@@ -5666,6 +6759,24 @@ def tab_stats() -> None:
         "Download message flag stats CSV",
         data=flag_stats_df.to_csv(index=False).encode("utf-8-sig"),
         file_name="cx_message_flag_stats.csv",
+        mime="text/csv",
+    )
+    st.download_button(
+        "Download L2 flag stats CSV",
+        data=l2_flag_stats_df.to_csv(index=False).encode("utf-8-sig"),
+        file_name="cx_l2_flag_stats.csv",
+        mime="text/csv",
+    )
+    st.download_button(
+        "Download agent flag stats CSV",
+        data=agent_flag_stats_df.to_csv(index=False).encode("utf-8-sig"),
+        file_name="cx_agent_flag_stats.csv",
+        mime="text/csv",
+    )
+    st.download_button(
+        "Download chunk flag stats CSV",
+        data=chunk_flag_stats_df.to_csv(index=False).encode("utf-8-sig"),
+        file_name="cx_chunk_flag_stats.csv",
         mime="text/csv",
     )
 
@@ -6271,7 +7382,7 @@ def _message_results_by_index(message_results: list[dict] | None) -> dict[str, d
 
 def _sender_flag_levels_for_journey(conversation_result: dict) -> dict[str, set[str]]:
     """Collect the message flag colors present for each supported sender type."""
-    levels = {kind: set() for kind in ("Agent", "Bot", "Broadcast")}
+    levels = {kind: set() for kind in ("Agent", "L2", "Bot", "Broadcast")}
     transcript = conversation_result.get("transcript") or []
     eval_by_idx = _message_results_by_index(conversation_result.get("message_level_results"))
     for message in transcript:
@@ -6283,7 +7394,38 @@ def _sender_flag_levels_for_journey(conversation_result: dict) -> dict[str, set[
         flag_level = _message_flag_level(result)
         if sender_type and flag_level:
             levels[sender_type].add(flag_level)
+            if sender_type == "Agent" and _is_l2_agent_message(message):
+                levels["L2"].add(flag_level)
     return levels
+
+
+def _chunk_flag_levels_for_journey(conversation_result: dict) -> dict[str, set[str]]:
+    """Collect red/yellow flagged message colors present for each retrieved RAG chunk."""
+    levels: dict[str, set[str]] = {}
+    transcript = conversation_result.get("transcript") or []
+    eval_by_idx = _message_results_by_index(conversation_result.get("message_level_results"))
+    for message in transcript:
+        chunks = _rag_chunks_for_message(message)
+        if not chunks:
+            continue
+        message_index = message.get("message_index")
+        if message_index is None:
+            continue
+        flag_level = _flagged_message_level(eval_by_idx.get(str(message_index)))
+        if flag_level not in {"Red", "Yellow"}:
+            continue
+        for chunk in chunks:
+            levels.setdefault(chunk, set()).add(flag_level)
+    return levels
+
+
+def _rag_chunk_options_for_results(conversation_results: list[dict]) -> list[str]:
+    """Return sorted unique RAG chunks found in loaded journey transcripts."""
+    chunks: set[str] = set()
+    for conversation_result in conversation_results or []:
+        for message in conversation_result.get("transcript") or []:
+            chunks.update(_rag_chunks_for_message(message))
+    return sorted(chunks, key=lambda value: value.lower())
 
 
 def _filter_conversations_by_sender_flags(
@@ -6304,7 +7446,9 @@ def _filter_conversations_by_sender_flags(
     for conversation_result in conversation_results:
         levels = _sender_flag_levels_for_journey(conversation_result)
         if all(
-            flag_level in levels.get(sender_type, set())
+            bool(levels.get(sender_type, set()))
+            if flag_level == "__ANY__"
+            else flag_level in levels.get(sender_type, set())
             for sender_type, flag_level in active_filters.items()
         ):
             matching_ids.add(str(conversation_result.get("conversation_id") or ""))
@@ -6312,17 +7456,62 @@ def _filter_conversations_by_sender_flags(
     return conv_df[conv_df["conversation_id"].astype(str).isin(matching_ids)]
 
 
-def _render_sender_flag_filters() -> dict[str, str | None]:
-    """Render independent Agent/Bot/Broadcast message flag filters."""
+def _filter_conversations_by_chunk_flag(
+    conv_df: pd.DataFrame,
+    conversation_results: list[dict],
+    chunk_filter: dict[str, str | None],
+) -> pd.DataFrame:
+    """Keep journeys containing the requested chunk and optional red/yellow severity."""
+    selected_chunk = str(chunk_filter.get("chunk") or "").strip()
+    selected_flag = str(chunk_filter.get("flag_level") or "").strip()
+    if not selected_chunk or conv_df.empty or "conversation_id" not in conv_df.columns:
+        return conv_df
+
+    matching_ids: set[str] = set()
+    for conversation_result in conversation_results:
+        chunk_levels = _chunk_flag_levels_for_journey(conversation_result)
+        levels = chunk_levels.get(selected_chunk, set())
+        matched = selected_flag in levels if selected_flag else bool(levels)
+        if matched:
+            matching_ids.add(str(conversation_result.get("conversation_id") or ""))
+
+    return conv_df[conv_df["conversation_id"].astype(str).isin(matching_ids)]
+
+
+def _render_sender_flag_filters(
+    conversation_results: list[dict],
+) -> tuple[dict[str, str | None], dict[str, str | None]]:
+    """Render Agent/Bot/Broadcast and RAG chunk message flag filters."""
     st.markdown("**Message flag filters**")
     st.caption(
-        "Show journeys containing the selected flag for each sender type. "
+        "Show journeys containing the selected flag for each sender type or retrieved chunk. "
         "When several filters are selected, a journey must match all of them."
     )
     options = ["All (no filter)", "Red", "Yellow", "Green"]
     filters: dict[str, str | None] = {}
-    columns = st.columns(3)
-    for column, sender_type in zip(columns, ("Agent", "Bot", "Broadcast")):
+    columns = st.columns([1, 1, 1, 1, 1.45, 1])
+    with columns[0]:
+        agent_scope = st.selectbox(
+            "Agent scope",
+            ["No filter", "All agents", "L2"],
+            index=0,
+            key="review_agent_scope_filter",
+            help="No filter ignores agents. All agents matches any agent. L2 matches only the configured L2 agent list.",
+        )
+    with columns[1]:
+        agent_severity = st.selectbox(
+            "Agent severity",
+            ["Any severity", "Red", "Yellow", "Green"],
+            index=0,
+            key="review_agent_scope_severity_filter",
+            disabled=agent_scope == "No filter",
+        )
+    if agent_scope != "No filter":
+        filters["L2" if agent_scope == "L2" else "Agent"] = (
+            "__ANY__" if agent_severity == "Any severity" else agent_severity
+        )
+
+    for column, sender_type in zip(columns[2:4], ("Bot", "Broadcast")):
         with column:
             selected = st.selectbox(
                 f"{sender_type} messages",
@@ -6331,7 +7520,30 @@ def _render_sender_flag_filters() -> dict[str, str | None]:
                 key=f"review_{sender_type.lower()}_flag_filter",
             )
         filters[sender_type] = None if selected == options[0] else selected
-    return filters
+
+    chunk_options = _rag_chunk_options_for_results(conversation_results)
+    with columns[4]:
+        selected_chunk = st.selectbox(
+            "RAG chunk",
+            ["All chunks"] + chunk_options if chunk_options else ["No chunks found"],
+            index=0,
+            key="review_chunk_flag_filter",
+            disabled=not chunk_options,
+        )
+    with columns[5]:
+        selected_chunk_severity = st.selectbox(
+            "Chunk severity",
+            ["Any flagged", "Red", "Yellow"],
+            index=0,
+            key="review_chunk_flag_severity_filter",
+            disabled=not chunk_options or selected_chunk in {"All chunks", "No chunks found"},
+        )
+
+    chunk_filter = {
+        "chunk": None if selected_chunk in {"All chunks", "No chunks found"} else selected_chunk,
+        "flag_level": None if selected_chunk_severity == "Any flagged" else selected_chunk_severity,
+    }
+    return filters, chunk_filter
 
 
 def _flagged_messages_by_sender(transcript: list[dict], message_results: list[dict]) -> list[dict[str, Any]]:
@@ -6345,36 +7557,166 @@ def _flagged_messages_by_sender(transcript: list[dict], message_results: list[di
         if not flag_level or not sender_type:
             continue
         parsed = result.get("parsed_json") or {}
+        chunks = _rag_chunks_for_message(message)
+        is_l2_agent = sender_type == "Agent" and _is_l2_agent_message(message)
         rows.append(
             {
                 "Type": sender_type,
+                "Agent subdivision": "L2" if is_l2_agent else ("Other agent" if sender_type == "Agent" else ""),
                 "Flag": flag_level,
                 "Message #": msg_index,
                 "Source conversation": message.get("source_conversation_id") or result.get("source_conversation_id") or "",
+                "Chunks": ", ".join(chunks),
                 "Effect": humanize_label(parsed.get("message_level_effect")),
                 "Issue type": humanize_label(parsed.get("issue_type")),
                 "Frustration": humanize_label(parsed.get("frustration_level_after_message")),
                 "Message": message.get("message_text") or result.get("target_message_text") or "",
+                "_chunks": chunks,
+                "_is_l2": is_l2_agent,
             }
         )
     return rows
 
 
+def _journey_chunk_usage_rows(transcript: list[dict], message_results: list[dict]) -> list[dict[str, Any]]:
+    """Summarize all RAG chunks used across a selected journey."""
+    eval_by_idx = _message_results_by_index(message_results)
+    counts: dict[str, dict[str, Any]] = {}
+    for message in transcript or []:
+        chunks = _rag_chunks_for_message(message)
+        if not chunks:
+            continue
+        msg_index = message.get("message_index")
+        flag_level = (
+            _message_flag_level(eval_by_idx.get(str(msg_index)))
+            if msg_index is not None
+            else None
+        )
+        is_flagged_standalone = flag_level in {"Red", "Yellow"} and len(chunks) == 1
+        for chunk in chunks:
+            row = counts.setdefault(
+                chunk,
+                {
+                    "Chunk": chunk,
+                    "Appearances": 0,
+                    "Red": 0,
+                    "Yellow": 0,
+                    "Green": 0,
+                    "Flagged standalone": 0,
+                    "_message_numbers": [],
+                },
+            )
+            row["Appearances"] += 1
+            if flag_level in {"Red", "Yellow", "Green"}:
+                row[flag_level] += 1
+            if is_flagged_standalone:
+                row["Flagged standalone"] += 1
+            if msg_index is not None:
+                row["_message_numbers"].append(msg_index)
+
+    rows = []
+    for row in counts.values():
+        message_numbers = row.get("_message_numbers") or []
+        rows.append(
+            {
+                "Chunk": row["Chunk"],
+                "Appearances": int(row["Appearances"]),
+                "Red": int(row["Red"]),
+                "Yellow": int(row["Yellow"]),
+                "Green": int(row["Green"]),
+                "Flagged standalone": int(row["Flagged standalone"]),
+                "Messages": ", ".join(str(value) for value in message_numbers[:12])
+                + ("..." if len(message_numbers) > 12 else ""),
+            }
+        )
+    return sorted(
+        rows,
+        key=lambda row: (-int(row["Appearances"]), -int(row["Red"]), str(row["Chunk"]).lower()),
+    )
+
+
+def _render_journey_chunk_overview(transcript: list[dict], message_results: list[dict]) -> None:
+    """Render a compact selected-journey RAG chunk summary near the top of review."""
+    rows = _journey_chunk_usage_rows(transcript, message_results)
+    st.markdown("#### Chunks used in this journey")
+    if not rows:
+        st.caption("No resolver chunks were recorded for this journey.")
+        return
+
+    total_appearances = sum(int(row["Appearances"]) for row in rows)
+    st.caption(
+        f"{len(rows):,} unique chunk{'s' if len(rows) != 1 else ''} · "
+        f"{total_appearances:,} total chunk appearance{'s' if total_appearances != 1 else ''}"
+    )
+    chip_html = []
+    for row in rows[:8]:
+        red = int(row["Red"])
+        yellow = int(row["Yellow"])
+        flag_note = f" · R{red}/Y{yellow}" if red or yellow else ""
+        chip_html.append(
+            "<span class='journey-chunk-chip'>"
+            f"{html_lib.escape(str(row['Chunk']))} "
+            f"<b>{int(row['Appearances']):,}</b>{html_lib.escape(flag_note)}"
+            "</span>"
+        )
+    st.markdown(
+        f"""
+        <style>
+        .journey-chunk-chip {{
+            display: inline-flex;
+            align-items: center;
+            gap: 0.25rem;
+            margin: 0 0.35rem 0.35rem 0;
+            padding: 0.35rem 0.55rem;
+            border: 1px solid {_DASH_COLORS["panel_border"]};
+            border-radius: 999px;
+            background: rgba(148, 163, 184, 0.08);
+            color: {_DASH_COLORS["text"]};
+            font-size: 0.86rem;
+            line-height: 1.2;
+        }}
+        .journey-chunk-chip b {{
+            color: {_DASH_COLORS["calm"]};
+        }}
+        </style>
+        <div>{''.join(chip_html)}</div>
+        """,
+        unsafe_allow_html=True,
+    )
+    if len(rows) > 8:
+        st.caption(f"Showing the top 8 chunks. Open details to see all {len(rows):,}.")
+    with st.expander("View chunk details for this journey", expanded=False):
+        st.dataframe(pd.DataFrame(rows), width="stretch", hide_index=True, height=min(360, 88 + len(rows) * 38))
+
+
 def _render_flagged_message_checker(transcript: list[dict], message_results: list[dict], conversation_id: str) -> None:
     flagged_rows = _flagged_messages_by_sender(transcript, message_results)
     counts = {kind: sum(1 for row in flagged_rows if row["Type"] == kind) for kind in ("Agent", "Bot", "Broadcast")}
+    l2_count = sum(1 for row in flagged_rows if row.get("_is_l2"))
     total = len(flagged_rows)
+    chunk_options = sorted(
+        {
+            chunk
+            for row in flagged_rows
+            for chunk in (row.get("_chunks") or [])
+        },
+        key=lambda value: value.lower(),
+    )
 
     st.markdown("### Flagged message check")
-    st.caption("Check whether flagged evaluated messages came from an agent, bot, or broadcast/system message.")
+    st.caption(
+        "Check whether flagged evaluated messages came from an agent, bot, broadcast/system message, "
+        "or a specific retrieved chunk."
+    )
 
     state_key = f"review_flagged_sender_{conversation_id}"
     if state_key not in st.session_state:
         st.session_state[state_key] = "All"
-    button_cols = st.columns(4)
+    button_cols = st.columns([1, 1, 1, 1, 1, 1.55, 1.05])
     choices = [
         ("All", total),
         ("Agent", counts["Agent"]),
+        ("L2", l2_count),
         ("Bot", counts["Bot"]),
         ("Broadcast", counts["Broadcast"]),
     ]
@@ -6384,8 +7726,36 @@ def _render_flagged_message_checker(transcript: list[dict], message_results: lis
             if st.button(f"{choice} ({count})", key=f"review_flagged_{choice}_{conversation_id}", type=button_type, use_container_width=True):
                 st.session_state[state_key] = choice
 
+    with button_cols[5]:
+        selected_chunk = st.selectbox(
+            "Chunk",
+            ["All chunks"] + chunk_options if chunk_options else ["No chunks found"],
+            index=0,
+            key=f"review_flagged_chunk_{conversation_id}",
+            disabled=not chunk_options,
+        )
+    with button_cols[6]:
+        selected_severity = st.selectbox(
+            "Severity",
+            ["All", "Red", "Yellow"],
+            index=0,
+            key=f"review_flagged_severity_{conversation_id}",
+        )
+
     selected = st.session_state[state_key]
-    shown = flagged_rows if selected == "All" else [row for row in flagged_rows if row["Type"] == selected]
+    if selected == "All":
+        shown = flagged_rows
+    elif selected == "L2":
+        shown = [row for row in flagged_rows if row.get("_is_l2")]
+    else:
+        shown = [row for row in flagged_rows if row["Type"] == selected]
+    if selected_chunk not in {"All chunks", "No chunks found"}:
+        shown = [
+            row for row in shown
+            if selected_chunk in set(row.get("_chunks") or [])
+        ]
+    if selected_severity != "All":
+        shown = [row for row in shown if row.get("Flag") == selected_severity]
     severity_counts = {
         "Red": sum(1 for row in shown if row.get("Flag") == "Red"),
         "Yellow": sum(1 for row in shown if row.get("Flag") == "Yellow"),
@@ -6394,7 +7764,7 @@ def _render_flagged_message_checker(transcript: list[dict], message_results: lis
         st.success("No evaluated agent, bot, or broadcast messages were flagged for this journey.")
         return
     if not shown:
-        st.info(f"No {selected.lower()} messages were flagged for this journey.")
+        st.info("No flagged messages match the selected type, chunk, and severity filters for this journey.")
         return
 
     metric_row(
@@ -6403,7 +7773,11 @@ def _render_flagged_message_checker(transcript: list[dict], message_results: lis
             ("Flagged yellow", f"{severity_counts['Yellow']:,}", None),
         ]
     )
-    st.dataframe(pd.DataFrame(shown), use_container_width=True, hide_index=True, height=min(360, 88 + len(shown) * 54))
+    display_rows = [
+        {key: value for key, value in row.items() if not str(key).startswith("_")}
+        for row in shown
+    ]
+    st.dataframe(pd.DataFrame(display_rows), use_container_width=True, hide_index=True, height=min(360, 88 + len(shown) * 54))
 
 
 def tab_review() -> None:
@@ -6438,12 +7812,14 @@ def tab_review() -> None:
             3. **Broadcast-only issue journeys** are hidden by default. Select
                **Only broadcast-only issue journeys** to show exclusively the journeys where
                the only red issue came from a system broadcast.
-            4. The Agent, Bot, and Broadcast message filters look for journeys containing at
-               least one evaluated message with the selected color:
-               **Red** needs attention, **Yellow** may need improvement, and **Green** was
-               assessed as acceptable. **All (no filter)** places no restriction on that sender.
-               If you select colors for several sender types, the journey must match every
-               selected sender filter.
+            4. The message filters look for journeys containing the selected type of evaluated
+               message. **Agent scope** can be **No filter**, **All agents**, or **L2**. **All agents**
+               includes every human agent; **L2** only includes the configured L2 agent list.
+               **Red** needs attention, **Yellow** may need improvement, and **Green** was assessed
+               as acceptable. If you select several message filters, the journey must match every
+               selected filter. The **RAG chunk** filter works the same way, but only for red/yellow
+               flagged bot messages that used the selected chunk. Use **Chunk severity** to choose
+               red only, yellow only, or any flagged severity.
             5. Use search to find a customer or conversation directly. Use **Worst score first**
                to begin with the journeys that may need the most attention.
             6. Turn on **Show journey analysis and review metrics**. Check the journey outcome,
@@ -6469,11 +7845,16 @@ def tab_review() -> None:
         include_journey_starter=True,
     )
     filtered_df = _apply_conversation_filters_fresh(conv_df, review_filters)
-    sender_flag_filters = _render_sender_flag_filters()
+    sender_flag_filters, chunk_flag_filter = _render_sender_flag_filters(rr.conversation_results)
     filtered_df = _filter_conversations_by_sender_flags(
         filtered_df,
         rr.conversation_results,
         sender_flag_filters,
+    )
+    filtered_df = _filter_conversations_by_chunk_flag(
+        filtered_df,
+        rr.conversation_results,
+        chunk_flag_filter,
     )
 
     search = st.text_input(
@@ -6694,14 +8075,15 @@ def tab_review() -> None:
         target_cr,
         show_details=show_review_details,
     )
+    transcript = target_cr.get("transcript") or []
+    msgs = target_cr.get("message_level_results") or []
+    _render_journey_chunk_overview(transcript, msgs)
 
     st.markdown("### Full Customer Journey")
     st.caption(
         "The full appended customer journey is shown below. Where available, assistant replies also include a short quality check underneath."
     )
     st.markdown("<div id='review-conversation-start'></div>", unsafe_allow_html=True)
-    transcript = target_cr.get("transcript") or []
-    msgs = target_cr.get("message_level_results") or []
     if show_review_details:
         _render_flagged_message_checker(transcript, msgs, target_id)
     _, chat_col, _ = st.columns([0.15, 9.7, 0.15])

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import html
+import re
 from typing import Any
 
 import pandas as pd
@@ -12,6 +13,24 @@ from aggregation import humanize_label
 
 
 # ----- Color hints for severity / sentiment -----
+
+RAG_CONTEXT_MARKER = "RAG context used for this bot response:"
+_RAG_CONTEXT_FOOTER_RE = re.compile(
+    rf"\s*{re.escape(RAG_CONTEXT_MARKER)}\s*\n?\s*\{{.*?\}}\s*$",
+    re.DOTALL,
+)
+
+
+def _strip_inline_rag_context(text: Any) -> str:
+    if text is None:
+        return ""
+    cleaned = str(text)
+    if RAG_CONTEXT_MARKER not in cleaned:
+        return cleaned
+    stripped = _RAG_CONTEXT_FOOTER_RE.sub("", cleaned).rstrip()
+    if RAG_CONTEXT_MARKER in stripped:
+        stripped = stripped.split(RAG_CONTEXT_MARKER, 1)[0].rstrip()
+    return stripped
 
 _FRUSTRATION_COLORS = {
     "none": "#16a34a",
@@ -283,7 +302,7 @@ def render_transcript(messages: list[dict]) -> None:
         klass = role if role in ("customer", "agent") else "unknown"
         idx = m.get("message_index")
         when = m.get("message_time") or ""
-        text = html.escape(str(m.get("message_text", "")))
+        text = html.escape(_strip_inline_rag_context(m.get("message_text", "")))
         meta_bits = []
         if idx is not None:
             meta_bits.append(f"#{idx}")
@@ -317,7 +336,7 @@ def _bubble_html(msg: dict, display_role: str, *, align: str, accent: str | None
     role = (msg.get("sender_role") or "unknown").lower()
     idx = msg.get("message_index")
     when = str(msg.get("message_time") or "")
-    text = str(msg.get("message_text", "") or "")
+    text = _strip_inline_rag_context(msg.get("message_text", "") or "")
     palette = {
         "customer": {
             "bg": "#1e293b",
@@ -419,6 +438,61 @@ def _render_message_run_details(message_result: dict) -> None:
 
     with st.expander("Message run JSON", expanded=False):
         st.json(message_result, expanded=False)
+
+
+def _listish(value: Any) -> list[Any]:
+    if value is None:
+        return []
+    if isinstance(value, list):
+        return value
+    if isinstance(value, tuple):
+        return list(value)
+    return [value]
+
+
+def _message_has_rag_context(msg: dict) -> bool:
+    return bool(
+        msg.get("has_rag_retrieval")
+        or msg.get("rag_retrievals")
+        or msg.get("chunks_fetched")
+        or msg.get("chunk_justification")
+    )
+
+
+def _render_message_rag_context(msg: dict) -> None:
+    """Render resolver RAG chunks and justification for an eligible bot message."""
+    if not _message_has_rag_context(msg):
+        return
+
+    st.markdown("### RAG resolver context")
+    metric_row(
+        [
+            ("Skill", msg.get("message_skill") or "—", None),
+            ("Retrievals", msg.get("rag_retrieval_count", "—"), None),
+            ("Chunk time", msg.get("chunk_time") or "—", None),
+        ]
+    )
+
+    retrievals = [item for item in _listish(msg.get("rag_retrievals")) if isinstance(item, dict)]
+    if retrievals:
+        for i, retrieval in enumerate(retrievals, start=1):
+            chunks = _listish(retrieval.get("chunks_fetched"))
+            chunk_text = ", ".join(str(chunk) for chunk in chunks) if chunks else "None"
+            title = f"Retrieval {i}"
+            retrieval_time = retrieval.get("chunk_time")
+            if retrieval_time:
+                title += f" · {retrieval_time}"
+            st.markdown(f"**{title}**")
+            st.write(f"Chunks fetched: {chunk_text}")
+            st.write(retrieval.get("justification") or "_No justification provided._")
+        return
+
+    chunks = _listish(msg.get("chunks_fetched"))
+    chunk_text = ", ".join(str(chunk) for chunk in chunks) if chunks else "None"
+    st.markdown("**Chunks fetched**")
+    st.write(chunk_text)
+    st.markdown("**Justification**")
+    st.write(msg.get("chunk_justification") or "_No justification provided._")
 
 
 def render_inline_evaluation(message_result: dict) -> None:
@@ -587,9 +661,10 @@ def render_conversation_transcript_with_evals(
             align = "left"
 
         eval_record = eval_by_idx.get(idx)
+        has_rag_context = _message_has_rag_context(msg)
         severity = _message_severity(eval_record)
         style = _SEVERITY_STYLES.get(severity, _SEVERITY_STYLES["gray"])
-        accent = style["border"] if eval_record else None
+        accent = style["border"] if eval_record else "#8b5cf6" if has_rag_context else None
 
         bubble_col, review_col = st.columns([10.5, 0.5], vertical_alignment="center")
 
@@ -597,10 +672,15 @@ def render_conversation_transcript_with_evals(
             st.markdown(_bubble_html(msg, display_role, align=align, accent=accent), unsafe_allow_html=True)
 
         with review_col:
-            if eval_record:
+            if eval_record or has_rag_context:
                 with st.popover("i", use_container_width=True):
-                    st.markdown(_severity_badge(severity), unsafe_allow_html=True)
-                    _render_message_run_details(eval_record)
+                    if eval_record:
+                        st.markdown(_severity_badge(severity), unsafe_allow_html=True)
+                        _render_message_run_details(eval_record)
+                    if has_rag_context:
+                        if eval_record:
+                            st.divider()
+                        _render_message_rag_context(msg)
             else:
                 st.markdown(
                     "<div style=\"width:1px;height:1px;\"></div>",
@@ -612,7 +692,7 @@ def render_message_evaluation_panel(message_result: dict) -> None:
     """Render a single message-level evaluation panel inside an expander or container."""
     pj = message_result.get("parsed_json") or {}
     status = message_result.get("parse_status", "ok")
-    text = message_result.get("target_message_text", "")
+    text = _strip_inline_rag_context(message_result.get("target_message_text", ""))
     idx = message_result.get("message_index")
 
     badges = []
