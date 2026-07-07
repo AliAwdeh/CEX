@@ -94,6 +94,7 @@ DEFAULT_EVALUATION_SETTINGS = {
     "conversation_selected_model": DEFAULT_SELECTED_MODEL,
     "message_thinking_effort": "default",
     "conversation_thinking_effort": "default",
+    "use_flex_service_tier": False,
     "temperature": 0.1,
     "top_p": 1.0,
     "max_tokens": 100000,
@@ -272,6 +273,7 @@ def _init_state() -> None:
         "conversation_selected_model": DEFAULT_EVALUATION_SETTINGS["conversation_selected_model"],
         "message_thinking_effort": DEFAULT_EVALUATION_SETTINGS["message_thinking_effort"],
         "conversation_thinking_effort": DEFAULT_EVALUATION_SETTINGS["conversation_thinking_effort"],
+        "use_flex_service_tier": DEFAULT_EVALUATION_SETTINGS["use_flex_service_tier"],
         "temperature": DEFAULT_EVALUATION_SETTINGS["temperature"],
         "top_p": DEFAULT_EVALUATION_SETTINGS["top_p"],
         "max_tokens": DEFAULT_EVALUATION_SETTINGS["max_tokens"],
@@ -979,6 +981,7 @@ def _build_api_config() -> APIConfig:
         base_url=st.session_state.api_base_url,
         api_key=st.session_state.api_key,
         model=st.session_state.selected_model,
+        service_tier="flex" if st.session_state.use_flex_service_tier else None,
         thinking_effort=str(st.session_state.message_thinking_effort),
         temperature=float(st.session_state.temperature),
         top_p=float(st.session_state.top_p),
@@ -998,6 +1001,7 @@ def _build_conversation_api_config() -> APIConfig:
             st.session_state.get("conversation_selected_model")
             or st.session_state.selected_model
         ),
+        service_tier=api.service_tier,
         thinking_effort=str(st.session_state.conversation_thinking_effort),
         temperature=api.temperature,
         top_p=api.top_p,
@@ -1086,6 +1090,32 @@ def _show_live_run_failure(
     failure_box.error(prefix + "\n\n" + "\n\n---\n\n".join(lines))
 
 
+def _show_live_message_rerun(
+    rerun_box,
+    rerun_events: list[dict],
+    event: dict,
+) -> None:
+    """Show automatic message reruns and whether they recovered."""
+    rerun_events.append(dict(event or {}))
+    visible = rerun_events[-5:]
+    lines: list[str] = []
+    for rerun in visible:
+        recovered = bool(rerun.get("recovered_after_rerun"))
+        outcome = "Recovered successfully" if recovered else "Still failed"
+        errors = [str(value) for value in (rerun.get("rerun_errors") or []) if value]
+        detail = errors[-1] if errors else "The original response could not be parsed."
+        lines.append(
+            f"**{outcome}** — Customer `{rerun.get('conversation_id')}`, "
+            f"message #{rerun.get('message_index')} — "
+            f"{int(rerun.get('automatic_reruns') or 0)} automatic rerun(s)\n\n"
+            f"Initial failure: {detail}"
+        )
+    prefix = f"**{len(rerun_events):,} message evaluation(s) automatically rerun.**"
+    if len(rerun_events) > len(visible):
+        prefix += " Showing the latest 5."
+    rerun_box.warning(prefix + "\n\n" + "\n\n---\n\n".join(lines))
+
+
 def _normalize_conversation_result_for_display(cr: dict) -> dict:
     """Apply current conversation schema defaults to older saved result JSON."""
     parsed = cr.get("parsed_json") or cr.get("evaluation_output")
@@ -1168,15 +1198,55 @@ def _render_last_run_summary() -> None:
     if not _has_results():
         return
     rr = st.session_state.run_results
+    rerun_rows: list[dict] = []
+    for result in rr.message_level_results:
+        debug = result.get("debug") or {}
+        automatic_reruns = int(
+            result.get("automatic_reruns")
+            or debug.get("automatic_reruns")
+            or 0
+        )
+        if automatic_reruns <= 0:
+            continue
+        history = debug.get("evaluation_attempt_history") or []
+        rerun_rows.append(
+            {
+                "customer": result.get("conversation_id") or result.get("thread_id"),
+                "message_index": result.get("message_index"),
+                "automatic_reruns": automatic_reruns,
+                "outcome": (
+                    "recovered"
+                    if result.get("recovered_after_rerun")
+                    or debug.get("recovered_after_rerun")
+                    else "failed"
+                ),
+                "initial_failure": next(
+                    (
+                        attempt.get("error")
+                        for attempt in history
+                        if isinstance(attempt, dict) and attempt.get("error")
+                    ),
+                    "",
+                ),
+            }
+        )
+    total_reruns = sum(int(row["automatic_reruns"]) for row in rerun_rows)
+    recovered = sum(1 for row in rerun_rows if row["outcome"] == "recovered")
     st.markdown("### Last run")
     metric_row(
         [
             ("Customer journeys", f"{len(rr.conversation_results):,}", None),
             ("Message calls", f"{len(rr.message_level_results):,}", None),
+            ("Automatic reruns", f"{total_reruns:,}", None),
+            ("Recovered messages", f"{recovered:,}", None),
             ("Errors", f"{len(rr.errors):,}", None),
             ("Duration (s)", f"{(rr.finished_at or 0) - (rr.started_at or 0):.1f}", None),
         ]
     )
+
+    if rerun_rows:
+        with st.expander(f"View {len(rerun_rows):,} automatically rerun messages"):
+            st.dataframe(pd.DataFrame(rerun_rows), use_container_width=True)
 
     if rr.errors:
         with st.expander(f"View {len(rr.errors)} non-fatal errors"):
@@ -1216,6 +1286,7 @@ def _execute_conversation_only_run(
         "model": config.api.model,
         "message_model": config.api.model,
         "conversation_model": config.conversation_api_config().model,
+        "service_tier": config.api.service_tier,
         "message_thinking_effort": config.api.thinking_effort,
         "conversation_thinking_effort": config.conversation_api_config().thinking_effort,
         "temperature": config.api.temperature,
@@ -1540,6 +1611,7 @@ def _execute_full_batch_into_run(
             "journey_count": len(conversation_ids),
             "message_model": config.api.model,
             "conversation_model": config.conversation_api_config().model,
+            "service_tier": config.api.service_tier,
             "message_thinking_effort": config.api.thinking_effort,
             "conversation_thinking_effort": config.conversation_api_config().thinking_effort,
             "message_prompt_id": message_prompt_id,
@@ -1560,9 +1632,13 @@ def _execute_full_batch_into_run(
         "calls": 0,
         "successes": 0,
         "failures": 0,
+        "reruns": 0,
+        "recovered": 0,
     }
     live_failures: list[dict] = []
+    live_reruns: list[dict] = []
     failure_box = st.empty()
+    rerun_box = st.empty()
 
     def on_progress(event: dict) -> None:
         phase = event.get("phase")
@@ -1575,6 +1651,12 @@ def _execute_full_batch_into_run(
             progress_state["calls"] += 1
             key = "successes" if event.get("status") == "ok" else "failures"
             progress_state[key] += 1
+            automatic_reruns = int(event.get("automatic_reruns") or 0)
+            if automatic_reruns:
+                progress_state["reruns"] += automatic_reruns
+                if event.get("recovered_after_rerun"):
+                    progress_state["recovered"] += 1
+                _show_live_message_rerun(rerun_box, live_reruns, event)
         elif phase == "conversation_done":
             progress_state["conversations"] += 1
             progress_state["calls"] += 1
@@ -1590,7 +1672,9 @@ def _execute_full_batch_into_run(
         )
         counter_box.markdown(
             f"**Successes:** {progress_state['successes']} | "
-            f"**Failures:** {progress_state['failures']}"
+            f"**Failures:** {progress_state['failures']} | "
+            f"**Automatic reruns:** {progress_state['reruns']} | "
+            f"**Recovered:** {progress_state['recovered']}"
         )
         st.session_state.progress_log.append(event)
 
@@ -2982,6 +3066,16 @@ def render_sidebar() -> None:
                 "compatible thinking toggle."
             ),
         )
+        st.toggle(
+            "Use Flex service tier",
+            key="use_flex_service_tier",
+            help=(
+                "When enabled, sends service_tier='flex' with message- and "
+                "conversation-level requests. When disabled, the service_tier "
+                "field is omitted completely. Enable only for providers and "
+                "models that support Flex processing."
+            ),
+        )
         st.slider(
             "Temperature",
             min_value=0.0,
@@ -3017,7 +3111,11 @@ def render_sidebar() -> None:
             min_value=0,
             step=1,
             key="retries",
-            help=f"Default: {DEFAULT_EVALUATION_SETTINGS['retries']}",
+            help=(
+                f"Default: {DEFAULT_EVALUATION_SETTINGS['retries']}. "
+                "Also controls automatic message reruns when a model returns "
+                "empty or invalid JSON."
+            ),
         )
         st.session_state.concurrency = min(
             MAX_CONCURRENCY,
@@ -4235,6 +4333,7 @@ def tab_run() -> None:
     counter_box = st.empty()
     current_box = st.empty()
     log_box = st.empty()
+    rerun_box = st.empty()
 
     if run_clicked:
         st.session_state.run_in_progress = True
@@ -4250,6 +4349,7 @@ def tab_run() -> None:
             "model": config.api.model,
             "message_model": config.api.model,
             "conversation_model": config.conversation_api_config().model,
+            "service_tier": config.api.service_tier,
             "message_thinking_effort": config.api.thinking_effort,
             "conversation_thinking_effort": config.conversation_api_config().thinking_effort,
             "temperature": config.api.temperature,
@@ -4285,8 +4385,16 @@ def tab_run() -> None:
 
         total_conv = estimate["conversations"]
         total_msg = estimate["message_level_calls"] + estimate["conversation_level_calls"]
-        progress_state = {"convs_done": 0, "calls_done": 0, "successes": 0, "failures": 0}
+        progress_state = {
+            "convs_done": 0,
+            "calls_done": 0,
+            "successes": 0,
+            "failures": 0,
+            "reruns": 0,
+            "recovered": 0,
+        }
         live_failures: list[dict] = []
+        live_reruns: list[dict] = []
 
         def on_progress(evt: dict) -> None:
             phase = evt.get("phase")
@@ -4302,6 +4410,12 @@ def tab_run() -> None:
                     progress_state["successes"] += 1
                 else:
                     progress_state["failures"] += 1
+                automatic_reruns = int(evt.get("automatic_reruns") or 0)
+                if automatic_reruns:
+                    progress_state["reruns"] += automatic_reruns
+                    if evt.get("recovered_after_rerun"):
+                        progress_state["recovered"] += 1
+                    _show_live_message_rerun(rerun_box, live_reruns, evt)
             elif phase == "conversation_done":
                 progress_state["convs_done"] += 1
                 progress_state["calls_done"] += 1
@@ -4319,7 +4433,10 @@ def tab_run() -> None:
                 text=f"Journeys {progress_state['convs_done']}/{total_conv} • Calls {progress_state['calls_done']}/{total_msg}",
             )
             counter_box.markdown(
-                f"**Successes:** {progress_state['successes']}  |  **Failures:** {progress_state['failures']}"
+                f"**Successes:** {progress_state['successes']} | "
+                f"**Failures:** {progress_state['failures']} | "
+                f"**Automatic reruns:** {progress_state['reruns']} | "
+                f"**Recovered:** {progress_state['recovered']}"
             )
             st.session_state.progress_log.append(evt)
 
@@ -6617,6 +6734,7 @@ def tab_exports() -> None:
         "model": st.session_state.selected_model,
         "message_model": st.session_state.selected_model,
         "conversation_model": st.session_state.get("conversation_selected_model"),
+        "service_tier": "flex" if st.session_state.use_flex_service_tier else None,
         "message_thinking_effort": st.session_state.message_thinking_effort,
         "conversation_thinking_effort": st.session_state.conversation_thinking_effort,
         "temperature": st.session_state.temperature,
@@ -6866,6 +6984,7 @@ def tab_debug() -> None:
         "model": st.session_state.selected_model,
         "message_model": st.session_state.selected_model,
         "conversation_model": st.session_state.get("conversation_selected_model"),
+        "service_tier": "flex" if st.session_state.use_flex_service_tier else None,
         "message_thinking_effort": st.session_state.message_thinking_effort,
         "conversation_thinking_effort": st.session_state.conversation_thinking_effort,
         "temperature": st.session_state.temperature,

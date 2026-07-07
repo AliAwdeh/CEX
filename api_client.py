@@ -22,6 +22,7 @@ class APIConfig:
     base_url: str = DEFAULT_BASE_URL
     api_key: str = ""
     model: str = DEFAULT_MODEL
+    service_tier: str | None = None
     # Cross-provider thinking control. Supported values are:
     # default, disabled, low, medium, high, maximum.
     thinking_effort: str = "default"
@@ -123,6 +124,8 @@ def chat_completion(
                 "max_tokens": int(config.max_tokens),
                 "timeout": float(config.timeout),
             }
+            if config.service_tier:
+                kwargs["service_tier"] = str(config.service_tier)
             kwargs.update(_thinking_request_kwargs(config))
             # Hint compatible endpoints to prefer JSON responses where supported.
             # Some proxies will ignore unknown params, so guard the call.
@@ -149,6 +152,9 @@ def chat_completion(
                 debug["usage"] = usage.model_dump()
             elif isinstance(usage, dict):
                 debug["usage"] = usage
+            response_service_tier = getattr(response, "service_tier", None)
+            if response_service_tier:
+                debug["service_tier"] = response_service_tier
             return content, debug
         except Exception as e:  # noqa: BLE001 — surface any provider error
             last_error = e

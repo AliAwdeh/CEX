@@ -880,32 +880,106 @@ def _eval_message_level(
         "debug": None,
     }
 
-    try:
-        raw, debug = chat_completion(client, api, system_prompt, user_prompt)
-        if save_raw:
-            record["raw_model_response"] = raw
-            record["debug"] = debug
+    max_evaluation_attempts = max(1, int(api.retries) + 1)
+    attempt_history: list[dict[str, Any]] = []
+    final_debug: dict[str, Any] = {}
+
+    for evaluation_attempt in range(1, max_evaluation_attempts + 1):
+        record["raw_model_response"] = None
+        record["parsed_json"] = None
+        record["evaluation_output"] = None
+        record["parse_status"] = "ok"
+        record["error_message"] = None
+        raw = ""
+        call_debug: dict[str, Any] = {}
         try:
-            obj = extract_json_object(raw)
-            validated = validate_message_level_result(obj)
-            validated = _downgrade_low_risk_caregiver_promo(
-                validated,
-                str(target_record.get("message_text") or ""),
-                history_records,
+            raw, call_debug = chat_completion(client, api, system_prompt, user_prompt)
+            if save_raw:
+                record["raw_model_response"] = raw
+            try:
+                obj = extract_json_object(raw)
+                validated = validate_message_level_result(obj)
+                validated = _downgrade_low_risk_caregiver_promo(
+                    validated,
+                    str(target_record.get("message_text") or ""),
+                    history_records,
+                )
+                if not validated.get("message_index") and record["message_index"] is not None:
+                    try:
+                        validated["message_index"] = int(record["message_index"])
+                    except (TypeError, ValueError):
+                        pass
+                record["parsed_json"] = validated
+                record["evaluation_output"] = validated
+            except Exception as je:
+                record["parse_status"] = "failed"
+                record["error_message"] = f"JSON parse failed: {je}"
+        except Exception as e:
+            record["parse_status"] = "api_error"
+            record["error_message"] = f"API call failed: {e}"
+
+        final_debug = dict(call_debug or {})
+        attempt_history.append(
+            {
+                "evaluation_attempt": evaluation_attempt,
+                "status": record["parse_status"],
+                "error": record["error_message"],
+                "api_attempts": call_debug.get("attempts"),
+                "usage": call_debug.get("usage"),
+            }
+        )
+        if record["parse_status"] == "ok":
+            break
+        # API exceptions already use APIConfig.retries inside chat_completion.
+        # Only response/JSON failures need a fresh evaluation request here.
+        if record["parse_status"] == "api_error":
+            break
+
+    automatic_reruns = max(0, len(attempt_history) - 1)
+    recovered_after_rerun = (
+        automatic_reruns > 0 and record.get("parse_status") == "ok"
+    )
+    total_usage = {
+        "prompt_tokens": 0,
+        "completion_tokens": 0,
+        "total_tokens": 0,
+        "completion_tokens_details": {"reasoning_tokens": 0},
+    }
+    has_usage = False
+    for attempt in attempt_history:
+        usage = attempt.get("usage") or {}
+        if not usage:
+            continue
+        has_usage = True
+        for key in ("prompt_tokens", "completion_tokens", "total_tokens"):
+            try:
+                total_usage[key] += int(usage.get(key) or 0)
+            except (TypeError, ValueError):
+                pass
+        details = usage.get("completion_tokens_details") or {}
+        try:
+            total_usage["completion_tokens_details"]["reasoning_tokens"] += int(
+                details.get("reasoning_tokens") or 0
             )
-            if not validated.get("message_index") and record["message_index"] is not None:
-                try:
-                    validated["message_index"] = int(record["message_index"])
-                except (TypeError, ValueError):
-                    pass
-            record["parsed_json"] = validated
-            record["evaluation_output"] = validated
-        except Exception as je:
-            record["parse_status"] = "failed"
-            record["error_message"] = f"JSON parse failed: {je}"
-    except Exception as e:
-        record["parse_status"] = "api_error"
-        record["error_message"] = f"API call failed: {e}"
+        except (TypeError, ValueError):
+            pass
+
+    final_debug.update(
+        {
+            "evaluation_attempts": len(attempt_history),
+            "automatic_reruns": automatic_reruns,
+            "recovered_after_rerun": recovered_after_rerun,
+            "evaluation_attempt_history": attempt_history,
+        }
+    )
+    if has_usage:
+        final_debug["total_usage_including_reruns"] = total_usage
+    record["debug"] = final_debug
+    record["automatic_reruns"] = automatic_reruns
+    record["recovered_after_rerun"] = recovered_after_rerun
+    record["rerun_errors"] = [
+        attempt["error"] for attempt in attempt_history if attempt.get("error")
+    ]
 
     return record
 
@@ -1282,6 +1356,11 @@ def run_evaluation(
                                 "message_in_conversation": state["ml_done"],
                                 "total_in_conversation": state["ml_total"],
                                 "status": mr.get("parse_status"),
+                                "automatic_reruns": int(mr.get("automatic_reruns") or 0),
+                                "recovered_after_rerun": bool(
+                                    mr.get("recovered_after_rerun")
+                                ),
+                                "rerun_errors": list(mr.get("rerun_errors") or []),
                             }
                         )
 

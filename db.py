@@ -843,7 +843,11 @@ class Database:
         observations: list[dict] = []
         for row in rows:
             debug = _json_load(row["debug_json"]) or {}
-            usage = debug.get("usage") or {}
+            usage = (
+                debug.get("total_usage_including_reruns")
+                or debug.get("usage")
+                or {}
+            )
             details = (
                 usage.get("completion_tokens_details")
                 or usage.get("output_tokens_details")
