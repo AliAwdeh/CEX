@@ -3991,27 +3991,6 @@ def tab_reviewer_admin() -> None:
         "Generate reviewer keys and revoke access from the workspace. "
         "Reviewer keys are stored in local Streamlit secrets, so they stay the same when you switch or pull databases."
     )
-    with st.expander("Temporary migration", expanded=False):
-        st.caption(
-            "Copies existing hashed reviewer keys from every local `.db` file into `.streamlit/secrets.toml`. "
-            "The original plaintext keys cannot be shown, but existing keys should continue to work after migration."
-        )
-        if st.button("Migrate reviewer keys from all databases to secrets", type="secondary", use_container_width=True):
-            try:
-                migration = _migrate_reviewer_keys_from_databases_to_local_secrets()
-            except Exception as exc:
-                st.error(f"Could not migrate reviewer keys: {exc}")
-            else:
-                st.success(
-                    f"Migrated {int(migration['imported']):,} reviewer key(s). "
-                    f"Skipped {int(migration['skipped']):,} duplicate/existing key(s). "
-                    f"Scanned {int(migration['scanned']):,} key row(s)."
-                )
-                db_rows = migration.get("databases") or []
-                if db_rows:
-                    st.dataframe(pd.DataFrame(db_rows), width="stretch", hide_index=True)
-                if int(migration.get("errors") or 0):
-                    st.warning(f"{int(migration['errors']):,} database file(s) could not be read.")
 
     create_col, keys_col = st.columns([1, 1.4])
     with create_col:
