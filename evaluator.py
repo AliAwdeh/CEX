@@ -323,6 +323,241 @@ def _normalize_bool_flag(value: Any, default: bool = False) -> bool:
     return default
 
 
+def _normalize_message_entity(record: dict | None) -> str:
+    if not isinstance(record, dict):
+        return "unknown"
+    raw_role = str(record.get("raw_sender_role") or "").strip().lower()
+    if raw_role == "system":
+        return "broadcast"
+    if raw_role in {"bot", "assistant"}:
+        return "bot"
+    if raw_role == "agent":
+        return "agent"
+    role = str(record.get("sender_role") or "").strip().lower()
+    if role in {"customer", "agent"}:
+        return role
+    return "unknown"
+
+
+def _normalize_message_result_flags(result: dict) -> dict:
+    parsed = result.get("parsed_json") or {}
+    if not isinstance(parsed, dict):
+        return result
+    if "contradiction" not in parsed:
+        parsed["contradiction"] = False
+    else:
+        parsed["contradiction"] = _normalize_bool_flag(parsed.get("contradiction"), default=False)
+    first_id = str(parsed.get("first_contradiction_message_id") or "none").strip()
+    parsed["first_contradiction_message_id"] = first_id or "none"
+    result["parsed_json"] = parsed
+    result["evaluation_output"] = parsed
+    return result
+
+
+def _clear_message_issue(parsed: dict, *, reason: str) -> None:
+    parsed["message_level_effect"] = "helped"
+    parsed["frustration_level_after_message"] = "none"
+    parsed["frustration_change"] = "decreased"
+    parsed["customer_effort_level"] = "low"
+    parsed["clarity_level"] = "clear"
+    parsed["context_handling"] = "good"
+    parsed["issue_origin"] = "none"
+    parsed["issue_type"] = "none"
+    parsed["frustration_cause"] = "none"
+    parsed["business_impact"] = reason
+    parsed["recommended_fix"] = "none"
+    parsed["contradiction_agent_issue_suppressed"] = True
+
+
+def _mark_contradiction_source_issue(parsed: dict, *, target_id: str) -> None:
+    parsed["conversation_id"] = parsed.get("conversation_id", "")
+    parsed["target_message_id"] = parsed.get("target_message_id", target_id)
+    parsed["message_level_effect"] = "major_issue"
+    parsed["frustration_level_after_message"] = "high"
+    parsed["frustration_change"] = "created"
+    parsed["customer_effort_level"] = "high"
+    parsed["clarity_level"] = "unclear"
+    parsed["context_handling"] = "poor"
+    parsed["issue_origin"] = "our_side"
+    parsed["issue_type"] = "wrong_info"
+    parsed["frustration_cause"] = "contradictory status"
+    parsed["business_impact"] = "Original bot/system message created a contradictory customer-visible state later corrected by a human agent."
+    parsed["recommended_fix"] = "Fix the original bot/system message so later human agents do not need to contradict it."
+    parsed["contradiction"] = True
+    parsed["first_contradiction_message_id"] = target_id
+    parsed["contradiction_source_penalized"] = True
+
+
+def _build_contradiction_source_result(
+    *,
+    triggering_result: dict,
+    source_record: dict,
+    source_message_id: str,
+) -> dict:
+    conversation_id = str(
+        triggering_result.get("conversation_id")
+        or triggering_result.get("thread_id")
+        or ""
+    )
+    message_index = source_record.get("message_index")
+    parsed = {
+        "conversation_id": conversation_id,
+        "target_message_id": source_message_id,
+        "message_index": message_index or 0,
+        "message_level_effect": "major_issue",
+        "frustration_level_after_message": "high",
+        "frustration_change": "created",
+        "customer_effort_level": "high",
+        "clarity_level": "unclear",
+        "context_handling": "poor",
+        "issue_origin": "our_side",
+        "issue_type": "wrong_info",
+        "contradiction": True,
+        "first_contradiction_message_id": source_message_id,
+        "frustration_cause": "contradictory status",
+        "evidence": "Earlier bot/system message created a contradictory customer-visible state.",
+        "business_impact": "Original bot/system message created a contradictory customer-visible state later corrected by a human agent.",
+        "recommended_fix": "Fix the original bot/system message so later human agents do not need to contradict it.",
+        "contradiction_source_penalized": True,
+        "generated_from_contradiction_transfer": True,
+    }
+    return {
+        "thread_id": conversation_id,
+        "conversation_id": conversation_id,
+        "target_message_id": source_message_id,
+        "message_index": message_index,
+        "appended_message_index": source_record.get("appended_message_index", message_index),
+        "source_conversation_id": source_record.get("source_conversation_id"),
+        "message_time": source_record.get("message_time", ""),
+        "target_message_text": strip_inline_rag_context(source_record.get("message_text", "")),
+        "input_history": None,
+        "raw_model_response": None,
+        "parsed_json": parsed,
+        "evaluation_output": parsed,
+        "parse_status": "ok",
+        "error_message": None,
+        "debug": {
+            "generated_from_contradiction_transfer": True,
+            "triggering_message_id": triggering_result.get("target_message_id"),
+            "triggering_message_index": triggering_result.get("message_index"),
+        },
+    }
+
+
+def _message_result_sort_key(result: dict) -> tuple[int, str]:
+    idx = result.get("message_index")
+    try:
+        return (int(idx), str(result.get("target_message_id") or ""))
+    except (TypeError, ValueError):
+        return (10**12, str(result.get("target_message_id") or ""))
+
+
+def apply_contradiction_source_suppression(
+    message_results: list[dict],
+    message_records: list[dict],
+) -> list[dict]:
+    """Move contradiction blame from later human-agent messages to the first bot/system source."""
+    records_by_id: dict[str, dict] = {}
+    records_by_idx: dict[Any, dict] = {}
+    for record in message_records or []:
+        message_id = str(record.get("message_id") or "").strip()
+        if message_id:
+            records_by_id[message_id] = record
+        idx = record.get("message_index")
+        if idx is not None:
+            records_by_idx[idx] = record
+            records_by_idx[str(idx)] = record
+            try:
+                records_by_idx[int(idx)] = record
+            except (TypeError, ValueError):
+                pass
+
+    results_by_id: dict[str, dict] = {}
+    for result in message_results or []:
+        _normalize_message_result_flags(result)
+        message_id = str(result.get("target_message_id") or "").strip()
+        if message_id:
+            results_by_id[message_id] = result
+
+    source_results_to_add: list[dict] = []
+    for result in list(message_results or []):
+        if result.get("parse_status") != "ok":
+            continue
+        parsed = result.get("parsed_json") or {}
+        if not parsed.get("contradiction"):
+            continue
+        first_id = str(parsed.get("first_contradiction_message_id") or "none").strip()
+        if not first_id or first_id == "none":
+            continue
+        current_record = records_by_id.get(str(result.get("target_message_id") or ""))
+        if current_record is None:
+            current_record = records_by_idx.get(result.get("message_index"))
+        first_record = records_by_id.get(first_id)
+        if first_record is None:
+            try:
+                first_record = records_by_idx.get(int(first_id))
+            except (TypeError, ValueError):
+                first_record = records_by_idx.get(first_id)
+        source_message_id = str(
+            (first_record or {}).get("message_id")
+            or first_id
+        ).strip()
+        current_entity = _normalize_message_entity(current_record)
+        first_entity = _normalize_message_entity(first_record)
+        if current_entity != "agent" or first_entity not in {"bot", "broadcast"}:
+            continue
+
+        parsed["first_contradiction_message_id"] = source_message_id
+
+        source_result = results_by_id.get(source_message_id) or results_by_id.get(first_id)
+        if source_result:
+            source_parsed = source_result.get("parsed_json") or {}
+            if not isinstance(source_parsed, dict):
+                source_parsed = {}
+            source_parsed["conversation_id"] = (
+                source_parsed.get("conversation_id")
+                or source_result.get("conversation_id")
+                or source_result.get("thread_id")
+                or ""
+            )
+            source_parsed["target_message_id"] = (
+                source_parsed.get("target_message_id")
+                or source_result.get("target_message_id")
+                or source_message_id
+            )
+            source_parsed["message_index"] = (
+                source_parsed.get("message_index")
+                if source_parsed.get("message_index") is not None
+                else source_result.get("message_index")
+            )
+            _mark_contradiction_source_issue(source_parsed, target_id=source_message_id)
+            source_result["parsed_json"] = source_parsed
+            source_result["evaluation_output"] = source_parsed
+            source_result["parse_status"] = "ok"
+            source_result["error_message"] = None
+        elif first_record:
+            source_result = _build_contradiction_source_result(
+                triggering_result=result,
+                source_record=first_record,
+                source_message_id=source_message_id,
+            )
+            results_by_id[source_message_id] = source_result
+            source_results_to_add.append(source_result)
+
+        _clear_message_issue(
+            parsed,
+            reason="Human agent message surfaced or corrected a contradiction created by an earlier bot/system message.",
+        )
+        result["parsed_json"] = parsed
+        result["evaluation_output"] = parsed
+
+    if source_results_to_add:
+        message_results.extend(source_results_to_add)
+        message_results.sort(key=_message_result_sort_key)
+
+    return message_results
+
+
 def _normalize_issue_origin(value: Any, *, allow_third_party: bool) -> str:
     origin = str(value or "").strip().lower().replace(" ", "_")
     if origin not in _MAIN_ISSUE_ORIGINS:
@@ -349,6 +584,19 @@ def _normalize_culprits(value: Any) -> list[str]:
         if culprit in allowed and culprit not in seen:
             out.append(culprit)
             seen.add(culprit)
+    return out
+
+
+def _normalize_string_list(value: Any) -> list[str]:
+    if not isinstance(value, list):
+        return []
+    out: list[str] = []
+    seen: set[str] = set()
+    for item in value:
+        text = str(item or "").strip()
+        if text and text not in seen:
+            out.append(text)
+            seen.add(text)
     return out
 
 
@@ -781,6 +1029,11 @@ def validate_conversation_level_result(data: dict) -> dict:
     out["classification_reason"] = classification_reason
     out["management_summary"] = management_summary
     out["culprits"] = _normalize_culprits(data.get("culprits"))
+    out["culprit_agent_names"] = (
+        _normalize_string_list(data.get("culprit_agent_names"))
+        if "agent" in out["culprits"]
+        else []
+    )
     out["culprit_reason"] = str(data.get("culprit_reason", "") or "")
     out["recommended_actions"] = [str(x) for x in (data.get("recommended_actions") or []) if x]
     out["manual_review_required"] = _normalize_bool_flag(data.get("manual_review_required"), default=False)
@@ -981,6 +1234,7 @@ def _eval_message_level(
     record["rerun_errors"] = [
         attempt["error"] for attempt in attempt_history if attempt.get("error")
     ]
+    _normalize_message_result_flags(record)
 
     return record
 
@@ -1248,6 +1502,10 @@ def run_evaluation(
             for t in state["targets"]
             if t["message_index"] in state["results_by_idx"]
         ]
+        message_results_ordered = apply_contradiction_source_suppression(
+            message_results_ordered,
+            state["records"],
+        )
         computed_md = compute_metadata(message_results_ordered, state["records"])
         computed_md["evaluation_target_role"] = target_role
         computed_md["target_messages_evaluated"] = sum(
@@ -1922,6 +2180,10 @@ def run_conversation_level_only(
                         pass
                 continue
 
+            message_results_ordered = apply_contradiction_source_suppression(
+                message_results_ordered,
+                records,
+            )
             computed_md = compute_metadata(message_results_ordered, records)
             computed_md["evaluation_target_role"] = target_role
             computed_md["target_messages_evaluated"] = sum(
@@ -1966,6 +2228,10 @@ def run_conversation_level_only(
             if config.max_agent_messages_per_conv is not None:
                 message_results_ordered = message_results_ordered[: config.max_agent_messages_per_conv]
 
+            message_results_ordered = apply_contradiction_source_suppression(
+                message_results_ordered,
+                records,
+            )
             computed_md = compute_metadata(message_results_ordered, records)
             computed_md["evaluation_target_role"] = target_role
             computed_md["target_messages_evaluated"] = sum(

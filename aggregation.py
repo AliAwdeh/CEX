@@ -441,6 +441,9 @@ def flatten_conversation_row(
     culprits = cl.get("culprits") or []
     if not isinstance(culprits, list):
         culprits = []
+    culprit_agent_names = cl.get("culprit_agent_names") or []
+    if not isinstance(culprit_agent_names, list):
+        culprit_agent_names = []
 
     def get_md(*keys: str) -> Any:
         for k in keys:
@@ -505,6 +508,7 @@ def flatten_conversation_row(
         "classification_reason": cl.get("classification_reason"),
         "management_summary": cl.get("management_summary"),
         "culprits": " | ".join(str(c) for c in culprits if c),
+        "culprit_agent_names": " | ".join(str(name) for name in culprit_agent_names if name),
         "culprit_reason": cl.get("culprit_reason"),
         "recommended_actions": " | ".join(cl.get("recommended_actions", []) or []),
         "manual_review_required": cl.get("manual_review_required"),
@@ -570,6 +574,11 @@ def flatten_message_row(message_result: dict) -> dict:
         "context_handling": pj.get("context_handling"),
         "issue_origin": pj.get("issue_origin"),
         "issue_type": pj.get("issue_type"),
+        "contradiction": pj.get("contradiction"),
+        "first_contradiction_message_id": pj.get("first_contradiction_message_id"),
+        "contradiction_agent_issue_suppressed": pj.get("contradiction_agent_issue_suppressed"),
+        "contradiction_source_penalized": pj.get("contradiction_source_penalized"),
+        "generated_from_contradiction_transfer": pj.get("generated_from_contradiction_transfer"),
         "frustration_cause": pj.get("frustration_cause"),
         "evidence": pj.get("evidence"),
         "business_impact": pj.get("business_impact"),

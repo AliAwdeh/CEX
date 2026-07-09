@@ -132,6 +132,8 @@ Do not assume hidden tools, hidden saves, hidden business rules, or backend acti
 
 If raw tool output, JSON, or system text is visible to the customer, treat it as a customer-facing issue.
 
+Every target and history message has a stable `message_id`. When a target message creates, exposes, or participates in a contradiction with an earlier visible company-side message, set `contradiction = true` and set `first_contradiction_message_id` to the first company-side message_id that created the conflicting state. If a later human agent clarifies or corrects an earlier bot/system/broadcast contradiction, do not punish the human agent merely for being the second side; point to the earlier bot/system/broadcast message so code can transfer the penalty to that source. If there is no contradiction, set `contradiction = false` and `first_contradiction_message_id = "none"`.
+
 ---
 
 # 2. Core Message-Level Question
@@ -495,6 +497,8 @@ DEFAULT_MESSAGE_LEVEL_OUTPUT_SCHEMA = """{
   "context_handling": "good|partial|poor|not_applicable",
   "issue_origin": "our_side|customer_side|shared|none",
   "issue_type": "none|misunderstanding|repetition|delay|unclear_guidance|wrong_info|ignored_context|dead_end|tool_or_system_failure|poor_tone|missing_next_step|other",
+  "contradiction": "true or false",
+  "first_contradiction_message_id": "message_id of the first visible bot/system/broadcast/agent message that created the contradiction, or none",
   "frustration_cause": "string, maximum 4 words, or none",
   "evidence": "short quote or paraphrase from the conversation",
   "business_impact": "short business-friendly explanation",
@@ -613,6 +617,8 @@ Do not assume hidden tools, hidden workflows, backend saves, internal approvals,
 Do not invent facts.
 
 If internal tool names, raw JSON, system messages, or backend output are shown to the customer, treat that as a customer-facing CX issue.
+
+Use raw sender identity fields such as `raw_sender_role`, `sender_entity`, and `agent_full_name` to distinguish bot, broadcast/system, human-agent, and customer responsibility. If `culprits` includes `agent`, copy the materially culpable human agent names exactly from transcript `agent_full_name` into `culprit_agent_names`; otherwise return `culprit_agent_names = []`.
 
 ---
 
@@ -922,6 +928,9 @@ DEFAULT_CONVERSATION_LEVEL_OUTPUT_SCHEMA = """{
   "positive_signals": ["short bullet"],
   "negative_signals": ["short bullet"],
   "management_summary": "concise business-friendly explanation of the outcome and customer experience",
+  "culprits": ["agent|bot|broadcast|customer"],
+  "culprit_agent_names": ["exact agent_full_name values for materially culpable human agents, or empty array"],
+  "culprit_reason": "short explanation of who materially caused the bad experience or friction, or none",
   "recommended_actions": ["short actionable recommendation"],
   "manual_review_required": true,
   "manual_review_reason": "short reason or none",
@@ -981,6 +990,8 @@ _ALLOWED_METADATA_KEYS = {
     "conversation_start_date",
     "conversation_end_date",
     "conversation_status",
+    "conversation_agent_full_name",
+    "conversation_agent_login_name",
     "initial_skill",
     "last_skill",
     "joined_skills",
@@ -1022,10 +1033,25 @@ def build_message_level_payload(
     def evaluator_role(message: dict) -> str:
         return "customer" if str(message.get("sender_role", "")).lower() == "customer" else "agent"
 
+    def sender_entity(message: dict) -> str:
+        raw_role = str(message.get("raw_sender_role", "") or "").strip().lower()
+        if raw_role == "system":
+            return "broadcast"
+        if raw_role in {"bot", "assistant"}:
+            return "bot"
+        if raw_role == "agent":
+            return "agent"
+        role = str(message.get("sender_role", "") or "").strip().lower()
+        if role in {"customer", "agent"}:
+            return role
+        return "unknown"
+
     target = {
         "message_id": target_message.get("message_id", ""),
         "message_index": target_message.get("message_index"),
         "sender_role": evaluator_role(target_message),
+        "raw_sender_role": target_message.get("raw_sender_role"),
+        "sender_entity": sender_entity(target_message),
         "message_time": str(target_message.get("message_time", "")),
         "message_text": trim(target_message.get("message_text", "")),
     }
@@ -1034,7 +1060,10 @@ def build_message_level_payload(
     for m in history:
         history_clean.append(
             {
+                "message_id": m.get("message_id", ""),
                 "sender_role": evaluator_role(m),
+                "raw_sender_role": m.get("raw_sender_role"),
+                "sender_entity": sender_entity(m),
                 "message_index": m.get("message_index"),
                 "message_time": str(m.get("message_time", "")),
                 "message_text": trim(m.get("message_text", "")),
@@ -1113,6 +1142,7 @@ def build_conversation_level_payload(
             "sender_role": m.get("sender_role", ""),
             "raw_sender_role": m.get("raw_sender_role"),
             "sender_entity": sender_entity(m),
+            "agent_full_name": m.get("agent_full_name"),
             "message_text": trim(m.get("message_text", "")),
         }
         if msg_idx in eval_by_idx:

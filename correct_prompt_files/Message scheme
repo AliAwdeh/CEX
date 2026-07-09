@@ -10,6 +10,8 @@
   "context_handling": "good|partial|poor|not_applicable",
   "issue_origin": "our_side|customer_side|shared|none",
   "issue_type": "none|misunderstanding|repetition|delay|unclear_guidance|wrong_info|ignored_context|dead_end|tool_or_system_failure|poor_tone|missing_next_step|other",
+  "contradiction": "true or false",
+  "first_contradiction_message_id": "message_id of the first visible bot/system/broadcast/agent message that created the contradiction, or none",
   "frustration_cause": "string, maximum 4 words, or none",
   "evidence": "short quote or paraphrase from the conversation",
   "business_impact": "short business-friendly explanation",

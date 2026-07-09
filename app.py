@@ -1082,6 +1082,13 @@ def _on_database_source_changed() -> None:
 
 
 def render_database_selector(*, in_sidebar: bool = False) -> None:
+    loaded_db_feedback = None
+    pending_db_path = st.session_state.pop("_pending_custom_db_path", None)
+    if pending_db_path:
+        st.session_state.db_path = str(pending_db_path)
+        _on_database_source_changed()
+        loaded_db_feedback = f"Loaded database: {Path(str(pending_db_path)).name}"
+
     options, labels = _available_database_options()
     if st.session_state.get("db_path") not in labels:
         st.session_state.db_path = options[0]
@@ -1108,6 +1115,30 @@ def render_database_selector(*, in_sidebar: bool = False) -> None:
 
     if Path(selected).name == REVIEW_DB_PATH.name:
         st.caption("Review DB: runs 5, 59, 57, and 55.")
+
+    if loaded_db_feedback:
+        st.success(loaded_db_feedback)
+
+    with st.expander("Load database from path", expanded=False):
+        custom_path = st.text_input(
+            "SQLite DB path",
+            key="custom_db_path_input",
+            placeholder=r"C:\Users\you\Downloads\cx_evaluator.db",
+            help="Paste the full path to a local .db file on this laptop.",
+        )
+        if st.button("Load DB path", key="load_custom_db_path", use_container_width=True):
+            candidate_raw = str(custom_path or "").strip().strip('"')
+            if not candidate_raw:
+                st.warning("Paste a database file path first.")
+            else:
+                candidate = _resolve_db_path(candidate_raw)
+                if not candidate.exists():
+                    st.error(f"Database file not found: {candidate}")
+                elif not candidate.is_file():
+                    st.error(f"Path is not a file: {candidate}")
+                else:
+                    st.session_state._pending_custom_db_path = str(candidate)
+                    st.rerun()
 
 
 def _prompt_status_label(row: sqlite3.Row | None) -> str:
@@ -1859,16 +1890,6 @@ def _execute_conversation_only_run(
 
     def persist_completed_results() -> None:
         if results is None:
-            return
-        counts = _run_result_counts(db, run_id)
-        expected_convs = len(results.conversation_results)
-        expected_msgs = len(results.message_level_results)
-        expected_errors = len(results.errors)
-        if (
-            counts["conversation_results"] == expected_convs
-            and counts["message_results"] == expected_msgs
-            and counts["run_errors"] == expected_errors
-        ):
             return
         _clear_run_results(db, run_id)
         for mr in results.message_level_results:
@@ -2684,6 +2705,125 @@ def _filter_conversation_results_for_export(
     return filtered
 
 
+def _compact_final_output(row: dict[str, Any]) -> str:
+    handled = _norm_export_marker(row.get("handled_status"))
+    experience = _norm_export_marker(row.get("customer_experience"))
+    subtype = _norm_export_marker(row.get("unhandled_resolution_subtype"))
+    parts: list[str] = []
+    if handled:
+        parts.append(handled)
+    if experience:
+        parts.append(experience)
+    if handled == "unhandled" and subtype and subtype != "not_applicable":
+        subtype_label = {
+            "pending_unresolved": "pending",
+            "totally_unresolved": "totally unresolved",
+        }.get(subtype, subtype.replace("_", " "))
+        parts.append(subtype_label)
+    return " ".join(parts).strip() or "unknown"
+
+
+def _compact_explanation(row: dict[str, Any]) -> str:
+    for key in (
+        "management_summary",
+        "score_explanation",
+        "classification_reason",
+        "main_issue_summary",
+        "customer_primary_objective",
+    ):
+        value = str(row.get(key) or "").strip()
+        if value:
+            return value
+    return ""
+
+
+def _compact_export_dataframe(conversation_results: list[dict], *, include_source_ids: bool = False) -> pd.DataFrame:
+    rows: list[dict[str, Any]] = []
+    for cr in conversation_results:
+        normalized = _normalize_conversation_result_for_display(cr)
+        flat = flatten_conversation_row(
+            normalized,
+            normalized.get("conversation_metadata", {}) or {},
+            normalized.get("computed_metadata", {}) or {},
+        )
+        rows.append(
+            {
+                "customer_name": flat.get("customer_name"),
+                "conversation_id": flat.get("conversation_id"),
+                "final_output": _compact_final_output(flat),
+                "explanation_summary": _compact_explanation(flat),
+            }
+        )
+        if include_source_ids:
+            rows[-1]["source_conversation_ids"] = flat.get("source_conversation_ids")
+    return pd.DataFrame(rows)
+
+
+def _compact_csv_bytes(conversation_results: list[dict]) -> bytes:
+    return _compact_export_dataframe(conversation_results).to_csv(index=False).encode("utf-8")
+
+
+def _load_compact_rows_for_run(db: Database, run_id: int) -> list[dict[str, Any]]:
+    loaded = db.load_run_summary_results(int(run_id))
+    df = _compact_export_dataframe(loaded.get("conversation_results") or [], include_source_ids=True)
+    if df.empty:
+        return []
+    return df.to_dict("records")
+
+
+def _build_run_comparison_csv_bytes(
+    db: Database,
+    run_ids: list[int],
+    run_names: dict[int, str] | None = None,
+) -> tuple[bytes | None, str | None]:
+    run_names = {int(k): str(v or f"Run {int(k)}") for k, v in (run_names or {}).items()}
+    run_rows: dict[int, list[dict[str, Any]]] = {
+        int(run_id): _load_compact_rows_for_run(db, int(run_id))
+        for run_id in run_ids
+    }
+    id_sets = {
+        run_id: {str(row.get("conversation_id") or "").strip() for row in rows if str(row.get("conversation_id") or "").strip()}
+        for run_id, rows in run_rows.items()
+    }
+    non_empty_sets = {run_id: ids for run_id, ids in id_sets.items() if ids}
+    if len(non_empty_sets) != len(run_ids):
+        empty_ids = [str(run_id) for run_id in run_ids if not id_sets.get(int(run_id))]
+        return None, f"Run(s) with no saved journey results: {', '.join(empty_ids)}."
+
+    first_run_id = int(run_ids[0])
+    first_ids = id_sets[first_run_id]
+    mismatches = [run_id for run_id, ids in id_sets.items() if ids != first_ids]
+    if mismatches:
+        details = []
+        for run_id in mismatches:
+            missing = len(first_ids - id_sets[run_id])
+            extra = len(id_sets[run_id] - first_ids)
+            details.append(f"#{run_id}: missing {missing}, extra {extra}")
+        return None, "Selected runs do not contain the same journey IDs. " + "; ".join(details)
+
+    by_run = {
+        run_id: {str(row.get("conversation_id") or "").strip(): row for row in rows}
+        for run_id, rows in run_rows.items()
+    }
+    output_rows: list[dict[str, Any]] = []
+    for conversation_id in sorted(first_ids):
+        base_row = by_run[first_run_id].get(conversation_id, {})
+        row: dict[str, Any] = {
+            "customer_name": base_row.get("customer_name"),
+            "conversation_id": conversation_id,
+            "source_conversation_ids": base_row.get("source_conversation_ids"),
+        }
+        for run_id in run_ids:
+            run_row = by_run[int(run_id)].get(conversation_id, {})
+            prefix = f"run_{int(run_id)}"
+            row[f"{prefix}_name"] = run_names.get(int(run_id), f"Run {int(run_id)}")
+            row[f"{prefix}_final_output"] = run_row.get("final_output")
+            row[f"{prefix}_explanation_summary"] = run_row.get("explanation_summary")
+        output_rows.append(row)
+
+    return pd.DataFrame(output_rows).to_csv(index=False).encode("utf-8"), None
+
+
 def _ordered_selected_ids(all_ids: list[str], selected_ids: list[str] | None) -> list[str]:
     """Return selected journey IDs in the same order they appear in the CSV."""
     if not selected_ids:
@@ -2859,6 +2999,7 @@ def _display_column_name(column: str) -> str:
         "score_rating": "Score rating",
         "score_explanation": "Score explanation",
         "culprits": "Culprits",
+        "culprit_agent_names": "Culpable agent names",
         "culprit_reason": "Culprit reasoning",
         "main_issue_type": "Main problem type",
         "main_issue_origin": "Where the main problem came from",
@@ -5350,16 +5491,6 @@ def tab_run() -> None:
         def persist_completed_results() -> None:
             if results is None:
                 return
-            counts = _run_result_counts(db, run_id)
-            expected_convs = len(results.conversation_results)
-            expected_msgs = len(results.message_level_results)
-            expected_errors = len(results.errors)
-            if (
-                counts["conversation_results"] == expected_convs
-                and counts["message_results"] == expected_msgs
-                and counts["run_errors"] == expected_errors
-            ):
-                return
             _clear_run_results(db, run_id)
             for mr in results.message_level_results:
                 mr["run_id"] = run_id
@@ -7817,14 +7948,26 @@ def _build_review_filter_index(conversation_results: list[dict]) -> dict[str, An
     """
     sender_levels_by_id: dict[str, dict[str, set[str]]] = {}
     chunk_levels_by_id: dict[str, dict[str, set[str]]] = {}
+    contradiction_modes_by_id: dict[str, set[str]] = {}
     chunk_options: set[str] = set()
 
     for conversation_result in conversation_results or []:
         conversation_id = str(conversation_result.get("conversation_id") or "")
         sender_levels = {kind: set() for kind in ("Agent", "L2", "Bot", "Broadcast")}
         chunk_levels: dict[str, set[str]] = {}
+        contradiction_modes: set[str] = set()
         transcript = conversation_result.get("transcript") or []
-        eval_by_idx = _message_results_by_index(conversation_result.get("message_level_results"))
+        message_results = conversation_result.get("message_level_results")
+        eval_by_idx = _message_results_by_index(message_results)
+
+        for result in message_results or []:
+            parsed = result.get("parsed_json") or {}
+            if not isinstance(parsed, dict):
+                continue
+            if parsed.get("contradiction_source_penalized"):
+                contradiction_modes.add("source_penalized")
+            if parsed.get("contradiction_agent_issue_suppressed"):
+                contradiction_modes.add("agent_suppressed")
 
         for message in transcript:
             chunks = _rag_chunks_for_message(message)
@@ -7849,10 +7992,12 @@ def _build_review_filter_index(conversation_results: list[dict]) -> dict[str, An
 
         sender_levels_by_id[conversation_id] = sender_levels
         chunk_levels_by_id[conversation_id] = chunk_levels
+        contradiction_modes_by_id[conversation_id] = contradiction_modes
 
     value = {
         "sender_levels_by_id": sender_levels_by_id,
         "chunk_levels_by_id": chunk_levels_by_id,
+        "contradiction_modes_by_id": contradiction_modes_by_id,
         "chunk_options": sorted(chunk_options, key=lambda value: value.lower()),
     }
     return value
@@ -7870,11 +8015,16 @@ def _ensure_active_run_derived_numbers() -> None:
     key = _run_cache_key()
     stats_cached = st.session_state.get("_stats_detail_tables_cache")
     review_cached = st.session_state.get("_review_filter_index_cache")
+    review_cache_has_contradictions = (
+        review_cached is not None
+        and "contradiction_modes_by_id" in (review_cached.get("value") or {})
+    )
     if (
         stats_cached is not None
         and stats_cached.get("key") == key
         and review_cached is not None
         and review_cached.get("key") == key
+        and review_cache_has_contradictions
     ):
         return
 
@@ -7907,6 +8057,7 @@ def _review_filter_index_for_active_run() -> dict[str, Any]:
     return {
         "sender_levels_by_id": {},
         "chunk_levels_by_id": {},
+        "contradiction_modes_by_id": {},
         "chunk_options": [],
     }
 
@@ -8005,9 +8156,31 @@ def _filter_conversations_by_chunk_flag(
     return conv_df[conv_df["conversation_id"].astype(str).isin(matching_ids)]
 
 
+def _filter_conversations_by_contradiction_transfer(
+    conv_df: pd.DataFrame,
+    review_index: dict[str, Any],
+    mode: str | None,
+) -> pd.DataFrame:
+    """Keep journeys with contradiction transfer markers selected in Journey Review."""
+    selected = str(mode or "").strip()
+    if selected in {"", "all"} or conv_df.empty or "conversation_id" not in conv_df.columns:
+        return conv_df
+
+    contradiction_modes_by_id = review_index.get("contradiction_modes_by_id") or {}
+    matching_ids: set[str] = set()
+    for conversation_id, modes in contradiction_modes_by_id.items():
+        mode_set = set(modes or [])
+        if selected == "any" and mode_set:
+            matching_ids.add(str(conversation_id))
+        elif selected in mode_set:
+            matching_ids.add(str(conversation_id))
+
+    return conv_df[conv_df["conversation_id"].astype(str).isin(matching_ids)]
+
+
 def _render_sender_flag_filters(
     review_index: dict[str, Any],
-) -> tuple[dict[str, str | None], dict[str, str | None]]:
+) -> tuple[dict[str, str | None], dict[str, str | None], str | None]:
     """Render Agent/Bot/Broadcast and RAG chunk message flag filters."""
     st.markdown("**Message flag filters**")
     st.caption(
@@ -8016,7 +8189,7 @@ def _render_sender_flag_filters(
     )
     options = ["All (no filter)", "Red", "Yellow", "Green"]
     filters: dict[str, str | None] = {}
-    columns = st.columns([1, 1, 1, 1, 1.45, 1])
+    columns = st.columns([1, 1, 1, 1, 1.25, 1.45, 1])
     with columns[0]:
         agent_scope = st.selectbox(
             "Agent scope",
@@ -8048,8 +8221,28 @@ def _render_sender_flag_filters(
             )
         filters[sender_type] = None if selected == options[0] else selected
 
-    chunk_options = _rag_chunk_options_for_review_index(review_index)
     with columns[4]:
+        contradiction_options = {
+            "All journeys": "all",
+            "Any contradiction transfer": "any",
+            "Bot/system source penalized": "source_penalized",
+            "Agent issue suppressed": "agent_suppressed",
+        }
+        has_contradictions = any(
+            bool(modes)
+            for modes in (review_index.get("contradiction_modes_by_id") or {}).values()
+        )
+        selected_contradiction = st.selectbox(
+            "Contradiction",
+            list(contradiction_options),
+            index=0,
+            key="review_contradiction_transfer_filter",
+            disabled=not has_contradictions,
+            help="Show journeys where contradiction transfer moved blame from a human agent correction to the original bot/system source.",
+        )
+
+    chunk_options = _rag_chunk_options_for_review_index(review_index)
+    with columns[5]:
         selected_chunk = st.selectbox(
             "RAG chunk",
             ["All chunks"] + chunk_options if chunk_options else ["No chunks found"],
@@ -8057,7 +8250,7 @@ def _render_sender_flag_filters(
             key="review_chunk_flag_filter",
             disabled=not chunk_options,
         )
-    with columns[5]:
+    with columns[6]:
         selected_chunk_severity = st.selectbox(
             "Chunk severity",
             ["Any flagged", "Red", "Yellow"],
@@ -8070,7 +8263,8 @@ def _render_sender_flag_filters(
         "chunk": None if selected_chunk in {"All chunks", "No chunks found"} else selected_chunk,
         "flag_level": None if selected_chunk_severity == "Any flagged" else selected_chunk_severity,
     }
-    return filters, chunk_filter
+    contradiction_filter = contradiction_options.get(selected_contradiction, "all")
+    return filters, chunk_filter, contradiction_filter
 
 
 def _flagged_messages_by_sender(transcript: list[dict], message_results: list[dict]) -> list[dict[str, Any]]:
@@ -8100,6 +8294,60 @@ def _flagged_messages_by_sender(transcript: list[dict], message_results: list[di
                 "Message": message.get("message_text") or result.get("target_message_text") or "",
                 "_chunks": chunks,
                 "_is_l2": is_l2_agent,
+            }
+        )
+    return rows
+
+
+def _message_records_by_id(transcript: list[dict] | None) -> dict[str, dict]:
+    records: dict[str, dict] = {}
+    for message in transcript or []:
+        message_id = str(message.get("message_id") or "").strip()
+        if message_id:
+            records[message_id] = message
+    return records
+
+
+def _message_records_by_index(transcript: list[dict] | None) -> dict[str, dict]:
+    return {
+        str(message.get("message_index")): message
+        for message in (transcript or [])
+        if message.get("message_index") is not None
+    }
+
+
+def _contradiction_transfer_rows(transcript: list[dict], message_results: list[dict]) -> list[dict[str, Any]]:
+    records_by_id = _message_records_by_id(transcript)
+    records_by_idx = _message_records_by_index(transcript)
+    rows: list[dict[str, Any]] = []
+    seen: set[tuple[str, str]] = set()
+    for result in message_results or []:
+        parsed = result.get("parsed_json") or {}
+        if not isinstance(parsed, dict):
+            continue
+        is_source = bool(parsed.get("contradiction_source_penalized"))
+        is_suppressed_agent = bool(parsed.get("contradiction_agent_issue_suppressed"))
+        if not is_source and not is_suppressed_agent:
+            continue
+        message_id = str(result.get("target_message_id") or parsed.get("target_message_id") or "").strip()
+        msg_index = result.get("message_index")
+        message = records_by_id.get(message_id) or records_by_idx.get(str(msg_index)) or {}
+        sender_type = _flagged_sender_type(message) or humanize_label(message.get("sender_entity")) or "Unknown"
+        status = "Bot/system source penalized" if is_source else "Agent issue suppressed"
+        key = (status, message_id or str(msg_index))
+        if key in seen:
+            continue
+        seen.add(key)
+        rows.append(
+            {
+                "Transfer status": status,
+                "Type": sender_type,
+                "Message #": msg_index,
+                "Message ID": message_id,
+                "First contradiction ID": parsed.get("first_contradiction_message_id") or "none",
+                "Effect": humanize_label(parsed.get("message_level_effect")),
+                "Issue type": humanize_label(parsed.get("issue_type")),
+                "Message": message.get("message_text") or result.get("target_message_text") or "",
             }
         )
     return rows
@@ -8218,6 +8466,7 @@ def _render_journey_chunk_overview(transcript: list[dict], message_results: list
 
 def _render_flagged_message_checker(transcript: list[dict], message_results: list[dict], conversation_id: str) -> None:
     flagged_rows = _flagged_messages_by_sender(transcript, message_results)
+    contradiction_rows = _contradiction_transfer_rows(transcript, message_results)
     counts = {kind: sum(1 for row in flagged_rows if row["Type"] == kind) for kind in ("Agent", "Bot", "Broadcast")}
     l2_count = sum(1 for row in flagged_rows if row.get("_is_l2"))
     total = len(flagged_rows)
@@ -8235,6 +8484,17 @@ def _render_flagged_message_checker(transcript: list[dict], message_results: lis
         "Check whether flagged evaluated messages came from an agent, bot, broadcast/system message, "
         "or a specific retrieved chunk."
     )
+    if contradiction_rows:
+        st.markdown("#### Contradiction transfer")
+        st.caption(
+            "Shows cases where a later human-agent contradiction issue was removed and the original bot/system source was penalized."
+        )
+        st.dataframe(
+            pd.DataFrame(contradiction_rows),
+            use_container_width=True,
+            hide_index=True,
+            height=min(260, 88 + len(contradiction_rows) * 54),
+        )
 
     state_key = f"review_flagged_sender_{conversation_id}"
     if state_key not in st.session_state:
@@ -8372,7 +8632,7 @@ def tab_review() -> None:
     )
     filtered_df = _apply_conversation_filters_fresh(conv_df, review_filters)
     review_index = _review_filter_index_for_active_run()
-    sender_flag_filters, chunk_flag_filter = _render_sender_flag_filters(review_index)
+    sender_flag_filters, chunk_flag_filter, contradiction_filter = _render_sender_flag_filters(review_index)
     filtered_df = _filter_conversations_by_sender_flags(
         filtered_df,
         review_index,
@@ -8382,6 +8642,11 @@ def tab_review() -> None:
         filtered_df,
         review_index,
         chunk_flag_filter,
+    )
+    filtered_df = _filter_conversations_by_contradiction_transfer(
+        filtered_df,
+        review_index,
+        contradiction_filter,
     )
 
     search = st.text_input(
@@ -8685,6 +8950,7 @@ def tab_exports() -> None:
         for cr in rr.conversation_results
     ]
     conv_bytes = build_conversation_csv_bytes(conversation_results)
+    compact_bytes = _compact_csv_bytes(conversation_results)
     msg_bytes = build_message_csv_bytes(rr.message_level_results)
     json_bytes = build_full_json_bytes(
         run_config=run_config,
@@ -8705,6 +8971,16 @@ def tab_exports() -> None:
             use_container_width=True,
         )
     with c2:
+        st.markdown("#### Compact Outcome CSV")
+        st.caption("Customer name, journey ID, final output, and generated summary/explanation.")
+        st.download_button(
+            "Download compact_outcomes.csv",
+            data=compact_bytes,
+            file_name="cx_compact_outcomes.csv",
+            mime="text/csv",
+            use_container_width=True,
+        )
+    with c3:
         st.markdown("#### Message-Level CSV")
         st.caption("One row per evaluated assistant message.")
         st.download_button(
@@ -8714,7 +8990,9 @@ def tab_exports() -> None:
             mime="text/csv",
             use_container_width=True,
         )
-    with c3:
+
+    _, json_col, _ = st.columns([1, 1, 1])
+    with json_col:
         st.markdown("#### Full JSON Export")
         st.caption("Run config, all results, errors, and raw responses.")
         st.download_button(
@@ -8724,6 +9002,61 @@ def tab_exports() -> None:
             mime="application/json",
             use_container_width=True,
         )
+
+    st.markdown("---")
+    st.markdown("### Compare Saved Runs")
+    st.caption(
+        "Download a compact side-by-side comparison. The app checks that every selected run has the same journey IDs before enabling the file."
+    )
+    db = get_active_db()
+    compare_runs = db.list_runs(limit=200)
+    compare_df = _fill_saved_run_counts(db, pd.DataFrame(compare_runs)) if compare_runs else pd.DataFrame()
+    if compare_df.empty:
+        st.caption("No saved runs available for comparison.")
+    else:
+        compare_df = compare_df.copy()
+        saved_counts = pd.to_numeric(
+            compare_df.get("saved_conversations", pd.Series(0, index=compare_df.index)),
+            errors="coerce",
+        ).fillna(0)
+        compare_df = compare_df[saved_counts > 0]
+        compare_df["label"] = compare_df.apply(lambda row: _saved_run_label(row.to_dict()), axis=1)
+        label_to_id = {str(row["label"]): int(row["id"]) for _, row in compare_df.iterrows()}
+        id_to_name = {
+            int(row["id"]): str(row.get("name") or f"Run {int(row['id'])}")
+            for _, row in compare_df.iterrows()
+        }
+        selected_labels = st.multiselect(
+            "Runs to compare",
+            options=list(label_to_id),
+            default=list(label_to_id)[:2],
+            key="exports_compare_run_labels",
+            help="Select two or more saved runs from this database.",
+        )
+        selected_run_ids = [label_to_id[label] for label in selected_labels if label in label_to_id]
+        if len(selected_run_ids) < 2:
+            st.info("Select at least two saved runs to compare.")
+        else:
+            compare_bytes, compare_error = _build_run_comparison_csv_bytes(
+                db,
+                selected_run_ids,
+                run_names={run_id: id_to_name.get(run_id, f"Run {run_id}") for run_id in selected_run_ids},
+            )
+            if compare_error:
+                st.error(compare_error)
+            else:
+                st.success(
+                    f"Journey ID check passed for {len(selected_run_ids):,} runs. "
+                    f"Each run has {len(db.list_run_conversation_ids(selected_run_ids[0])):,} matching journeys."
+                )
+            st.download_button(
+                "Download run_comparison.csv",
+                data=compare_bytes or b"",
+                file_name="cx_run_comparison.csv",
+                mime="text/csv",
+                disabled=compare_bytes is None,
+                use_container_width=True,
+            )
 
     st.markdown("---")
     st.markdown("### Journey Category CSVs")

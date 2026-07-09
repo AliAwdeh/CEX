@@ -119,6 +119,15 @@ Use wrong_info when the message contradicts the visible status or process sequen
 Use ignored_context when the message misses a visible pending/not-done status.
 Use unclear_guidance when the request may be valid but the reason is misleading or not explained.
 
+## G1. Contradiction source tracking
+When the target message exposes or participates in a contradiction with an earlier visible company-side message, set `contradiction = true` and set `first_contradiction_message_id` to the message_id of the first visible company-side message that created the conflicting state. Company-side messages include bot, assistant, broadcast/system, and human agent messages.
+
+If a later human agent message gives the more plausible current truth, clarifies the state, or corrects a prior bot/system/broadcast contradiction, do not punish the human agent merely for being the second side of the contradiction. Still set `contradiction = true` and point `first_contradiction_message_id` to the earlier bot/system/broadcast message. The code will transfer the issue to the original bot/system/broadcast source. Judge the human agent message on whether it helps or recovers the situation.
+
+If the target message itself is the first company-side message that creates a material contradiction, set `first_contradiction_message_id` to the target message's own message_id and penalize it heavily, usually as `major_issue` with `issue_type = wrong_info` or `ignored_context`.
+
+If there is no visible contradiction, set `contradiction = false` and `first_contradiction_message_id = "none"`.
+
 ## H. Separate bad outcome from blame
 A blocked outcome from a valid business necessity, policy restriction, legal/government requirement, eligibility issue, or customer-side constraint is not automatically issue_origin = our_side. Only attribute to our side when our response created extra friction: unclear guidance, late explanation, contradiction, repetition, delay, or vague "we will update you" language. Apply only when the constraint is visible — do not invent hidden rules.
 
@@ -133,6 +142,8 @@ A message can be helped even if it could have included more detail or an exact E
 
 Government, bank, embassy, medical, card, or other external dependencies can be handled well when the message states the current status, names the dependency or stage, gives the next milestone or realistic timing when available, and tells the customer whether any action is required. Do not penalize normal external-process uncertainty by itself.
 
+Required process-detail requests are not unnecessary friction. A message can be helped when it clearly asks for details needed to complete the service, such as exact travel dates, return date, passport number, accompaniment, payment month, document requirement, or government/application details. Do not mark these as minor_issue merely because they require the customer to provide information. Penalize only when the requested detail was already clearly provided, is irrelevant, is asked repeatedly, is broken into avoidable one-by-one back-and-forth, or blocks progress despite enough information.
+
 Mandatory medical-center requirements such as vaccines, signatures, paperwork, passport checks, or fitness-center steps can be helped when the message explains they are part of the government medical/residency process and tells the customer to proceed. Do not mark the message as an issue solely because it does not provide detailed clinical/legal reasoning.
 
 A first outbound or proactive passport renewal service message can be helped when it gives the passport expiry date, explains the renewal option, gives the home visit or embassy alternative, states the cost, and tells the customer what is needed next. Do not mark wrong_info solely because the passport expiry date is in the future, even if it is months away or in the next year. Future expiry does not prove renewal is unnecessary. Use wrong_info only when visible context proves the passport was already renewed, the expiry date is false, the customer already declined renewal, or the message requests payment/action under a visibly false premise.
@@ -143,17 +154,19 @@ A very brief "let me check / grant me a moment" response can be neutral or minor
 
 A single wrong-topic phrase, generic closing, or low-value acknowledgment is neutral or recovered_issue when it does not block the customer, is followed by correct material answers, and the customer remains calm. Use minor_issue only if it causes material confusion or delay. Do not mark major_issue or poor_tone solely for one recovered wrong-topic phrase.
 
-An isolated promotional, marketing, survey, birthday, re-engagement, caregiver, certified-caregiver, childcare, elderly-care, or general informational message can be neutral or minor_issue when it is sent after the customer's operational objective was already answered, the customer accepted or closed the support topic, and the message does not require meaningful effort or cause confusion. Do not mark it as major_issue solely because it is irrelevant after resolution.
+An isolated promotional, marketing, survey, birthday, re-engagement, caregiver, certified-caregiver, childcare, elderly-care, or general informational message should be neutral when it is sent after the customer's operational objective was already answered, the customer accepted or closed the support topic, or it is simply added at the end. Do not penalize it solely because it is promotional, irrelevant, or appended after resolution.
 
-The caregiver promo pattern ("Exciting news! We now offer certified caregivers for children and elderly family members..." / "reply here if you're interested to view profiles") is not a major_issue by itself. If it appears after the customer said "thanks", "got it", "great", "ok", "will do", or otherwise accepted the support answer, classify it as neutral unless it creates visible confusion or requires meaningful customer effort. If you want to penalize it as irrelevant noise, use minor_issue/other at most, with frustration_level_after_message none or low.
+The caregiver promo pattern ("Exciting news! We now offer certified caregivers for children and elderly family members..." / "reply here if you're interested to view profiles") is not a major_issue by itself. If it appears after the customer said "thanks", "got it", "great", "ok", "will do", or otherwise accepted the support answer, or if it is added at the end after the support answer, classify it as neutral. Do not penalize it as irrelevant noise unless it interrupts an active serious or sensitive matter.
 
-A promotional or unrelated message is a CX issue when it appears inside an active serious, urgent, blocked, or sensitive support discussion, such as cancellation/refund, payment failure, visa/legal risk, overstay/absconding risk, unresolved delivery before travel, unresolved complaint, repeated chasing, or visible customer frustration. In those cases, use ignored_context, poor_tone, unclear_guidance, or other depending on the impact, and escalate to major_issue if it delays or derails the needed answer.
+A promotional or unrelated message is a CX issue only when it appears out of context inside an active serious, urgent, blocked, or sensitive support discussion, such as cancellation/refund, payment failure, visa/legal risk, overstay/absconding risk, unresolved delivery before travel, unresolved complaint, repeated chasing, or visible customer frustration. In those cases, use ignored_context, poor_tone, unclear_guidance, or other depending on the impact, and escalate to major_issue only if it delays, ignores, or derails the needed answer.
 
 A repeated proactive broadcast or operational instruction is not automatically a major issue. If it repeats earlier process guidance but no contradiction is created and a later message gives the current status or next step, mark it minor_issue at most. Do not ignore it solely because the customer did not complain. Use major_issue when the repeat causes customer confusion, asks for contradictory action, blocks progress, or makes the customer repeat themselves.
 
 Repeated proactive broadcasts, payment reminders, document reminders, or "ACTION: Payment/Document" instructions can be CX issues even without visible customer frustration. Use minor_issue when the message adds avoidable noise or pressure but the customer still has a usable path. Use major_issue when the reminder conflicts with visible status, continues after payment/document submission, targets the wrong customer state, creates a loop, or blocks the current support need. If the reminder is valid because the customer has not paid or has not submitted required documents, do not mark the underlying requirement as our_side fault; use customer_side or shared depending on whether our wording added friction.
 
 An operational support-channel notice is not automatically a CX issue. If the message says "we are not receiving messages on this phone number", this number is no longer active, messages cannot be reviewed on this number, or the customer must use another WhatsApp number, use neutral when it gives a usable active support path and the customer's issue can continue with minimal friction. Use minor_issue when it causes avoidable channel friction or one repeat of the request. A first valid automated channel notice can be neutral; a second repeated notice should usually be minor_issue with repetition; a third or later repeated notice should usually be major_issue when it creates a channel loop, blocks support, or makes the customer repeat the same unresolved request. Use major_issue immediately when it gives no usable path or blocks an urgent issue.
+
+After a valid channel-change notice, do not over-penalize a first new-channel greeting such as "How can I help you today?" just because it does not automatically catch up from the previous chat. Use neutral or minor_issue at most when the customer can restate the issue once and the next support response handles it. Use major_issue only when the greeting loses a serious active request, causes repeated unresolved re-explaining, or blocks urgent/sensitive support.
 
 Wrong-context customer-status messages are strong message-level issues. If the target message is unsuitable for the customer's visible situation, known customer/maid status, payment/document status, location, cancellation state, or active request, mark it as a major_issue when material. Example: sending an instruction to go to a medical center when the visible journey shows the maid is outside the UAE. Use issue_type wrong_info when the message is false/contradictory, ignored_context when it misses visible status, or unclear_guidance when the status may have changed but the message fails to explain the current state.
 
@@ -176,8 +189,14 @@ Use minor_issue with unclear_guidance or poor_tone when wording, grammar, transl
 
 Use major_issue only when language quality materially changes the meaning, sounds rude/blaming/dismissive, creates trust risk, gives an unsafe or misleading instruction, or makes the customer unable to act. Do not penalize language more severely than its real CX impact.
 
+In sensitive complaint or welfare cases, distinguish defensive tone from failure to resolve. If an agent confirms the practical status, says management was checked or the incident was reported, and gives the customer the immediate answer, but also includes a defensive correction such as disputing "basement" or facility wording, use minor_issue with poor_tone or partial acknowledgment. Do not use major_issue or ignored_context unless the message fails to address the practical concern, dismisses the complaint entirely, denies visible facts, or leaves the customer blocked.
+
 ## K2. Payment-process updates are not automatically bad
 An operational payment or billing-process notice can be neutral or helped when it gives useful information about a payment model, future payment link, direct debit change, one-time adjustment, amount, due date, or expected payment method.
+
+A standard failed-bank-deduction broadcast can be helped or neutral when it states the amount, worker/payment context, customer-side reason such as insufficient funds or bank rejection, retry timing, and an alternative payment link. Do not mark it as an issue merely because it mentions insufficient funds, asks the customer to add funds, or gives a payment link. Mark an issue only when it contradicts visible payment status, repeats after the customer has already resolved/explained the issue, escalates with disproportionate pressure, or creates unclear/unsafe payment action.
+
+If a customer says funds were added, asks the company to try deduction again, or worries about using a link because of prior duplicate charge, a message is helped when it explains deduction is automatic or bank-controlled, gives the retry timing/trigger, tells the customer to keep funds available, and clearly says not to use the payment link now if it could duplicate the charge.
 
 Do not mark a payment-process update as an issue solely because it could explain more. Mark it as minor_issue only when the missing reason, amount, timing, payment link, or next step creates visible ambiguity, blocks action, or leads to follow-up confusion.
 
@@ -186,6 +205,8 @@ Use unclear_guidance for an unclear payment-process notice. Do not use major_iss
 Signature, VAT, bank-rejection, refund, or payment-confirmation requests should explain why the request is needed, what action the customer must take, and what happens next. If the message asks for a signature or payment action without connecting it to the visible process, use unclear_guidance or missing_next_step. Use wrong_info only if visible context proves the request or reason is false.
 
 Do not mark salary, card-payment, advance-salary, direct-debit, billing-cycle, future-renewal, or pay-period explanations as wrong_info unless visible context proves the explanation is false or contradictory. If the message plausibly explains which month or period a payment covers, how a credit/VAT/payment-plan calculation works, when salary will be released, or what future renewal amount means, treat it as helped or neutral. Use minor_issue/unclear_guidance only when the explanation is hard to act on or uses wording that could confuse the customer.
+
+Do not mark a direct billing/debit explanation as wrong_info solely because it is a billing claim or confidently explains a charge. If the answer is supported by visible account/payment context, or no visible context contradicts it, and it directly answers what the debit/payment is for, classify it as helped or neutral. Only mark wrong_info or major_issue when the explanation is contradicted by visible context, proven false, or creates unsafe payment action.
 
 A new or unexplained salary advance/deduction broadcast can be minor_issue with unclear_guidance when it says a salary will be deducted at the start of the month and transferred later, but does not explain why, whether the deduction is automatic, which month the deduction covers, or whether the customer must do anything. Use neutral only when visible context already explained this cycle or the broadcast is clearly an established recurring reminder. Do not use wrong_info unless visible context proves the dates, amount, or payment basis is false.
 
@@ -322,6 +343,8 @@ If "we will update you" is the main problem, use delay or missing_next_step depe
 - context_handling — good | partial | poor | not_applicable
 - issue_origin — our_side | customer_side | shared | none
 - issue_type — see section 6
+- contradiction — true if this target message creates, exposes, or is part of a contradiction with an earlier visible company-side message; otherwise false
+- first_contradiction_message_id — message_id of the first visible company-side message that created the contradiction, or "none" when contradiction is false
 - frustration_cause — short phrase describing the cause, or "none"
 - evidence — short quote or paraphrase from visible conversation
 - business_impact — short business-friendly impact statement
@@ -334,6 +357,31 @@ If "we will update you" is the main problem, use delay or missing_next_step depe
 ## Helped
 Customer asks what is missing. Agent clearly names the missing item and next step immediately.
 → message_level_effect: helped, frustration_level_after_message: none
+
+## Helped: required process details
+Customer asks for a travel NOC but does not know exact dates. Agent asks for exact departure date, return date, and whether the maid travels with the customer, alone, or with someone else.
+These are required details for the NOC, not unnecessary friction.
+→ helped, issue_origin: none, issue_type: none
+
+## Helped or neutral: standard failed-payment reminder
+Broadcast says the bank could not deduct a specific amount due to insufficient funds, says it will retry, and provides an alternative payment link.
+If this does not contradict known status and is not part of an excessive/escalating sequence, treat it as useful payment notice.
+→ helped or neutral, issue_origin: customer_side or none, issue_type: none
+
+## Helped: direct billing explanation supported by visible context
+Customer asks what a visible bank debit/payment is for. Agent directly explains the charge, such as a discounted Visa-Only package renewal or scheduled salary/payment amount, and no visible context contradicts the explanation.
+Do not mark wrong_info merely because the answer is a confident billing claim.
+→ helped or neutral, issue_origin: none, issue_type: none
+
+## Neutral or minor issue: first new-channel greeting after routing notice
+An automated message says the old number can no longer receive/review messages and gives the correct support WhatsApp number. On the new channel, the first agent says "How can I help you today?" instead of automatically continuing the prior chat.
+This is normal channel-transition friction when the customer can restate the issue once and the next support response handles it.
+→ neutral or minor_issue, not major_issue, unless it loses an urgent/sensitive active request or causes repeated unresolved re-explaining
+
+## Minor issue: defensive complaint reply that still resolves status
+Customer complains about pressure and poor office/waiting conditions. Agent says management was checked, confirms the practical status is resolved, reports the incident, but also defensively corrects the customer's wording about the facility.
+The practical answer helps, but the defensive tone can make the customer feel dismissed.
+→ minor_issue, issue_origin: our_side, issue_type: poor_tone
 
 ## Major issue: repeated request
 Customer already sent the passport. Agent asks for it again.
@@ -555,8 +603,8 @@ Do not mark a clear embassy/travel visa processing offer as major_issue solely b
 Do not penalize normal address/current-location collection unless visible context shows a contradiction or the message creates avoidable confusion. Do not use major_issue for address/current-location collection unless there is material contradiction, customer confusion, or downstream risk.
 Do not mark valid policy reassurance as wrong_info unless visible context shows it is false, contradictory, or unsafe.
 Do not mark a single recovered wrong-topic phrase or generic closing as poor_tone, minor_issue, or major_issue when the customer's material question is answered immediately after and there is no material confusion, delay, or frustration.
-Do not mark one isolated post-resolution promotional, birthday, survey, re-engagement, caregiver, or general informational message as major_issue when the customer had already accepted the support answer and the promo did not disrupt the journey.
-Do not ignore a promotional or unrelated message that appears during an active serious, urgent, blocked, or sensitive issue; treat it as a CX issue if it delays or displaces the needed support answer.
+Do not mark one isolated post-resolution promotional, birthday, survey, re-engagement, caregiver, or general informational message as major_issue when the customer had already accepted the support answer or the promo was added at the end after support was handled.
+Do not ignore a promotional or unrelated message that appears out of context during an active serious, urgent, blocked, or sensitive issue; treat it as a CX issue only if it delays, ignores, or displaces the needed support answer.
 Do not mark callback deflection as major_issue when the agent gives a usable WhatsApp path and resolves the issue in chat.
 Do not mark a later government photo/document rejection as wrong_info solely because an earlier message said the replacement was uploaded to the contract/profile/system. Upload does not mean government approval.
 Do not mark salary card/direct-contact coordination as an issue solely because an external provider date is not fixed, if payment method, fallback path, notification, and internal coordination are clear.

@@ -52,6 +52,9 @@
   "culprits": [
     "agent|bot|broadcast|customer"
   ],
+  "culprit_agent_names": [
+    "exact agent_full_name values for materially culpable human agents, or empty array"
+  ],
   "culprit_reason": "short explanation of who materially caused the bad experience or friction, or none",
   "recommended_actions": [
     "short actionable recommendation"
