@@ -6471,6 +6471,151 @@ def _render_stats_summary_table(rows: list[dict[str, Any]]) -> None:
     )
 
 
+def _score_mean_rows(conv_df: pd.DataFrame) -> list[dict[str, Any]]:
+    """Build average score rows for the main outcome/experience buckets."""
+    score_columns = {
+        "ai": "score_ai_judgment",
+        "message": "score_message_signals",
+        "final": "score_final",
+    }
+    if conv_df.empty or not any(column in conv_df.columns for column in score_columns.values()):
+        return []
+
+    handled = _norm_marker_series(conv_df, "handled_status")
+    experience = _norm_marker_series(conv_df, "customer_experience")
+    experience = experience.replace({"many": "bad", "zero_minimal": "good", "minimal": "good"})
+    scores = {
+        key: (
+            pd.to_numeric(conv_df[column], errors="coerce")
+            if column in conv_df.columns
+            else pd.Series([pd.NA] * len(conv_df), index=conv_df.index, dtype="Float64")
+        )
+        for key, column in score_columns.items()
+    }
+
+    buckets = [
+        ("Overall", pd.Series(True, index=conv_df.index), "total"),
+        ("Handled / Good", (handled == "handled") & (experience == "good"), "good"),
+        ("Handled / Bad", (handled == "handled") & (experience == "bad"), "bad"),
+        ("Unhandled / Good", (handled == "unhandled") & (experience == "good"), "warn"),
+        ("Unhandled / Bad", (handled == "unhandled") & (experience == "bad"), "critical"),
+    ]
+
+    rows: list[dict[str, Any]] = []
+    for label, mask, kind in buckets:
+        final_scores = scores["final"][mask].dropna()
+
+        def mean_label(score_key: str) -> str:
+            segment_scores = scores[score_key][mask].dropna()
+            if segment_scores.empty:
+                return "—"
+            return f"{float(segment_scores.mean()):.2f}"
+
+        rows.append(
+            {
+                "Segment": label,
+                "Journeys": int(mask.sum()),
+                "Scored journeys": int(final_scores.count()),
+                "Mean AI score": mean_label("ai"),
+                "Mean message-code score": mean_label("message"),
+                "Mean final score": mean_label("final"),
+                "_kind": kind,
+            }
+        )
+    return rows
+
+
+def _render_score_mean_table(rows: list[dict[str, Any]]) -> None:
+    """Render average score rows with the same visual system as Stats."""
+    if not rows:
+        st.caption("No final conversation scores are available for this run.")
+        return
+
+    header_bg = "#24272d"
+    total_bg = "#202329"
+    row_bg = "#17191d"
+    border = _DASH_COLORS["panel_border"]
+    text = _DASH_COLORS["text"]
+    muted = _DASH_COLORS["muted"]
+    accent_by_kind = {
+        "total": _DASH_COLORS["calm"],
+        "good": _DASH_COLORS["minimal"],
+        "bad": _DASH_COLORS["many"],
+        "warn": _DASH_COLORS["handled"],
+        "critical": _DASH_COLORS["unhandled"],
+    }
+    bg_by_kind = {
+        "total": total_bg,
+        "good": "#17231b",
+        "bad": "#261d18",
+        "warn": "#16221d",
+        "critical": "#24191b",
+    }
+    columns = [
+        "Segment",
+        "Journeys",
+        "Scored journeys",
+        "Mean AI score",
+        "Mean message-code score",
+        "Mean final score",
+    ]
+
+    body = []
+    for row in rows:
+        kind = str(row.get("_kind") or "")
+        bg = bg_by_kind.get(kind, row_bg)
+        accent = accent_by_kind.get(kind, _DASH_COLORS["dim"])
+        weight = "700" if kind == "total" else "500"
+        cells = []
+        for column in columns:
+            value = row.get(column, "")
+            color = text if column == "Segment" or kind == "total" else muted
+            if column.startswith("Mean"):
+                color = accent
+            extra = f"border-left:4px solid {accent};" if column == "Segment" else ""
+            display = f"{int(value):,}" if isinstance(value, int) else str(value)
+            cells.append(
+                f'<td style="background:{bg};border:1px solid {border};{extra}'
+                f'padding:8px 10px;text-align:left;font-weight:{weight};'
+                f'color:{color};white-space:nowrap;">{html_lib.escape(display)}</td>'
+            )
+        body.append("<tr>" + "".join(cells) + "</tr>")
+
+    headers = "".join(f"<th>{html_lib.escape(column)}</th>" for column in columns)
+    st.markdown(
+        f"""
+        <style>
+        .score-mean-table {{
+            width: min(980px, 100%);
+            border-collapse: separate;
+            border-spacing: 0;
+            color: {text};
+            font-size: 1rem;
+            line-height: 1.25;
+            border: 1px solid {border};
+            border-radius: 10px;
+            overflow: hidden;
+            background: {total_bg};
+        }}
+        .score-mean-table th {{
+            background: {header_bg};
+            border: 1px solid {border};
+            padding: 10px;
+            text-align: left;
+            font-weight: 800;
+            color: {text};
+            white-space: nowrap;
+        }}
+        </style>
+        <table class="score-mean-table">
+            <thead><tr>{headers}</tr></thead>
+            <tbody>{''.join(body)}</tbody>
+        </table>
+        """,
+        unsafe_allow_html=True,
+    )
+
+
 def _message_flag_stats(conversation_results: list[dict]) -> pd.DataFrame:
     """Count evaluated message flag colors by sender origin."""
     sender_types = ("Agent - L2", "Agent - Other", "Bot", "Broadcast")
@@ -7176,6 +7321,9 @@ def tab_stats() -> None:
             """
             - **Count** is the number of customer journeys in that result.
             - **Percentage** shows how much of the full review that result represents.
+            - **Average scores** shows the mean AI conversation score, message-code score,
+              and final score overall and split by handled/good, handled/bad,
+              unhandled/good, and unhandled/bad journeys.
             - **Handled** means the customer's request was completed. **Pending unresolved**
               means more work or follow-up was still needed. **Totally unresolved** means the
               request was not solved.
@@ -7209,6 +7357,13 @@ def tab_stats() -> None:
 
     rows = _stats_summary_rows(conv_df)
     _render_stats_summary_table(rows)
+
+    score_mean_rows = _score_mean_rows(conv_df)
+    st.markdown("### Average scores")
+    st.caption(
+        "Mean AI conversation score, message-code score, and final score for the whole run and the four outcome/experience groups."
+    )
+    _render_score_mean_table(score_mean_rows)
 
     stats_detail_tables = _stats_detail_tables_for_active_run()
     flag_stats_df = stats_detail_tables["sender"]
@@ -7309,6 +7464,19 @@ def tab_stats() -> None:
         data=stats_df.to_csv(index=False).encode("utf-8-sig"),
         file_name="cx_stats_summary.csv",
         mime="text/csv",
+    )
+    score_mean_df = pd.DataFrame(
+        [
+            {k: v for k, v in row.items() if not k.startswith("_")}
+            for row in score_mean_rows
+        ]
+    )
+    st.download_button(
+        "Download average score stats CSV",
+        data=score_mean_df.to_csv(index=False).encode("utf-8-sig"),
+        file_name="cx_average_score_stats.csv",
+        mime="text/csv",
+        disabled=score_mean_df.empty,
     )
     st.download_button(
         "Download message flag stats CSV",
