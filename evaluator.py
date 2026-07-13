@@ -904,6 +904,23 @@ def _apply_message_signal_to_conversation_score(parsed_json: dict, computed_meta
     )
     raw_total = _score_number((float(ai_judgment) + float(message_signal)) / 2.0, 0, 10)
     final_score = raw_total
+    # TEMPORARY GUARD — remove later:
+    # If the message-level signal falls below 2/5 of the 0-10 scale, hard-zero
+    # the final conversation score regardless of the model's conversation-level
+    # judgment. 2/5 on a 0-10 scale is 4.0.
+    if float(message_signal) < 4.0:
+        raw_total = 0
+        final_score = 0
+        existing_explanation = str(score.get("score_explanation") or "").strip()
+        guard_note = (
+            "Temporary scoring guard applied: message-level signal was below "
+            "2/5, so the final score was forced to 0."
+        )
+        score["score_explanation"] = (
+            f"{existing_explanation} {guard_note}".strip()
+            if existing_explanation
+            else guard_note
+        )
     score["ai_judgment_score"] = ai_judgment
     score["message_signal_score"] = message_signal
     score["raw_total_score"] = raw_total
