@@ -1214,6 +1214,7 @@ def conversation_filters(
     conv_df: pd.DataFrame,
     key_prefix: str = "conv_filters",
     include_journey_starter: bool = False,
+    include_agent_presence: bool = False,
 ) -> dict:
     """Render filter widgets and return the active filter values."""
     if conv_df.empty:
@@ -1221,6 +1222,7 @@ def conversation_filters(
 
     sel_journey_starter: list[str] = []
     sel_culprits: list[str] = []
+    sel_agent_presence = "All journeys"
     with st.expander("Filters", expanded=True):
         c1, c2, c3 = st.columns(3)
         with c1:
@@ -1336,6 +1338,22 @@ def conversation_filters(
                     key=f"{key_prefix}_journey_starter",
                     help="The sender type of the first message in the appended customer journey.",
                 )
+            if include_agent_presence:
+                sel_agent_presence = st.selectbox(
+                    "Human-agent involvement",
+                    [
+                        "All journeys",
+                        "No human agent anywhere in journey",
+                        "Has source conversation >2 messages with no agent",
+                    ],
+                    index=0,
+                    key=f"{key_prefix}_agent_presence",
+                    help=(
+                        "Use this to find fully bot/broadcast/customer journeys, or journeys where "
+                        "at least one source conversation segment had more than 2 messages without "
+                        "a human agent message."
+                    ),
+                )
             mr_options = ["Any", "Only manual review", "Only no manual review"]
             sel_mr = st.selectbox("Human review", mr_options, index=0, key=f"{key_prefix}_manual_review")
             broadcast_issue_mode = st.radio(
@@ -1375,6 +1393,7 @@ def conversation_filters(
         "main_issue_type": sel_issue_type,
         "culprits": sel_culprits,
         "journey_starter": sel_journey_starter,
+        "agent_presence": sel_agent_presence,
         "manual_review": sel_mr,
         "broadcast_only_red_mode": broadcast_issue_mode,
         "date_range": date_range,
@@ -1401,6 +1420,21 @@ def apply_conversation_filters(conv_df: pd.DataFrame, filters: dict) -> pd.DataF
     in_filter("main_issue_origin", "main_issue_origin")
     in_filter("main_issue_type", "main_issue_type")
     in_filter("journey_starter", "journey_starter")
+
+    def truthy_series(col: str) -> pd.Series:
+        return conv_df[col].map(
+            lambda value: str(value if value is not None else False).strip().lower() in {"true", "1", "yes", "y"}
+        )
+
+    agent_presence = str(filters.get("agent_presence") or "All journeys")
+    if agent_presence == "No human agent anywhere in journey" and "has_human_agent_in_journey" in conv_df.columns:
+        mask &= ~truthy_series("has_human_agent_in_journey")
+    elif (
+        agent_presence == "Has source conversation >2 messages with no agent"
+        and "has_agentless_source_conversation_over_2_messages" in conv_df.columns
+    ):
+        mask &= truthy_series("has_agentless_source_conversation_over_2_messages")
+
     selected_culprits = {str(value).strip().lower() for value in (filters.get("culprits") or []) if value}
     if selected_culprits and "culprits" in conv_df.columns:
         mask &= conv_df["culprits"].fillna("").astype(str).map(
@@ -1412,18 +1446,14 @@ def apply_conversation_filters(conv_df: pd.DataFrame, filters: dict) -> pd.DataF
     mr = filters.get("manual_review")
     manual_review_series = None
     if "manual_review_required" in conv_df.columns:
-        manual_review_series = conv_df["manual_review_required"].map(
-            lambda value: str(value if value is not None else False).strip().lower() in {"true", "1", "yes", "y"}
-        )
+        manual_review_series = truthy_series("manual_review_required")
     if mr == "Only manual review" and "manual_review_required" in conv_df.columns:
         mask &= manual_review_series
     elif mr == "Only no manual review" and "manual_review_required" in conv_df.columns:
         mask &= ~manual_review_series
 
     if "broadcast_only_red_issue" in conv_df.columns:
-        broadcast_only_series = conv_df["broadcast_only_red_issue"].map(
-            lambda value: str(value if value is not None else False).strip().lower() in {"true", "1", "yes", "y"}
-        )
+        broadcast_only_series = truthy_series("broadcast_only_red_issue")
         broadcast_issue_mode = str(filters.get("broadcast_only_red_mode") or "Include")
         if broadcast_issue_mode == "Only":
             mask &= broadcast_only_series

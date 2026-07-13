@@ -12,6 +12,53 @@ FRUSTRATION_ORDER = ["none", "low", "medium", "high", "cancellation_risk"]
 FRUSTRATION_RANK = {v: i for i, v in enumerate(FRUSTRATION_ORDER)}
 
 
+def _is_human_agent_transcript_message(message: dict) -> bool:
+    """Return whether a transcript message was sent by a human agent."""
+    raw_role = str(message.get("raw_sender_role") or "").strip().lower()
+    sender_role = str(message.get("sender_role") or "").strip().lower()
+    return raw_role == "agent" or sender_role == "agent"
+
+
+def _agent_presence_summary(
+    transcript: list[dict],
+    *,
+    fallback_conversation_id: str = "",
+) -> dict[str, Any]:
+    """Summarize human-agent presence at journey and source-conversation level."""
+    source_stats: dict[str, dict[str, Any]] = {}
+    has_human_agent = False
+
+    for message in transcript or []:
+        if not isinstance(message, dict):
+            continue
+        source_id = str(
+            message.get("source_conversation_id")
+            or message.get("conversation_id")
+            or fallback_conversation_id
+            or ""
+        ).strip()
+        if not source_id:
+            source_id = "__unknown__"
+
+        stats = source_stats.setdefault(source_id, {"message_count": 0, "has_agent": False})
+        stats["message_count"] += 1
+        if _is_human_agent_transcript_message(message):
+            stats["has_agent"] = True
+            has_human_agent = True
+
+    agentless_source_ids = [
+        source_id
+        for source_id, stats in source_stats.items()
+        if int(stats.get("message_count") or 0) > 2 and not bool(stats.get("has_agent"))
+    ]
+
+    return {
+        "has_human_agent_in_journey": has_human_agent,
+        "has_agentless_source_conversation_over_2_messages": bool(agentless_source_ids),
+        "agentless_source_conversation_ids_over_2_messages": " | ".join(agentless_source_ids),
+    }
+
+
 def humanize_label(value: Any) -> str:
     """Render enum/metric identifiers as readable labels."""
     text = str(value or "").strip()
@@ -469,6 +516,10 @@ def flatten_conversation_row(
         "conversation_id": conv_result.get("conversation_id", ""),
         "customer_journey_id": conv_result.get("conversation_id", ""),
         "journey_starter": journey_starter,
+        **_agent_presence_summary(
+            transcript if isinstance(transcript, list) else [],
+            fallback_conversation_id=str(conv_result.get("conversation_id", "") or ""),
+        ),
         "customer_name": get_md("customer_name"),
         "customer_phone": get_md("customer_phone"),
         "source_conversation_ids": get_md("source_conversation_ids", "conversation_ids"),

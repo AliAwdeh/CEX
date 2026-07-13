@@ -3723,11 +3723,13 @@ def _conversation_filters_with_keys(
     conv_df: pd.DataFrame,
     key_prefix: str,
     include_journey_starter: bool = False,
+    include_agent_presence: bool = False,
 ) -> dict:
     return ui_components_module.conversation_filters(
         conv_df,
         key_prefix=key_prefix,
         include_journey_starter=include_journey_starter,
+        include_agent_presence=include_agent_presence,
     )
 
 
@@ -9006,6 +9008,77 @@ def _message_results_by_index(message_results: list[dict] | None) -> dict[str, d
     }
 
 
+def _agent_presence_summary_for_review(conversation_result: dict) -> dict[str, Any]:
+    """Return small human-agent presence markers for Journey Review filtering."""
+    conversation_id = str(conversation_result.get("conversation_id") or "").strip()
+    source_stats: dict[str, dict[str, Any]] = {}
+    has_human_agent = False
+
+    for message in conversation_result.get("transcript") or []:
+        if not isinstance(message, dict):
+            continue
+        source_id = str(
+            message.get("source_conversation_id")
+            or message.get("conversation_id")
+            or conversation_id
+            or ""
+        ).strip()
+        if not source_id:
+            source_id = "__unknown__"
+
+        stats = source_stats.setdefault(source_id, {"message_count": 0, "has_agent": False})
+        stats["message_count"] += 1
+        if _flagged_sender_type(message) == "Agent":
+            stats["has_agent"] = True
+            has_human_agent = True
+
+    agentless_source_ids = [
+        source_id
+        for source_id, stats in source_stats.items()
+        if int(stats.get("message_count") or 0) > 2 and not bool(stats.get("has_agent"))
+    ]
+    return {
+        "has_human_agent_in_journey": has_human_agent,
+        "has_agentless_source_conversation_over_2_messages": bool(agentless_source_ids),
+        "agentless_source_conversation_ids_over_2_messages": " | ".join(agentless_source_ids),
+    }
+
+
+def _add_review_agent_presence_columns(conv_df: pd.DataFrame, review_index: dict[str, Any]) -> pd.DataFrame:
+    """Attach cached human-agent presence markers to the Journey Review table."""
+    if conv_df.empty or "conversation_id" not in conv_df.columns:
+        return conv_df
+    presence_by_id = review_index.get("agent_presence_by_id") or {}
+    if not presence_by_id:
+        return conv_df
+
+    out = conv_df.copy()
+    ids = out["conversation_id"].astype(str)
+    out["has_human_agent_in_journey"] = ids.map(
+        lambda conversation_id: bool(
+            (presence_by_id.get(conversation_id) or {}).get("has_human_agent_in_journey", False)
+        )
+    )
+    out["has_agentless_source_conversation_over_2_messages"] = ids.map(
+        lambda conversation_id: bool(
+            (presence_by_id.get(conversation_id) or {}).get(
+                "has_agentless_source_conversation_over_2_messages",
+                False,
+            )
+        )
+    )
+    out["agentless_source_conversation_ids_over_2_messages"] = ids.map(
+        lambda conversation_id: str(
+            (presence_by_id.get(conversation_id) or {}).get(
+                "agentless_source_conversation_ids_over_2_messages",
+                "",
+            )
+            or ""
+        )
+    )
+    return out
+
+
 def _conversation_results_identity_key(conversation_results: list[dict]) -> tuple[int, int]:
     """Cheap identity key for cached derived data from the currently loaded run."""
     return (id(conversation_results), len(conversation_results or []))
@@ -9020,6 +9093,7 @@ def _build_review_filter_index(conversation_results: list[dict]) -> dict[str, An
     sender_levels_by_id: dict[str, dict[str, set[str]]] = {}
     chunk_levels_by_id: dict[str, dict[str, set[str]]] = {}
     contradiction_modes_by_id: dict[str, set[str]] = {}
+    agent_presence_by_id: dict[str, dict[str, Any]] = {}
     chunk_options: set[str] = set()
 
     for conversation_result in conversation_results or []:
@@ -9068,11 +9142,13 @@ def _build_review_filter_index(conversation_results: list[dict]) -> dict[str, An
         sender_levels_by_id[conversation_id] = sender_levels
         chunk_levels_by_id[conversation_id] = chunk_levels
         contradiction_modes_by_id[conversation_id] = contradiction_modes
+        agent_presence_by_id[conversation_id] = _agent_presence_summary_for_review(conversation_result)
 
     value = {
         "sender_levels_by_id": sender_levels_by_id,
         "chunk_levels_by_id": chunk_levels_by_id,
         "contradiction_modes_by_id": contradiction_modes_by_id,
+        "agent_presence_by_id": agent_presence_by_id,
         "chunk_options": sorted(chunk_options, key=lambda value: value.lower()),
     }
     return value
@@ -9094,12 +9170,17 @@ def _ensure_active_run_derived_numbers() -> None:
         review_cached is not None
         and "contradiction_modes_by_id" in (review_cached.get("value") or {})
     )
+    review_cache_has_agent_presence = (
+        review_cached is not None
+        and "agent_presence_by_id" in (review_cached.get("value") or {})
+    )
     if (
         stats_cached is not None
         and stats_cached.get("key") == key
         and review_cached is not None
         and review_cached.get("key") == key
         and review_cache_has_contradictions
+        and review_cache_has_agent_presence
     ):
         return
 
@@ -9113,7 +9194,12 @@ def _ensure_active_run_derived_numbers() -> None:
                 "key": key,
                 "value": _build_stats_detail_tables(conversation_results),
             }
-        if not (review_cached is not None and review_cached.get("key") == key):
+        if not (
+            review_cached is not None
+            and review_cached.get("key") == key
+            and review_cache_has_contradictions
+            and review_cache_has_agent_presence
+        ):
             st.session_state["_review_filter_index_cache"] = {
                 "key": key,
                 "value": _build_review_filter_index(conversation_results),
@@ -9133,6 +9219,7 @@ def _review_filter_index_for_active_run() -> dict[str, Any]:
         "sender_levels_by_id": {},
         "chunk_levels_by_id": {},
         "contradiction_modes_by_id": {},
+        "agent_presence_by_id": {},
         "chunk_options": [],
     }
 
@@ -9667,6 +9754,8 @@ def tab_review() -> None:
     if conv_df.empty:
         st.info("No customer journey results are available yet.")
         return
+    review_index = _review_filter_index_for_active_run()
+    conv_df = _add_review_agent_presence_columns(conv_df, review_index)
 
     st.caption(
         "Browse customer journeys by result, customer frustration, review priority, or the main customer problem."
@@ -9681,14 +9770,17 @@ def tab_review() -> None:
             """
             1. Use the main filters to narrow the list by outcome, customer experience,
                unresolved status, frustration, problem type, who started the journey, review
-               requirement, or date.
+               requirement, human-agent involvement, or date.
             2. Leaving a filter empty means it does not limit the results. Choosing several
                values inside one filter shows journeys matching any of those values. Filters
                used in different boxes work together, so a journey must match all of them.
-            3. **Broadcast-only issue journeys** are hidden by default. Select
+            3. **Human-agent involvement** can show journeys where no human agent participated
+               anywhere, or journeys that contain at least one source conversation segment with
+               more than 2 messages and no agent message inside that segment.
+            4. **Broadcast-only issue journeys** are hidden by default. Select
                **Only broadcast-only issue journeys** to show exclusively the journeys where
                the only red issue came from a system broadcast.
-            4. The message filters look for journeys containing the selected type of evaluated
+            5. The message filters look for journeys containing the selected type of evaluated
                message. **Agent scope** can be **No filter**, **All agents**, or **L2**. **All agents**
                includes every human agent; **L2** only includes the configured L2 agent list.
                **Red** needs attention, **Yellow** may need improvement, and **Green** was assessed
@@ -9696,14 +9788,14 @@ def tab_review() -> None:
                selected filter. The **RAG chunk** filter works the same way, but only for red/yellow
                flagged bot messages that used the selected chunk. Use **Chunk severity** to choose
                red only, yellow only, or any flagged severity.
-            5. Use search to find a customer or conversation directly. Use **Worst score first**
+            6. Use search to find a customer or conversation directly. Use **Worst score first**
                to begin with the journeys that may need the most attention.
-            6. Turn on **Show journey analysis and review metrics**. Check the journey outcome,
+            7. Turn on **Show journey analysis and review metrics**. Check the journey outcome,
                experience, score, frustration, main issue, recommended actions, and flagged
                message summary.
-            7. Read the full conversation. Use the information button beside evaluated
+            8. Read the full conversation. Use the information button beside evaluated
                messages when you need the message-level details.
-            8. Add a clear review comment and select **Mark as reviewed** when your check is
+            9. Add a clear review comment and select **Mark as reviewed** when your check is
                complete.
             """
         ))
@@ -9718,9 +9810,9 @@ def tab_review() -> None:
         conv_df,
         "review_filters",
         include_journey_starter=True,
+        include_agent_presence=True,
     )
     filtered_df = _apply_conversation_filters_fresh(conv_df, review_filters)
-    review_index = _review_filter_index_for_active_run()
     sender_flag_filters, chunk_flag_filter, contradiction_filter = _render_sender_flag_filters(review_index)
     filtered_df = _filter_conversations_by_sender_flags(
         filtered_df,
