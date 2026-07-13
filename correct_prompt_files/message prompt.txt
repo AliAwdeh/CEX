@@ -120,13 +120,23 @@ Use ignored_context when the message misses a visible pending/not-done status.
 Use unclear_guidance when the request may be valid but the reason is misleading or not explained.
 
 ## G1. Contradiction source tracking
-When the target message exposes or participates in a contradiction with an earlier visible company-side message, set `contradiction = true` and set `first_contradiction_message_id` to the message_id of the first visible company-side message that created the conflicting state. Company-side messages include bot, assistant, broadcast/system, and human agent messages.
+When the target message exposes or participates in a contradiction with an earlier visible company-side message, set `contradiction = true`, set `first_contradiction_message_id` to the message_id of the first visible company-side message that created the conflicting state, and set `contradiction_debug_message` to one concise sentence explaining the two conflicting facts and why that first message id is the source. Company-side messages include bot, assistant, broadcast/system, and human agent messages.
 
-If a later human agent message gives the more plausible current truth, clarifies the state, or corrects a prior bot/system/broadcast contradiction, do not punish the human agent merely for being the second side of the contradiction. Still set `contradiction = true` and point `first_contradiction_message_id` to the earlier bot/system/broadcast message. The code will transfer the issue to the original bot/system/broadcast source. Judge the human agent message on whether it helps or recovers the situation.
+If a later human agent message conflicts with, clarifies, or corrects a prior bot/system/broadcast contradiction, treat the human agent as the source of truth for contradiction transfer. Do not punish the human agent merely for being the second side of the contradiction. Still set `contradiction = true` and point `first_contradiction_message_id` to the earlier bot/system/broadcast message. The code will transfer the issue to the original bot/system/broadcast source and keep the human agent message green.
+
+For human-agent source-of-truth transfer, choose the first earlier automation message that directly states the opposite of the human agent's current claim. Do not point to an earlier automation message that agrees with the agent on the main status. Example: if a system first says "contract cancelled", later bots say "the cancellation was incorrect/no cancellation request", and then a human agent says "the contract was cancelled due to unpaid payment", the contradiction source for the human agent is the first bot that said "not cancelled/no cancellation", not the earlier system message that also said "cancelled".
+
+This source-of-truth protection applies only against chatbot/automation messages: bot, assistant, system, broadcast, automated notification, template, SMS, or email. If the contradiction is caused by a prior human agent, or the human agent openly says an agent-side mistake happened in front of the customer ("I was wrong", "my mistake", "we gave you wrong information", "the previous agent was wrong"), do not transfer it to automation. Point `first_contradiction_message_id` to the earlier human-agent source when visible and evaluate the agent-side issue normally.
+
+After a human agent establishes the current truth, later human-agent messages that are consistent with that agent truth are not new contradictions merely because older bot/system/broadcast messages said something different. Judge those later agent messages on clarity, completeness, delay, tone, and next step, not as contradiction.
+
+Do not mark a short operational follow-up as a contradiction only because it follows a contradictory or corrected status. Messages like "I will send the link shortly", "I will call you now", "please wait while I check", or "I will update you shortly" are contradiction=false unless the follow-up itself repeats or introduces a conflicting fact, amount, status, deadline, or instruction.
+
+Do not mark a contradiction when the target message is consistent with the earlier correction but uses different wording. For Emirates ID / courier status, "not delivered yet", "still with courier", "with courier", and "delivery scheduled for tomorrow" can all be consistent. They contradict only a completed/final delivery claim such as "already delivered".
 
 If the target message itself is the first company-side message that creates a material contradiction, set `first_contradiction_message_id` to the target message's own message_id and penalize it heavily, usually as `major_issue` with `issue_type = wrong_info` or `ignored_context`.
 
-If there is no visible contradiction, set `contradiction = false` and `first_contradiction_message_id = "none"`.
+If there is no visible contradiction, set `contradiction = false`, `first_contradiction_message_id = "none"`, and `contradiction_debug_message = "none"`.
 
 ## H. Separate bad outcome from blame
 A blocked outcome from a valid business necessity, policy restriction, legal/government requirement, eligibility issue, or customer-side constraint is not automatically issue_origin = our_side. Only attribute to our side when our response created extra friction: unclear guidance, late explanation, contradiction, repetition, delay, or vague "we will update you" language. Apply only when the constraint is visible — do not invent hidden rules.
@@ -345,6 +355,7 @@ If "we will update you" is the main problem, use delay or missing_next_step depe
 - issue_type — see section 6
 - contradiction — true if this target message creates, exposes, or is part of a contradiction with an earlier visible company-side message; otherwise false
 - first_contradiction_message_id — message_id of the first visible company-side message that created the contradiction, or "none" when contradiction is false
+- contradiction_debug_message — one concise sentence explaining the conflicting facts and why first_contradiction_message_id is the source, or "none" when contradiction is false
 - frustration_cause — short phrase describing the cause, or "none"
 - evidence — short quote or paraphrase from visible conversation
 - business_impact — short business-friendly impact statement

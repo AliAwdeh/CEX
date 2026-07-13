@@ -539,6 +539,13 @@ def _render_message_run_details(message_result: dict) -> None:
         st.markdown("**Recommended fix**")
         st.write(pj.get("recommended_fix") or "—")
 
+    if pj.get("contradiction"):
+        st.markdown("**Contradiction debug**")
+        st.write(pj.get("contradiction_debug_message") or "-")
+        st.caption(
+            f"First contradiction message ID: {pj.get('first_contradiction_message_id') or 'none'}"
+        )
+
     with st.expander("Message run JSON", expanded=False):
         st.json(message_result, expanded=False)
 
@@ -810,6 +817,8 @@ def render_message_evaluation_panel(message_result: dict) -> None:
         badges.append(_badge("Issue", humanize_label(pj["issue_type"]), "#b91c1c"))
     if pj.get("issue_origin") and pj["issue_origin"] != "none":
         badges.append(_badge("Origin", humanize_label(pj["issue_origin"]), "#475569"))
+    if pj.get("contradiction"):
+        badges.append(_badge("Contradiction", "Yes", "#0891b2"))
     st.markdown("".join(badges), unsafe_allow_html=True)
 
     if idx is not None:
@@ -839,6 +848,13 @@ def render_message_evaluation_panel(message_result: dict) -> None:
         st.write(pj.get("recommended_fix") or "_(none)_")
         st.markdown("**Frustration cause**")
         st.write(pj.get("frustration_cause") or "_(none)_")
+
+    if pj.get("contradiction"):
+        st.markdown("**Contradiction debug**")
+        st.write(pj.get("contradiction_debug_message") or "_(none)_")
+        st.caption(
+            f"First contradiction message ID: {pj.get('first_contradiction_message_id') or 'none'}"
+        )
 
 
 def render_conversation_summary_card(

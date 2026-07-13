@@ -295,7 +295,16 @@ class Database:
         )
         self._conn.row_factory = sqlite3.Row
         self._conn.execute("PRAGMA foreign_keys = ON")
-        self._conn.execute("PRAGMA journal_mode = WAL")
+        self._conn.execute("PRAGMA busy_timeout = 5000")
+        try:
+            self._conn.execute("PRAGMA journal_mode = WAL")
+        except sqlite3.OperationalError:
+            # Some copied/read-only/locked SQLite files cannot switch into WAL.
+            # Keep the app usable with SQLite's default journal behavior.
+            try:
+                self._conn.execute("PRAGMA journal_mode = DELETE")
+            except sqlite3.OperationalError:
+                pass
         with self._lock:
             self._conn.executescript(SCHEMA)
         self._ensure_runtime_columns()
@@ -734,6 +743,29 @@ class Database:
             return
         self.set_active_prompt(int(default["id"]))
 
+    def _prompt_id_for_run(self, prompt_id: Optional[int], kind: str) -> Optional[int]:
+        """Return a valid prompt id in this DB, falling back to the active prompt."""
+        try:
+            if prompt_id is not None:
+                row = self._fetchone(
+                    "SELECT id FROM prompt_templates WHERE id=? AND kind=? LIMIT 1",
+                    (int(prompt_id), kind),
+                )
+                if row:
+                    return int(row["id"])
+            row = self._fetchone(
+                "SELECT id FROM prompt_templates WHERE kind=? AND is_active=1 LIMIT 1",
+                (kind,),
+            )
+            if not row:
+                row = self._fetchone(
+                    "SELECT id FROM prompt_templates WHERE kind=? AND is_default=1 LIMIT 1",
+                    (kind,),
+                )
+            return int(row["id"]) if row else None
+        except (sqlite3.Error, TypeError, ValueError):
+            return None
+
     # -------- runs --------
 
     def start_run(
@@ -745,6 +777,8 @@ class Database:
         name: Optional[str] = None,
     ) -> int:
         now = _now_iso()
+        message_prompt_id = self._prompt_id_for_run(message_prompt_id, "message_level")
+        conversation_prompt_id = self._prompt_id_for_run(conversation_prompt_id, "conversation_level")
         cur = self._exec(
             "INSERT INTO runs"
             "(name, csv_name, started_at, status, run_config_json, message_prompt_id, conversation_prompt_id)"

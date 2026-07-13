@@ -121,6 +121,9 @@ _ML_DEFAULTS = {
     "business_impact": "",
     "recommended_fix": "",
 }
+_MISSING_CONTRADICTION_DEBUG_MESSAGE = (
+    "Contradiction flagged by the message-level evaluator, but no debug reason was returned."
+)
 
 _FORBIDDEN_ID_FIELDS = {
     "conversation_id",
@@ -143,6 +146,24 @@ _CUSTOMER_CLOSING_RE = re.compile(
 _ACTIVE_SENSITIVE_RE = re.compile(
     r"\b(cancel|refund|payment\s+fail|paid\s+already|overstay|abscond|expired|expiry|urgent|asap|"
     r"complain|complaint|escalat|legal|police|fine|blocked|not\s+working|issue\s+not\s+resolved)\b",
+    re.IGNORECASE,
+)
+_AGENT_SELF_ADMISSION_RE = re.compile(
+    r"\b("
+    r"i\s+(?:am|was|were)?\s*(?:wrong|mistaken|at\s+fault)|"
+    r"my\s+(?:mistake|fault|error)|"
+    r"i\s+(?:gave|provided|shared|sent|told|said)\s+(?:you\s+)?(?:the\s+)?(?:wrong|incorrect|inaccurate)|"
+    r"(?:we|our\s+team)\s+(?:made|caused)\s+(?:a\s+)?(?:mistake|error)|"
+    r"(?:we|our\s+team)\s+(?:gave|provided|shared|sent|told|said)\s+(?:you\s+)?(?:the\s+)?(?:wrong|incorrect|inaccurate)|"
+    r"(?:previous\s+agent|the\s+agent|our\s+agent).{0,80}(?:wrong|incorrect|mistake|error)"
+    r")\b",
+    re.IGNORECASE,
+)
+_AUTOMATION_MISTAKE_RE = re.compile(
+    r"\b(?:automated|automatic|system|bot|broadcast|notification|sms|email|template|auto[-\s]?message)"
+    r".{0,80}\b(?:wrong|incorrect|mistake|error)\b|"
+    r"\b(?:wrong|incorrect|mistake|error)\b.{0,80}"
+    r"\b(?:automated|automatic|system|bot|broadcast|notification|sms|email|template|auto[-\s]?message)\b",
     re.IGNORECASE,
 )
 
@@ -334,6 +355,10 @@ def _normalize_message_entity(record: dict | None) -> str:
     if raw_role == "agent":
         return "agent"
     role = str(record.get("sender_role") or "").strip().lower()
+    if role in {"system", "broadcast"}:
+        return "broadcast"
+    if role in {"bot", "assistant"}:
+        return "bot"
     if role in {"customer", "agent"}:
         return role
     return "unknown"
@@ -349,12 +374,44 @@ def _normalize_message_result_flags(result: dict) -> dict:
         parsed["contradiction"] = _normalize_bool_flag(parsed.get("contradiction"), default=False)
     first_id = str(parsed.get("first_contradiction_message_id") or "none").strip()
     parsed["first_contradiction_message_id"] = first_id or "none"
+    debug_msg = str(parsed.get("contradiction_debug_message") or "").strip()
+    if parsed["contradiction"]:
+        parsed["contradiction_debug_message"] = (
+            debug_msg
+            or _MISSING_CONTRADICTION_DEBUG_MESSAGE
+        )
+    else:
+        parsed["contradiction_debug_message"] = debug_msg or "none"
     result["parsed_json"] = parsed
     result["evaluation_output"] = parsed
     return result
 
 
-def _clear_message_issue(parsed: dict, *, reason: str) -> None:
+def _set_contradiction_debug_if_missing(parsed: dict, message: str) -> None:
+    current = str(parsed.get("contradiction_debug_message") or "").strip()
+    if (
+        not current
+        or current.lower() == "none"
+        or current == _MISSING_CONTRADICTION_DEBUG_MESSAGE
+    ):
+        parsed["contradiction_debug_message"] = message
+
+
+def _agent_self_admitted_issue(record: dict | None) -> bool:
+    text = str((record or {}).get("message_text") or "")
+    if not text.strip():
+        return False
+    if not _AGENT_SELF_ADMISSION_RE.search(text):
+        return False
+    return not bool(_AUTOMATION_MISTAKE_RE.search(text))
+
+
+def _clear_message_issue(
+    parsed: dict,
+    *,
+    reason: str,
+    contradiction_debug_message: str | None = None,
+) -> None:
     parsed["message_level_effect"] = "helped"
     parsed["frustration_level_after_message"] = "none"
     parsed["frustration_change"] = "decreased"
@@ -367,6 +424,10 @@ def _clear_message_issue(parsed: dict, *, reason: str) -> None:
     parsed["business_impact"] = reason
     parsed["recommended_fix"] = "none"
     parsed["contradiction_agent_issue_suppressed"] = True
+    parsed["contradiction_debug_message"] = (
+        contradiction_debug_message
+        or "Human agent conflicted with an earlier bot/system/broadcast message, so the contradiction penalty was transferred to the automation source."
+    )
 
 
 def _mark_contradiction_source_issue(parsed: dict, *, target_id: str) -> None:
@@ -386,6 +447,9 @@ def _mark_contradiction_source_issue(parsed: dict, *, target_id: str) -> None:
     parsed["contradiction"] = True
     parsed["first_contradiction_message_id"] = target_id
     parsed["contradiction_source_penalized"] = True
+    parsed["contradiction_debug_message"] = (
+        "This bot/system/broadcast message was identified as the automation source contradicted by a later human agent."
+    )
 
 
 def _build_contradiction_source_result(
@@ -414,6 +478,7 @@ def _build_contradiction_source_result(
         "issue_type": "wrong_info",
         "contradiction": True,
         "first_contradiction_message_id": source_message_id,
+        "contradiction_debug_message": "This earlier bot/system/broadcast message was identified as the first source of the contradiction.",
         "frustration_cause": "contradictory status",
         "evidence": "Earlier bot/system message created a contradictory customer-visible state.",
         "business_impact": "Original bot/system message created a contradictory customer-visible state later corrected by a human agent.",
@@ -507,6 +572,16 @@ def apply_contradiction_source_suppression(
         if current_entity != "agent" or first_entity not in {"bot", "broadcast"}:
             continue
 
+        if _agent_self_admitted_issue(current_record):
+            parsed["contradiction_transfer_skipped"] = True
+            _set_contradiction_debug_if_missing(
+                parsed,
+                "Transfer skipped because the human agent appears to admit an agent-side mistake, not merely correct bot/system/broadcast automation.",
+            )
+            result["parsed_json"] = parsed
+            result["evaluation_output"] = parsed
+            continue
+
         parsed["first_contradiction_message_id"] = source_message_id
 
         source_result = results_by_id.get(source_message_id) or results_by_id.get(first_id)
@@ -547,6 +622,10 @@ def apply_contradiction_source_suppression(
         _clear_message_issue(
             parsed,
             reason="Human agent message surfaced or corrected a contradiction created by an earlier bot/system message.",
+            contradiction_debug_message=(
+                f"Human agent was treated as source of truth against earlier automation message {source_message_id}; "
+                "the agent issue was suppressed and the automation source was penalized."
+            ),
         )
         result["parsed_json"] = parsed
         result["evaluation_output"] = parsed
@@ -1371,10 +1450,48 @@ def _eval_conversation_level(
     return record
 
 
+def _evaluation_sources(
+    df: pd.DataFrame | None,
+    existing_conversation_results: Optional[list[dict]] = None,
+) -> list[tuple[str, list[dict], dict]]:
+    """Return normalized conversation sources from a CSV dataframe or saved DB rows."""
+    sources: list[tuple[str, list[dict], dict]] = []
+    if df is not None and not df.empty:
+        for conversation_id, group in get_conversation_groups(df):
+            conversation_id = str(conversation_id)
+            sources.append(
+                (
+                    conversation_id,
+                    message_records_from_group(group, conversation_id),
+                    conversation_metadata_from_group(group),
+                )
+            )
+        return sources
+
+    for loaded in existing_conversation_results or []:
+        if not isinstance(loaded, dict):
+            continue
+        conversation_id = str(loaded.get("conversation_id") or loaded.get("thread_id") or "")
+        if not conversation_id:
+            continue
+        records = list(loaded.get("transcript") or [])
+        if not records:
+            continue
+        sources.append(
+            (
+                conversation_id,
+                records,
+                dict(loaded.get("conversation_metadata") or {}),
+            )
+        )
+    return sources
+
+
 def run_evaluation(
-    df: pd.DataFrame,
+    df: pd.DataFrame | None,
     client,
     config: RunConfig,
+    existing_conversation_results: Optional[list[dict]] = None,
     on_progress: Optional[Callable[[dict], None]] = None,
     cancel_requested: Optional[Callable[[], bool]] = None,
     on_message_result: Optional[Callable[[dict], None]] = None,
@@ -1407,15 +1524,15 @@ def run_evaluation(
     if target_role not in ("agent", "customer"):
         target_role = "agent"
 
-    groups = get_conversation_groups(df)
+    sources = _evaluation_sources(df, existing_conversation_results)
     # Selection precedence: explicit IDs (random sampler) > max_conversations slice.
     if config.selected_conversation_ids is not None:
         wanted = set(str(x) for x in config.selected_conversation_ids)
-        groups = [g for g in groups if str(g[0]) in wanted]
+        sources = [source for source in sources if str(source[0]) in wanted]
     elif config.max_conversations is not None:
-        groups = groups[: config.max_conversations]
+        sources = sources[: config.max_conversations]
 
-    total_conversations = len(groups)
+    total_conversations = len(sources)
     if on_progress:
         on_progress(
             {
@@ -1446,9 +1563,7 @@ def run_evaluation(
     ml_tasks: list[tuple[str, dict, list[dict]]] = []  # (conversation_id, target_record, history)
     no_target_convs: list[str] = []
 
-    for ci, (conversation_id, group) in enumerate(groups, start=1):
-        records = message_records_from_group(group, conversation_id)
-        conversation_metadata = conversation_metadata_from_group(group)
+    for ci, (conversation_id, records, conversation_metadata) in enumerate(sources, start=1):
         targets = [r for r in records if r.get("sender_role") == target_role]
         if config.max_agent_messages_per_conv is not None:
             targets = targets[: config.max_agent_messages_per_conv]

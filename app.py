@@ -1426,6 +1426,15 @@ def _loaded_run_saved_counts() -> dict[str, int]:
         }
 
 
+def _saved_counts_for_run(db: Database, run_id: int | None) -> dict[str, int]:
+    if run_id is None:
+        return {"conversation_results": 0, "message_results": 0, "run_errors": 0}
+    try:
+        return db.get_run_result_counts(int(run_id))
+    except Exception:
+        return {"conversation_results": 0, "message_results": 0, "run_errors": 0}
+
+
 def _show_live_run_failure(
     failure_box,
     failures: list[dict],
@@ -1544,6 +1553,34 @@ def _load_compact_run_details(db: Database | None = None) -> RunResults | None:
     )
     rr = _normalize_run_results_for_display(rr)
     return rr
+
+
+def _load_saved_run_transcripts_only(
+    db: Database | None = None,
+    run_id: int | None = None,
+) -> RunResults | None:
+    """Load saved transcripts without old message-level details for DB-backed full runs."""
+    run_id = int(run_id if run_id is not None else (st.session_state.get("current_run_id") or 0))
+    if not run_id:
+        return None
+
+    db = db or get_active_db()
+    loaded = db.load_run_results(
+        int(run_id),
+        include_transcripts=True,
+        include_message_details=False,
+        include_raw=False,
+        include_debug=False,
+        include_input_history=False,
+    )
+    rr = RunResults(
+        conversation_results=loaded["conversation_results"],
+        message_level_results=[],
+        errors=loaded["errors"],
+        started_at=loaded["started_at"],
+        finished_at=loaded["finished_at"],
+    )
+    return _normalize_run_results_for_display(rr)
 
 
 def _load_selected_conversation_detail(
@@ -1935,6 +1972,246 @@ def _execute_conversation_only_run(
             )
     except Exception as e:
         progress_box.error(f"Conversation-only evaluation failed: {e}")
+    finally:
+        try:
+            status = "completed"
+            if st.session_state.cancel_flag:
+                status = "cancelled"
+            elif results is None:
+                status = "failed"
+            n_convs = len(results.conversation_results) if results else 0
+            n_msgs = len(results.message_level_results) if results else 0
+            n_err = len(results.errors) if results else 0
+            db.finish_run(run_id, status, n_convs, n_msgs, n_err)
+        except Exception:
+            pass
+        st.session_state.run_in_progress = False
+        st.session_state.cancel_flag = False
+
+
+def _execute_db_source_full_run(
+    *,
+    source_run_id: int,
+    source_conversation_results: list[dict],
+    max_conversations: int | None,
+    selected_conversation_ids: list[str] | None,
+    progress_box,
+    bar,
+    counter_box,
+    current_box,
+) -> None:
+    """Run the full evaluator from saved DB transcripts and save as a new run."""
+    if not source_conversation_results:
+        progress_box.error("The loaded DB run has no saved transcripts to evaluate.")
+        return
+
+    db = get_active_db()
+    config, ml_prompt_id, cl_prompt_id = _build_run_config()
+    config.selected_conversation_ids = (
+        list(selected_conversation_ids) if selected_conversation_ids else None
+    )
+    config.max_conversations = None if config.selected_conversation_ids else max_conversations
+    client = build_client(config.api.base_url, config.api.api_key)
+    source_run = db.get_run(int(source_run_id)) or {}
+
+    estimate = _estimate_call_counts_from_saved_conversations(
+        source_conversation_results,
+        max_conversations=config.max_conversations,
+        max_target_messages_per_journey=config.max_agent_messages_per_conv,
+        selected_conversation_ids=config.selected_conversation_ids,
+        target_role=config.message_target_role,
+    )
+    if int(estimate["conversations"] or 0) <= 0:
+        progress_box.warning("No saved journeys match this DB run scope.")
+        return
+
+    st.session_state.run_in_progress = True
+    st.session_state.cancel_flag = False
+    st.session_state.progress_log = []
+
+    run_config_serializable = {
+        "api_base_url": config.api.base_url,
+        "model": config.api.model,
+        "message_model": config.api.model,
+        "conversation_model": config.conversation_api_config().model,
+        "service_tier": config.api.service_tier,
+        "message_thinking_effort": config.api.thinking_effort,
+        "conversation_thinking_effort": config.conversation_api_config().thinking_effort,
+        "temperature": config.api.temperature,
+        "top_p": config.api.top_p,
+        "max_tokens": config.api.max_tokens,
+        "timeout": config.api.timeout,
+        "retries": config.api.retries,
+        "concurrency": config.api.concurrency,
+        "run_all_conversations": config.max_conversations is None and not config.selected_conversation_ids,
+        "max_conversations": config.max_conversations,
+        "max_target_messages_per_journey": config.max_agent_messages_per_conv,
+        "truncate_messages": config.truncate_messages,
+        "max_chars_per_message": config.max_chars_per_message,
+        "include_unknown_in_history": config.include_unknown_in_history,
+        "stop_on_error": config.stop_on_error,
+        "save_raw_responses": config.save_raw_responses,
+        "message_target_role": config.message_target_role,
+        "selected_conversation_ids": config.selected_conversation_ids,
+        "selected_conversation_count": len(config.selected_conversation_ids or []),
+        "run_name": (st.session_state.run_name or "").strip(),
+        "run_source": "saved_db_run",
+        "source_run_id": int(source_run_id),
+        "source_run_name": source_run.get("name"),
+        "source_csv_name": source_run.get("csv_name"),
+        "used_loaded_run_without_csv": True,
+    }
+    run_name = (st.session_state.run_name or "").strip() or None
+    run_id = db.start_run(
+        csv_name=source_run.get("csv_name") or f"saved_db_run_{source_run_id}",
+        run_config=run_config_serializable,
+        message_prompt_id=ml_prompt_id,
+        conversation_prompt_id=cl_prompt_id,
+        name=run_name,
+    )
+    st.session_state.current_run_id = run_id
+    st.session_state.loaded_run_label = None
+    st.session_state._run_results_db_path = _active_db_path()
+
+    total_conv = int(estimate["conversations"] or 0)
+    total_calls = int(estimate["total_calls"] or 0)
+    progress_state = {
+        "convs_done": 0,
+        "calls_done": 0,
+        "successes": 0,
+        "failures": 0,
+        "reruns": 0,
+        "recovered": 0,
+    }
+    live_failures: list[dict] = []
+    live_reruns: list[dict] = []
+    failure_box = st.empty()
+    rerun_box = st.empty()
+
+    def on_progress(evt: dict) -> None:
+        nonlocal total_conv, total_calls
+        phase = evt.get("phase")
+        if phase == "start":
+            total_conv = int(evt.get("total_conversations") or total_conv or 0)
+            total_calls = total_calls or total_conv
+        elif phase == "conversation_start":
+            current_box.info(
+                f"Journey {evt.get('conversation_index')}/{evt.get('total_conversations')} - "
+                f"Customer `{evt.get('conversation_id')}` - "
+                f"{evt.get('target_messages', 0)} target message(s)"
+            )
+        elif phase == "message_done":
+            progress_state["calls_done"] += 1
+            if evt.get("status") == "ok":
+                progress_state["successes"] += 1
+            else:
+                progress_state["failures"] += 1
+            automatic_reruns = int(evt.get("automatic_reruns") or 0)
+            if automatic_reruns:
+                progress_state["reruns"] += automatic_reruns
+                if evt.get("recovered_after_rerun"):
+                    progress_state["recovered"] += 1
+                _show_live_message_rerun(rerun_box, live_reruns, evt)
+        elif phase == "conversation_done":
+            progress_state["convs_done"] += 1
+            progress_state["calls_done"] += 1
+            if evt.get("status") == "ok":
+                progress_state["successes"] += 1
+            else:
+                progress_state["failures"] += 1
+            automatic_reruns = int(evt.get("automatic_reruns") or 0)
+            if automatic_reruns:
+                progress_state["reruns"] += automatic_reruns
+                if evt.get("recovered_after_rerun"):
+                    progress_state["recovered"] += 1
+                _show_live_message_rerun(rerun_box, live_reruns, evt)
+
+        frac = min(progress_state["calls_done"] / max(total_calls, 1), 1.0) if total_calls > 0 else 0.0
+        bar.progress(
+            frac,
+            text=f"Journeys {progress_state['convs_done']}/{total_conv} | Calls {progress_state['calls_done']}/{total_calls}",
+        )
+        counter_box.markdown(
+            f"**Successes:** {progress_state['successes']} | "
+            f"**Failures:** {progress_state['failures']} | "
+            f"**Automatic reruns:** {progress_state['reruns']} | "
+            f"**Recovered:** {progress_state['recovered']}"
+        )
+        st.session_state.progress_log.append(evt)
+
+    def cancel_requested() -> bool:
+        return bool(st.session_state.cancel_flag)
+
+    persistence_errors: list[str] = []
+
+    def save_message(mr: dict) -> None:
+        try:
+            mr["run_id"] = run_id
+            db.save_message_result(run_id, mr)
+        except Exception as exc:
+            persistence_errors.append(f"message result: {exc}")
+
+    def save_conversation(cr: dict) -> None:
+        try:
+            cr["run_id"] = run_id
+            db.save_conversation_result(run_id, cr)
+        except Exception as exc:
+            persistence_errors.append(f"conversation result: {exc}")
+
+    def save_err(err: dict) -> None:
+        _show_live_run_failure(failure_box, live_failures, err)
+        try:
+            db.save_error(run_id, err)
+        except Exception as exc:
+            persistence_errors.append(f"run error: {exc}")
+
+    def persist_completed_results() -> None:
+        if results is None:
+            return
+        _clear_run_results(db, run_id)
+        for mr in results.message_level_results:
+            mr["run_id"] = run_id
+            db.save_message_result(run_id, mr)
+        for cr in results.conversation_results:
+            cr["run_id"] = run_id
+            db.save_conversation_result(run_id, cr)
+        for err in results.errors:
+            db.save_error(run_id, err)
+
+    results = None
+    try:
+        progress_box.info("Starting full evaluation from saved DB transcripts...")
+        results = run_evaluation(
+            df=None,
+            existing_conversation_results=source_conversation_results,
+            client=client,
+            config=config,
+            on_progress=on_progress,
+            cancel_requested=cancel_requested,
+            on_message_result=save_message,
+            on_conversation_result=save_conversation,
+            on_error=save_err,
+        )
+        st.session_state.run_results = results
+        st.session_state._run_results_db_path = _active_db_path()
+        _clear_run_derived_caches()
+        persist_completed_results()
+        completion_message = (
+            f"DB-sourced evaluation finished. {len(results.conversation_results)} customer journeys processed, "
+            f"{len(results.message_level_results)} message-level calls, "
+            f"{len(results.errors)} errors. Saved as run #{run_id}."
+        )
+        if results.errors:
+            progress_box.warning(completion_message)
+        else:
+            progress_box.success(completion_message)
+        if persistence_errors:
+            st.warning(
+                "Some live DB saves failed during the run, but the completed results were saved again at the end. "
+                f"First error: {persistence_errors[0]}"
+            )
+    except Exception as exc:
+        progress_box.error(f"DB-sourced evaluation failed: {exc}")
     finally:
         try:
             status = "completed"
@@ -2553,6 +2830,408 @@ def _execute_smart_failed_repair(
         st.session_state.cancel_flag = False
 
 
+def _render_db_source_run(
+    *,
+    db: Database,
+    source_run_id: int,
+    conversation_only_available: bool,
+    conversation_rerun_ids: list[str],
+) -> None:
+    source_run = db.get_run(int(source_run_id)) or {}
+    source_label = source_run.get("name") or "Untitled run"
+    source_csv = source_run.get("csv_name") or "unknown CSV"
+    st.info(
+        f"Evaluation source: saved DB run #{int(source_run_id)} - "
+        f"{source_label} ({source_csv}). A full run from DB creates a new run; it does not overwrite the source."
+    )
+    st.caption(f"Customer journey list below is loaded from saved DB run #{int(source_run_id)} only.")
+
+    if not st.session_state.selected_model:
+        st.warning(
+            "Select a message-level model from the sidebar before running. "
+            "Click 'Load available models' to populate the list."
+        )
+    if not st.session_state.get("conversation_selected_model"):
+        st.warning(
+            "Select a conversation-level model from the sidebar before running. "
+            "Click 'Load available models' to populate the list."
+        )
+
+    source_rr = _load_saved_run_transcripts_only(db, source_run_id)
+    source_conversation_results = list(getattr(source_rr, "conversation_results", []) or [])
+    source_conversation_results = [
+        result for result in source_conversation_results if result.get("transcript")
+    ]
+    total_saved_journeys = len(source_conversation_results)
+    if not total_saved_journeys:
+        st.error("This saved run has no transcript rows, so it cannot be used as a full DB run source.")
+        _render_last_run_summary()
+        return
+
+    st.text_input(
+        "Run name",
+        key="run_name",
+        placeholder=f"e.g., Rerun from DB run #{int(source_run_id)}",
+        help="Saved with the new run and shown in Past runs.",
+    )
+
+    st.markdown("### Saved DB journey selection")
+    run_all_key = f"db_source_run_all_{int(source_run_id)}"
+    max_key = f"db_source_max_conversations_{int(source_run_id)}"
+    if run_all_key not in st.session_state:
+        st.session_state[run_all_key] = False
+    if max_key not in st.session_state:
+        st.session_state[max_key] = min(
+            max(1, int(st.session_state.get("max_conversations") or 50)),
+            total_saved_journeys,
+        )
+    if int(st.session_state.get(max_key) or 1) > total_saved_journeys:
+        st.session_state[max_key] = total_saved_journeys
+
+    st.caption(f"Loaded DB source has {total_saved_journeys:,} saved journey transcript(s).")
+    st.toggle(
+        "Run all loaded DB journeys",
+        key=run_all_key,
+        help="When enabled, the full DB-sourced run processes every journey transcript in the loaded saved run.",
+    )
+    if st.session_state.get(run_all_key):
+        max_conversations = None
+    else:
+        max_conversations = int(
+            st.number_input(
+                "Saved DB journeys to process",
+                min_value=1,
+                max_value=total_saved_journeys,
+                step=1,
+                key=max_key,
+                help="When 'Run all loaded DB journeys' is off, this many journeys are processed from the saved-run order.",
+            )
+        )
+
+    selector_df = _saved_conversation_selector_rows(source_conversation_results)
+    all_db_ids = selector_df["journey_id"].astype(str).tolist() if not selector_df.empty else []
+    selected_ids_key = f"db_source_selected_conversation_ids_{int(source_run_id)}"
+    feedback_key = f"db_source_sample_feedback_{int(source_run_id)}"
+    cleaned_selected_db_ids = _ordered_selected_ids(
+        all_db_ids,
+        list(st.session_state.get(selected_ids_key) or []),
+    )
+    if cleaned_selected_db_ids != list(st.session_state.get(selected_ids_key) or []):
+        st.session_state[selected_ids_key] = cleaned_selected_db_ids
+    selected_db_ids = cleaned_selected_db_ids
+    if selected_db_ids:
+        st.caption(
+            f"DB run #{int(source_run_id)} has {len(selected_db_ids):,} pinned journey/journeys. "
+            "This selection is separate from the uploaded CSV selection and from other DB runs."
+        )
+    db_search = st.text_input(
+        "Find saved DB customer journey",
+        key=f"db_source_journey_selection_query_{int(source_run_id)}",
+        placeholder="Search by customer name, phone, journey ID, source conversation ID, or date",
+        disabled=bool(st.session_state.get(run_all_key)) or st.session_state.run_in_progress or selector_df.empty,
+    ).strip().lower()
+    filtered_selector_df = selector_df
+    if db_search and not selector_df.empty:
+        filtered_selector_df = selector_df[
+            selector_df["search_text"].fillna("").astype(str).str.contains(db_search, regex=False)
+        ]
+    max_visible_options = 250
+    visible_selector_df = filtered_selector_df.head(max_visible_options).copy()
+    visible_options = visible_selector_df["label"].tolist() if not visible_selector_df.empty else []
+    visible_label_to_id = (
+        dict(zip(visible_selector_df["label"], visible_selector_df["journey_id"].astype(str)))
+        if not visible_selector_df.empty
+        else {}
+    )
+    visible_key = f"db_source_visible_journey_labels_{int(source_run_id)}"
+    if visible_key in st.session_state:
+        visible_option_set = set(visible_options)
+        st.session_state[visible_key] = [
+            label for label in st.session_state[visible_key] if label in visible_option_set
+        ]
+    st.caption(
+        f"Showing {len(visible_selector_df):,} of {len(filtered_selector_df):,} matching saved DB journeys "
+        f"({len(selector_df):,} total)."
+    )
+    picked_db_labels = st.multiselect(
+        "Select customer journeys from the current DB search results",
+        options=visible_options,
+        key=visible_key,
+        disabled=bool(st.session_state.get(run_all_key)) or st.session_state.run_in_progress or selector_df.empty,
+        help=(
+            "Pick one or more matching saved DB journeys, then add or replace the pinned DB run selection. "
+            "Run all ignores pinned selections."
+        ),
+    )
+    picked_db_ids = [visible_label_to_id[label] for label in picked_db_labels if label in visible_label_to_id]
+    pick_cols = st.columns([1, 1, 1])
+    with pick_cols[0]:
+        if st.button(
+            "Add selected",
+            key=f"db_source_add_selected_{int(source_run_id)}",
+            disabled=not picked_db_ids or bool(st.session_state.get(run_all_key)) or st.session_state.run_in_progress,
+            use_container_width=True,
+            help="Add the selected visible DB journeys to the pinned run selection.",
+        ):
+            st.session_state[selected_ids_key] = _ordered_selected_ids(all_db_ids, selected_db_ids + picked_db_ids)
+            st.rerun()
+    with pick_cols[1]:
+        if st.button(
+            "Replace with selected",
+            key=f"db_source_replace_selected_{int(source_run_id)}",
+            disabled=not picked_db_ids or bool(st.session_state.get(run_all_key)) or st.session_state.run_in_progress,
+            use_container_width=True,
+            help="Run only the selected visible DB journeys.",
+        ):
+            st.session_state[selected_ids_key] = _ordered_selected_ids(all_db_ids, picked_db_ids)
+            st.rerun()
+    with pick_cols[2]:
+        if st.button(
+            "Select all matches",
+            key=f"db_source_select_all_matches_{int(source_run_id)}",
+            disabled=filtered_selector_df.empty or bool(st.session_state.get(run_all_key)) or st.session_state.run_in_progress,
+            use_container_width=True,
+            help="Pin every saved DB journey matching the current search. If search is empty, this selects all saved DB journeys.",
+        ):
+            st.session_state[selected_ids_key] = _ordered_selected_ids(
+                all_db_ids,
+                filtered_selector_df["journey_id"].astype(str).tolist(),
+            )
+            st.rerun()
+    if not selected_db_ids and st.session_state.get(selected_ids_key):
+        st.session_state[selected_ids_key] = []
+
+    sample_size = total_saved_journeys if max_conversations is None else int(max_conversations)
+    sample_size = min(max(1, sample_size), total_saved_journeys)
+    sample_cols = st.columns([1, 1, 3])
+    with sample_cols[0]:
+        if st.button(
+            "Random sample",
+            key=f"db_source_random_sample_{int(source_run_id)}",
+            disabled=bool(st.session_state.get(run_all_key)) or st.session_state.run_in_progress or selector_df.empty,
+            use_container_width=True,
+            help=(
+                "Pick a random proportional sample from the selected saved DB run. "
+                "Sample size uses the DB journey count above."
+            ),
+        ):
+            sampled_ids = proportional_stratified_sample_ids(selector_df, sample_size)
+            st.session_state[selected_ids_key] = _ordered_selected_ids(all_db_ids, sampled_ids)
+            source_mix = selector_df["journey_starter"].value_counts()
+            sample_mix = (
+                selector_df[selector_df["journey_id"].astype(str).isin(set(sampled_ids))]
+                ["journey_starter"]
+                .value_counts()
+            )
+            mix_summary = ", ".join(
+                (
+                    f"{humanize_label(starter)} "
+                    f"{int(sample_mix.get(starter, 0)):,}/{len(sampled_ids):,} "
+                    f"({int(sample_mix.get(starter, 0)) / max(len(sampled_ids), 1):.1%}; "
+                    f"source {count / max(len(selector_df), 1):.1%})"
+                )
+                for starter, count in source_mix.items()
+            )
+            st.session_state[feedback_key] = (
+                f"Selected a random DB sample of {len(sampled_ids):,} journey/journeys: {mix_summary}."
+            )
+            st.rerun()
+    with sample_cols[1]:
+        if st.button(
+            "Clear selection",
+            key=f"db_source_clear_sample_{int(source_run_id)}",
+            disabled=not selected_db_ids or st.session_state.run_in_progress,
+            use_container_width=True,
+        ):
+            st.session_state[selected_ids_key] = []
+            st.session_state[feedback_key] = "Cleared the pinned DB journey selection."
+            st.rerun()
+
+    sample_feedback = st.session_state.pop(feedback_key, None)
+    if sample_feedback:
+        st.success(sample_feedback)
+    if selected_db_ids and st.session_state.get(run_all_key):
+        st.info(
+            f"Run all is on, so the {len(selected_db_ids):,} selected DB journey/journeys are ignored. "
+            "Turn Run all off to use the selection."
+        )
+    elif selected_db_ids:
+        st.success(
+            f"{len(selected_db_ids):,} DB journey/journeys pinned for run #{int(source_run_id)}. "
+            "The full DB run will use this selection until you clear it."
+        )
+        selected_preview_df = selector_df[
+            selector_df["journey_id"].astype(str).isin(set(selected_db_ids))
+        ].copy()
+        selected_preview_df["order"] = selected_preview_df["journey_id"].astype(str).map(
+            {journey_id: idx for idx, journey_id in enumerate(selected_db_ids)}
+        )
+        selected_preview_df = selected_preview_df.sort_values("order")
+        preview_cols = [
+            "customer_phone",
+            "customer_name",
+            "journey_starter",
+            "source_conversation_count",
+            "message_count",
+            "conversation_start_date",
+            "conversation_end_date",
+        ]
+        with st.expander("Pinned DB journeys", expanded=False):
+            st.dataframe(
+                selected_preview_df[[c for c in preview_cols if c in selected_preview_df.columns]],
+                use_container_width=True,
+                hide_index=True,
+            )
+
+    active_selected_db_ids = None if st.session_state.get(run_all_key) else selected_db_ids or None
+    target_role = str(st.session_state.message_target_role or "agent")
+    estimate = _estimate_call_counts_from_saved_conversations(
+        source_conversation_results,
+        max_conversations=None if active_selected_db_ids else max_conversations,
+        max_target_messages_per_journey=int(st.session_state.max_agent_messages_per_conv),
+        selected_conversation_ids=active_selected_db_ids,
+        target_role=target_role,
+    )
+    st.markdown("### Evaluation estimate")
+    role_label = "assistant" if target_role == "agent" else "customer"
+    st.caption(
+        f"Message-level layer will evaluate **{role_label} messages** from the saved DB transcript."
+    )
+    metric_row(
+        [
+            ("Customer journeys to evaluate", f"{int(estimate['conversations']):,}", None),
+            (f"{role_label.capitalize()}-message AI calls", f"{int(estimate['message_level_calls']):,}", None),
+            ("Journey-level AI calls", f"{int(estimate['conversation_level_calls']):,}", None),
+            ("Total estimated AI calls", f"{int(estimate['total_calls']):,}", None),
+        ]
+    )
+    st.caption(
+        "Token/cost estimate is only calculated for uploaded CSV runs. "
+        "DB-sourced runs still use the active prompts, models, limits, and safeguards."
+    )
+
+    no_csv_failed_mode = "Smart repair"
+    failed_ids: set[str] = set()
+    if source_run_id:
+        failed_ids = set(db.list_run_failed_conversation_ids(int(source_run_id)))
+    if failed_ids:
+        with st.expander(
+            f"Run Failed from loaded run #{int(source_run_id)}",
+            expanded=False,
+        ):
+            st.caption(
+                f"Failed journeys found: {len(failed_ids):,}. "
+                "Details are loaded only after you click Run Failed."
+            )
+            no_csv_failed_mode = st.radio(
+                "Run Failed mode",
+                ["Smart repair", "Full failed journeys"],
+                key=f"run_failed_mode_db_source_{int(source_run_id)}",
+                horizontal=True,
+                help=(
+                    "Smart repair reruns only failed message rows, and reruns the "
+                    "conversation layer only for journeys whose conversation result failed. "
+                    "Full failed journeys reruns every target message plus conversation "
+                    "analysis for each failed journey using the saved transcript."
+                ),
+            )
+
+    run_col, convo_only_col, failed_col, cancel_col, _ = st.columns([1, 1, 1, 1, 2])
+    with run_col:
+        run_clicked = st.button(
+            "Run CX Evaluation",
+            type="primary",
+            disabled=(
+                st.session_state.run_in_progress
+                or not st.session_state.selected_model
+                or not st.session_state.get("conversation_selected_model")
+                or int(estimate["conversations"] or 0) <= 0
+            ),
+            use_container_width=True,
+            help="Run message-level + conversation-level analysis using saved DB transcripts.",
+        )
+    with convo_only_col:
+        convo_only_clicked = st.button(
+            f"Run Conversation Analysis ({len(conversation_rerun_ids):,})",
+            disabled=(
+                st.session_state.run_in_progress
+                or not st.session_state.get("conversation_selected_model")
+                or not conversation_only_available
+                or not conversation_rerun_ids
+            ),
+            use_container_width=True,
+        )
+    with failed_col:
+        run_failed_clicked = st.button(
+            f"Run Failed ({len(failed_ids):,})",
+            disabled=(
+                st.session_state.run_in_progress
+                or not failed_ids
+                or not st.session_state.selected_model
+                or not st.session_state.get("conversation_selected_model")
+            ),
+            use_container_width=True,
+            help="Repair failed rows in the loaded run using saved DB transcripts/results.",
+        )
+    with cancel_col:
+        if st.session_state.run_in_progress:
+            if st.button("Cancel run", use_container_width=True):
+                st.session_state.cancel_flag = True
+                st.toast("Cancelling after current call finishes...")
+
+    progress_box = st.empty()
+    bar = st.progress(0, text="Idle")
+    counter_box = st.empty()
+    current_box = st.empty()
+
+    if run_clicked:
+        _execute_db_source_full_run(
+            source_run_id=int(source_run_id),
+            source_conversation_results=source_conversation_results,
+            max_conversations=None if active_selected_db_ids else max_conversations,
+            selected_conversation_ids=active_selected_db_ids,
+            progress_box=progress_box,
+            bar=bar,
+            counter_box=counter_box,
+            current_box=current_box,
+        )
+    elif convo_only_clicked:
+        _execute_conversation_only_run(
+            df=None,
+            progress_box=progress_box,
+            bar=bar,
+            counter_box=counter_box,
+            current_box=current_box,
+            selected_conversation_ids=conversation_rerun_ids,
+        )
+    elif run_failed_clicked:
+        detail_rr = _load_compact_run_details(db) or st.session_state.get("run_results")
+        failed_plan = _failed_run_repair_plan(detail_rr)
+        if no_csv_failed_mode == "Full failed journeys":
+            failed_plan = _full_failed_repair_plan_from_loaded_run(
+                detail_rr,
+                sorted(failed_ids),
+                target_role=target_role,
+                max_messages_per_conversation=int(
+                    st.session_state.get("max_agent_messages_per_conv") or 0
+                )
+                or None,
+            )
+        _execute_smart_failed_repair(
+            df=None,
+            run_id=int(source_run_id),
+            plan=failed_plan,
+            progress_box=progress_box,
+            bar=bar,
+            counter_box=counter_box,
+            current_box=current_box,
+        )
+        del detail_rr
+        gc.collect()
+
+    _render_last_run_summary()
+
+
 def _conv_dataframe_from_results() -> pd.DataFrame:
     rr = st.session_state.run_results
     if not rr:
@@ -2853,6 +3532,120 @@ def _customer_ids_from_saved_run(db: Database, run_id: int) -> tuple[list[str], 
 
     result_ids = [x for x in db.list_run_conversation_ids(int(run_id)) if x]
     return result_ids, "saved run results"
+
+
+def _conversation_result_id(result: dict) -> str:
+    return str(result.get("conversation_id") or result.get("thread_id") or "").strip()
+
+
+def _saved_conversation_selector_rows(conversation_results: list[dict]) -> pd.DataFrame:
+    """Build one row per saved DB journey for random sampling and preview."""
+    rows: list[dict[str, Any]] = []
+    for result in conversation_results or []:
+        journey_id = _conversation_result_id(result)
+        if not journey_id:
+            continue
+        records = list(result.get("transcript") or [])
+        md = dict(result.get("conversation_metadata") or {})
+        first_message = records[0] if records else {}
+        raw_starter = (
+            first_message.get("raw_sender_role")
+            or first_message.get("sender_role")
+            or first_message.get("sender_entity")
+            or "unknown"
+        )
+        journey_starter = str(raw_starter or "unknown").strip().lower()
+        journey_starter = {
+            "customer": "consumer",
+            "assistant": "bot",
+        }.get(journey_starter, journey_starter)
+        customer_name = str(md.get("customer_name") or "").strip()
+        customer_phone = str(md.get("customer_phone") or journey_id or "").strip()
+        source_ids = str(md.get("source_conversation_ids") or "").strip()
+        source_count = md.get("source_conversation_count") or 0
+        start_date = str(md.get("conversation_start_date") or "").strip()
+        end_date = str(md.get("conversation_end_date") or "").strip()
+        display_name = customer_name or "Unknown customer"
+        label = (
+            f"{customer_phone} • {display_name} • {source_count} source convs • "
+            f"{len(records)} msgs"
+        )
+        search_text = " ".join(
+            [
+                journey_id,
+                customer_name,
+                customer_phone,
+                source_ids,
+                start_date,
+                end_date,
+            ]
+        ).lower()
+        rows.append(
+            {
+                "journey_id": journey_id,
+                "journey_starter": journey_starter,
+                "customer_name": customer_name,
+                "customer_phone": customer_phone,
+                "source_conversation_ids": source_ids,
+                "source_conversation_count": source_count,
+                "message_count": len(records),
+                "customer_messages": sum(1 for r in records if r.get("sender_role") == "customer"),
+                "agent_messages": sum(1 for r in records if r.get("sender_role") == "agent"),
+                "conversation_start_date": start_date,
+                "conversation_end_date": end_date,
+                "label": label,
+                "search_text": search_text,
+            }
+        )
+    return pd.DataFrame(rows)
+
+
+def _scoped_saved_conversation_results(
+    conversation_results: list[dict],
+    *,
+    selected_conversation_ids: list[str] | None = None,
+    max_conversations: int | None = None,
+) -> list[dict]:
+    rows = [cr for cr in conversation_results or [] if _conversation_result_id(cr)]
+    if selected_conversation_ids:
+        wanted = {str(value) for value in selected_conversation_ids if str(value).strip()}
+        return [cr for cr in rows if _conversation_result_id(cr) in wanted]
+    if max_conversations is not None:
+        return rows[: max(0, int(max_conversations))]
+    return rows
+
+
+def _estimate_call_counts_from_saved_conversations(
+    conversation_results: list[dict],
+    *,
+    max_conversations: int | None = None,
+    max_target_messages_per_journey: int | None = None,
+    selected_conversation_ids: list[str] | None = None,
+    target_role: str = "agent",
+) -> dict[str, int | str]:
+    role = str(target_role or "agent").strip().lower()
+    if role not in {"agent", "customer"}:
+        role = "agent"
+    scoped = _scoped_saved_conversation_results(
+        conversation_results,
+        selected_conversation_ids=selected_conversation_ids,
+        max_conversations=max_conversations,
+    )
+    message_calls = 0
+    for result in scoped:
+        records = list(result.get("transcript") or [])
+        targets = [record for record in records if record.get("sender_role") == role]
+        if max_target_messages_per_journey is not None:
+            targets = targets[: max(0, int(max_target_messages_per_journey))]
+        message_calls += len(targets)
+    conversation_calls = len(scoped)
+    return {
+        "conversations": int(conversation_calls),
+        "message_level_calls": int(message_calls),
+        "conversation_level_calls": int(conversation_calls),
+        "total_calls": int(message_calls + conversation_calls),
+        "target_role": role,
+    }
 
 
 def _journey_selector_rows(df: pd.DataFrame) -> pd.DataFrame:
@@ -4637,7 +5430,11 @@ def _render_saved_runs_loader(key_prefix: str, *, expanded: bool = False) -> Non
             if st.button("Load this run", key=f"{key_prefix}_load_run", use_container_width=True, disabled=is_incomplete_run):
                 try:
                     _load_saved_run_into_session(db, sel_id, label=sel)
+                    if key_prefix == "run":
+                        st.session_state.run_evaluation_source_mode = "Loaded DB run"
+                        st.session_state.db_source_rerun_source_run_id = int(sel_id)
                     st.success(f"Loaded run #{sel_id}.")
+                    st.rerun()
                 except Exception as e:
                     st.error(f"Could not load run: {e}")
         if _can_manage_runs():
@@ -4675,12 +5472,68 @@ def tab_run() -> None:
     db = get_active_db()
     _render_saved_runs_loader("run", expanded=False)
 
-    df = st.session_state.df_norm
+    df_uploaded = st.session_state.df_norm
     saved_counts = _loaded_run_saved_counts()
+    uploaded_csv_available = df_uploaded is not None and not df_uploaded.empty
+    db_source_runs = [
+        dict(row)
+        for row in db.list_runs(limit=500)
+        if int(row.get("saved_conversations") or 0) > 0
+    ]
+    db_source_run_ids = [int(row["id"]) for row in db_source_runs]
+    selected_source_run_id: int | None = None
+    if db_source_run_ids:
+        source_run_key = "db_source_rerun_source_run_id"
+        preferred_run_id = int(st.session_state.get("current_run_id") or db_source_run_ids[0])
+        if preferred_run_id not in db_source_run_ids:
+            preferred_run_id = db_source_run_ids[0]
+        if int(st.session_state.get(source_run_key) or 0) not in db_source_run_ids:
+            st.session_state[source_run_key] = preferred_run_id
+        selected_source_run_id = int(st.session_state[source_run_key])
+    db_source_available = selected_source_run_id is not None
+    source_mode = "Uploaded CSV"
+    if db_source_available:
+        source_options = ["Uploaded CSV", "Loaded DB run"] if uploaded_csv_available else ["Loaded DB run"]
+        source_key = "run_evaluation_source_mode"
+        if st.session_state.get(source_key) not in source_options:
+            st.session_state[source_key] = source_options[0]
+        source_mode = st.radio(
+            "Evaluation source",
+            options=source_options,
+            key=source_key,
+            horizontal=True,
+            help=(
+                "Uploaded CSV runs from the current CSV. Loaded DB run uses saved transcripts "
+                "from the selected Past Runs entry and saves the result as a new run."
+            ),
+        )
+        if source_mode == "Loaded DB run":
+            run_labels = {
+                int(row["id"]): _saved_run_label(row)
+                for row in db_source_runs
+            }
+            selected_label = st.selectbox(
+                "Saved DB run to rerun",
+                options=[run_labels[run_id] for run_id in db_source_run_ids],
+                index=db_source_run_ids.index(selected_source_run_id),
+                key="db_source_rerun_source_run_label",
+                help="This list is read from the active DB file. The customer journey picker below comes from this selected run only.",
+            )
+            label_to_run_id = {label: run_id for run_id, label in run_labels.items()}
+            selected_source_run_id = int(label_to_run_id[selected_label])
+            st.session_state[source_run_key] = selected_source_run_id
+            selected_source_counts = _saved_counts_for_run(db, selected_source_run_id)
+            st.caption(
+                f"Using DB `{Path(_active_db_path()).name}`, run #{selected_source_run_id}: "
+                f"{int(selected_source_counts.get('conversation_results') or 0):,} saved customer journeys."
+            )
     conversation_only_available = bool(
         st.session_state.run_results
+        and selected_source_run_id is not None
+        and int(st.session_state.get("current_run_id") or 0) == int(selected_source_run_id)
         and int(saved_counts.get("message_results") or 0) > 0
     )
+    df = df_uploaded if source_mode == "Uploaded CSV" else None
     conversation_rerun_ids: list[str] = []
     if conversation_only_available:
         with st.expander(
@@ -4688,6 +5541,15 @@ def tab_run() -> None:
             expanded=False,
         ):
             conversation_rerun_ids = _render_conversation_rerun_scope()
+
+    if source_mode == "Loaded DB run" and db_source_available:
+        _render_db_source_run(
+            db=db,
+            source_run_id=int(selected_source_run_id),
+            conversation_only_available=conversation_only_available,
+            conversation_rerun_ids=conversation_rerun_ids,
+        )
+        return
 
     if df is None or df.empty:
         if not conversation_only_available:
@@ -6471,6 +7333,41 @@ def _render_stats_summary_table(rows: list[dict[str, Any]]) -> None:
     )
 
 
+def _stats_score_aggregate_metrics(conv_df: pd.DataFrame) -> list[tuple[str, str, str | None]]:
+    """Return run-level mean score metrics for the Stats tab."""
+    total = int(len(conv_df))
+    if total <= 0:
+        return []
+
+    score_10 = (
+        pd.to_numeric(conv_df["score_final"], errors="coerce").dropna()
+        if "score_final" in conv_df.columns
+        else pd.Series(dtype=float)
+    )
+    score_100 = (
+        pd.to_numeric(conv_df["score_final_100"], errors="coerce").dropna()
+        if "score_final_100" in conv_df.columns
+        else pd.Series(dtype=float)
+    )
+
+    if score_10.empty and not score_100.empty:
+        score_10 = score_100 / 10.0
+    if score_100.empty and not score_10.empty:
+        score_100 = score_10 * 10.0 if float(score_10.max()) <= 10.0 else score_10
+    if not score_10.empty and float(score_10.max()) > 10.0:
+        score_10 = score_10 / 10.0
+
+    if score_10.empty:
+        return []
+
+    scored = int(len(score_10))
+    return [
+        ("Mean journey score", f"{score_10.mean():.1f} / 10", None),
+        ("Mean score (100 view)", f"{score_100.mean():.1f} / 100" if not score_100.empty else "-", None),
+        ("Scored journeys", f"{scored:,} / {total:,}", f"{_pct(scored, total):.1f}% coverage"),
+    ]
+
+
 def _message_flag_stats(conversation_results: list[dict]) -> pd.DataFrame:
     """Count evaluated message flag colors by sender origin."""
     sender_types = ("Agent - L2", "Agent - Other", "Bot", "Broadcast")
@@ -7209,6 +8106,13 @@ def tab_stats() -> None:
 
     rows = _stats_summary_rows(conv_df)
     _render_stats_summary_table(rows)
+
+    score_metrics = _stats_score_aggregate_metrics(conv_df)
+    st.markdown("### Score aggregator")
+    if score_metrics:
+        metric_row(score_metrics)
+    else:
+        st.caption("No journey scores are available for this run.")
 
     stats_detail_tables = _stats_detail_tables_for_active_run()
     flag_stats_df = stats_detail_tables["sender"]
@@ -7964,10 +8868,14 @@ def _build_review_filter_index(conversation_results: list[dict]) -> dict[str, An
             parsed = result.get("parsed_json") or {}
             if not isinstance(parsed, dict):
                 continue
+            if parsed.get("contradiction"):
+                contradiction_modes.add("flagged")
             if parsed.get("contradiction_source_penalized"):
                 contradiction_modes.add("source_penalized")
             if parsed.get("contradiction_agent_issue_suppressed"):
                 contradiction_modes.add("agent_suppressed")
+            if parsed.get("contradiction_transfer_skipped"):
+                contradiction_modes.add("transfer_skipped")
 
         for message in transcript:
             chunks = _rag_chunks_for_message(message)
@@ -8172,6 +9080,8 @@ def _filter_conversations_by_contradiction_transfer(
         mode_set = set(modes or [])
         if selected == "any" and mode_set:
             matching_ids.add(str(conversation_id))
+        elif selected == "transfer" and mode_set.intersection({"source_penalized", "agent_suppressed"}):
+            matching_ids.add(str(conversation_id))
         elif selected in mode_set:
             matching_ids.add(str(conversation_id))
 
@@ -8224,9 +9134,11 @@ def _render_sender_flag_filters(
     with columns[4]:
         contradiction_options = {
             "All journeys": "all",
-            "Any contradiction transfer": "any",
+            "Any contradiction": "any",
+            "Any contradiction transfer": "transfer",
             "Bot/system source penalized": "source_penalized",
             "Agent issue suppressed": "agent_suppressed",
+            "Transfer skipped": "transfer_skipped",
         }
         has_contradictions = any(
             bool(modes)
@@ -8238,7 +9150,7 @@ def _render_sender_flag_filters(
             index=0,
             key="review_contradiction_transfer_filter",
             disabled=not has_contradictions,
-            help="Show journeys where contradiction transfer moved blame from a human agent correction to the original bot/system source.",
+            help="Show journeys with contradiction flags, transfer, or skipped transfer debug markers.",
         )
 
     chunk_options = _rag_chunk_options_for_review_index(review_index)
@@ -8327,13 +9239,22 @@ def _contradiction_transfer_rows(transcript: list[dict], message_results: list[d
             continue
         is_source = bool(parsed.get("contradiction_source_penalized"))
         is_suppressed_agent = bool(parsed.get("contradiction_agent_issue_suppressed"))
-        if not is_source and not is_suppressed_agent:
+        is_transfer_skipped = bool(parsed.get("contradiction_transfer_skipped"))
+        is_contradiction = bool(parsed.get("contradiction"))
+        if not is_source and not is_suppressed_agent and not is_transfer_skipped and not is_contradiction:
             continue
         message_id = str(result.get("target_message_id") or parsed.get("target_message_id") or "").strip()
         msg_index = result.get("message_index")
         message = records_by_id.get(message_id) or records_by_idx.get(str(msg_index)) or {}
         sender_type = _flagged_sender_type(message) or humanize_label(message.get("sender_entity")) or "Unknown"
-        status = "Bot/system source penalized" if is_source else "Agent issue suppressed"
+        if is_source:
+            status = "Bot/system source penalized"
+        elif is_suppressed_agent:
+            status = "Agent issue suppressed"
+        elif is_transfer_skipped:
+            status = "Transfer skipped"
+        else:
+            status = "Contradiction flagged"
         key = (status, message_id or str(msg_index))
         if key in seen:
             continue
@@ -8345,6 +9266,7 @@ def _contradiction_transfer_rows(transcript: list[dict], message_results: list[d
                 "Message #": msg_index,
                 "Message ID": message_id,
                 "First contradiction ID": parsed.get("first_contradiction_message_id") or "none",
+                "Debug": parsed.get("contradiction_debug_message") or "",
                 "Effect": humanize_label(parsed.get("message_level_effect")),
                 "Issue type": humanize_label(parsed.get("issue_type")),
                 "Message": message.get("message_text") or result.get("target_message_text") or "",
@@ -8485,9 +9407,9 @@ def _render_flagged_message_checker(transcript: list[dict], message_results: lis
         "or a specific retrieved chunk."
     )
     if contradiction_rows:
-        st.markdown("#### Contradiction transfer")
+        st.markdown("#### Contradiction debug")
         st.caption(
-            "Shows cases where a later human-agent contradiction issue was removed and the original bot/system source was penalized."
+            "Shows why each contradiction was flagged and whether transfer moved blame, skipped transfer, or only marked the contradiction."
         )
         st.dataframe(
             pd.DataFrame(contradiction_rows),
