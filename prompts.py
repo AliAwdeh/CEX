@@ -623,6 +623,12 @@ Use raw sender identity fields such as `raw_sender_role`, `sender_entity`, and `
 
 ---
 
+# 3A. Ticket Metadata Scope
+
+If conversation_metadata contains ticket fields, evaluate this payload as one ticket journey, not as the original full customer timeline. Use ticket_objective as the scoped customer objective unless the visible ticket transcript clearly contradicts it. Use ticket_status as segmentation context, not automatic truth: the final handled_status and unhandled_resolution_subtype must still be justified by the ticket transcript and message-level evidence.
+
+---
+
 # 4. Core CX Principles
 
 These principles are strict and should drive your judgment.
@@ -972,10 +978,83 @@ DEFAULT_CONVERSATION_LEVEL_PROMPT = PromptTemplate(
 )
 
 
+# --------- Default ticket-segmentation prompt ---------
+
+
+DEFAULT_TICKET_SEGMENTATION_SYSTEM_PROMPT = """You split a complete customer/contract conversation timeline into ticket-style customer journeys.
+
+Return strict JSON only.
+
+A ticket is one evaluable customer thread. Split distinct issues into separate tickets, group standalone informational inquiries into an inquiry ticket, keep related broadcasts/greetings, and track unresolved inquiries separately.
+
+Required schema:
+{output_schema}
+
+Do not include markdown, comments, or extra top-level keys."""
+
+
+DEFAULT_TICKET_SEGMENTATION_OUTPUT_SCHEMA = """{
+  "tickets": [
+    {
+      "ticket_id": "ticket_1",
+      "ticket_type": "short_snake_case",
+      "customer_objective": "short description",
+      "start_message_index": 1,
+      "end_message_index": 5,
+      "included_message_indexes": [1, 2, 3, 4, 5],
+      "status": "resolved|pending_unresolved|totally_unresolved",
+      "should_append_future_conversations": true,
+      "previous_ticket_id": "",
+      "inquiries": [
+        {
+          "inquiry_id": "inquiry_1",
+          "question": "short customer question",
+          "message_indexes": [3],
+          "status": "resolved|pending_unresolved|totally_unresolved",
+          "answer_summary": "short answer or current state",
+          "unresolved_reason": "short reason, or none"
+        }
+      ],
+      "segmentation_reason": "short reason"
+    }
+  ]
+}"""
+
+
+DEFAULT_TICKET_SEGMENTATION_USER_TEMPLATE = """Split this complete customer/contract timeline into ticket-style journeys.
+
+Return strict JSON only using the required schema.
+
+Input:
+{payload_json}"""
+
+
+DEFAULT_TICKET_SEGMENTATION_SYSTEM_PROMPT = _load_external_prompt_default(
+    "ticket segmentation prompt",
+    DEFAULT_TICKET_SEGMENTATION_SYSTEM_PROMPT,
+)
+DEFAULT_TICKET_SEGMENTATION_OUTPUT_SCHEMA = _load_external_prompt_default(
+    "ticket segmentation scheme",
+    DEFAULT_TICKET_SEGMENTATION_OUTPUT_SCHEMA,
+)
+DEFAULT_TICKET_SEGMENTATION_USER_TEMPLATE = _load_external_prompt_default(
+    "ticket segmentation user input",
+    DEFAULT_TICKET_SEGMENTATION_USER_TEMPLATE,
+)
+
+
+DEFAULT_TICKET_SEGMENTATION_PROMPT = PromptTemplate(
+    system_prompt=DEFAULT_TICKET_SEGMENTATION_SYSTEM_PROMPT,
+    output_schema=DEFAULT_TICKET_SEGMENTATION_OUTPUT_SCHEMA,
+    user_prompt_template=DEFAULT_TICKET_SEGMENTATION_USER_TEMPLATE,
+)
+
+
 # --------- Backward-compatible exports ---------
 # Older code may import the bare strings; expose them as the assembled defaults.
 MESSAGE_LEVEL_SYSTEM_PROMPT = DEFAULT_MESSAGE_LEVEL_PROMPT.build_system()
 CONVERSATION_LEVEL_SYSTEM_PROMPT = DEFAULT_CONVERSATION_LEVEL_PROMPT.build_system()
+TICKET_SEGMENTATION_SYSTEM_PROMPT = DEFAULT_TICKET_SEGMENTATION_PROMPT.build_system()
 
 
 # --------- Payload builders (unchanged) ---------

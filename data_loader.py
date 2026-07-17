@@ -12,6 +12,7 @@ import pandas as pd
 
 
 JOURNEY_ID_COLUMN = "CUSTOMER_PHONE"
+TICKET_JOURNEY_ID_COLUMN = "TICKET_JOURNEY_ID"
 MESSAGE_ORDER_COLUMN = "APPENDED_MESSAGE_INDEX"
 LEGACY_MESSAGE_ORDER_COLUMN = "MESSAGE_INDEX"
 RAG_CONTEXT_MARKER = "RAG context used for this bot response:"
@@ -42,6 +43,16 @@ METADATA_COLUMNS = [
     "CONVERSATION_AGENT_LOGIN_NAME",
     "CUSTOMER_NAME",
     "CUSTOMER_PHONE",
+    "TICKET_JOURNEY_ID",
+    "PARENT_JOURNEY_ID",
+    "TICKET_ID",
+    "TICKET_TYPE",
+    "TICKET_STATUS",
+    "TICKET_OBJECTIVE",
+    "TICKET_PREVIOUS_TICKET_ID",
+    "TICKET_INQUIRIES_JSON",
+    "TICKET_SEGMENTATION_REASON",
+    "TICKET_SHOULD_APPEND_FUTURE",
     "CONVERSATION_IDS",
     "SOURCE_CONVERSATION_COUNT",
     "TOTAL_VISIBLE_MESSAGES",
@@ -228,7 +239,13 @@ def summarize_dataframe(df: pd.DataFrame) -> dict:
 
 def get_conversation_groups(df: pd.DataFrame) -> list[tuple[str, pd.DataFrame]]:
     """Return list of (journey_id, sorted_dataframe) tuples."""
-    id_col = JOURNEY_ID_COLUMN if JOURNEY_ID_COLUMN in df.columns else "THREAD_ID"
+    id_col = (
+        TICKET_JOURNEY_ID_COLUMN
+        if TICKET_JOURNEY_ID_COLUMN in df.columns
+        else JOURNEY_ID_COLUMN
+        if JOURNEY_ID_COLUMN in df.columns
+        else "THREAD_ID"
+    )
     if id_col not in df.columns:
         return []
     out = []
@@ -349,8 +366,15 @@ def conversation_metadata_from_group(group: pd.DataFrame) -> dict:
         else:
             md[key] = clean(first.get(col))
 
-    journey_id = clean(first.get(JOURNEY_ID_COLUMN)) if JOURNEY_ID_COLUMN in group.columns else None
+    parent_journey_id = clean(first.get(JOURNEY_ID_COLUMN)) if JOURNEY_ID_COLUMN in group.columns else None
+    ticket_journey_id = (
+        clean(first.get(TICKET_JOURNEY_ID_COLUMN))
+        if TICKET_JOURNEY_ID_COLUMN in group.columns
+        else None
+    )
+    journey_id = ticket_journey_id or parent_journey_id
     source_ids = unique_join("CONVERSATION_IDS") or unique_join("CONVERSATION_ID")
+    md["parent_journey_id"] = parent_journey_id
     md["customer_journey_id"] = journey_id
     md["journey_id"] = journey_id
     md["source_conversation_ids"] = source_ids

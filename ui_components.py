@@ -865,6 +865,19 @@ def render_conversation_summary_card(
     pj = conv_result.get("parsed_json") or {}
     md = conv_result.get("conversation_metadata") or {}
     cm = conv_result.get("computed_metadata") or {}
+    conversation_id = str(conv_result.get("conversation_id", "") or "")
+    parent_journey_id = str(md.get("parent_journey_id") or "").strip()
+    ticket_id = str(md.get("ticket_id") or "").strip()
+    if not ticket_id and "::ticket_" in conversation_id:
+        ticket_id = f"ticket_{conversation_id.split('::ticket_', 1)[1]}"
+    ticket_label = ticket_id
+    if ticket_label.lower().startswith("ticket_"):
+        ticket_label = f"Ticket {ticket_label.split('_', 1)[1]}"
+    elif ticket_label:
+        ticket_label = humanize_label(ticket_label)
+    ticket_type = str(md.get("ticket_type") or "").strip()
+    ticket_status = str(md.get("ticket_status") or "").strip()
+    ticket_objective = str(md.get("ticket_objective") or "").strip()
 
     handled = pj.get("handled_status", "unknown")
     experience = pj.get("customer_experience", "unknown")
@@ -928,6 +941,10 @@ def render_conversation_summary_card(
         badges.append(_badge("Frustration origin", humanize_label(frustration_origin) or "n/a", "#475569"))
     if not show_unresolved_header_badge:
         badges.append(_badge("Unresolved status", subtype_display, "#475569"))
+    if ticket_label:
+        badges.append(_badge("Ticket", ticket_label, "#0891b2"))
+    if ticket_type:
+        badges.append(_badge("Ticket type", humanize_label(ticket_type), "#475569"))
     badges.append(_badge("Customer feeling at end", humanize_label(sentiment), _SENTIMENT_COLORS.get(sentiment, "#6b7280")))
     badges.append(_badge("Highest frustration level", humanize_label(max_fl), _FRUSTRATION_COLORS.get(max_fl, "#6b7280")))
     if culprits:
@@ -1093,14 +1110,23 @@ def render_conversation_summary_card(
     cols = st.columns([1, 1, 1])
     with cols[0]:
         st.markdown("**ID**")
-        st.write(conv_result.get("conversation_id", ""))
+        st.write(conversation_id)
         st.markdown("**Customer**")
         st.write(md.get("customer_name") or "—")
         st.markdown("**Phone**")
         st.write(md.get("customer_phone") or "—")
     with cols[1]:
         st.markdown("**Customer journey ID**")
-        st.write(conv_result.get("conversation_id", ""))
+        st.write(conversation_id)
+        if ticket_label:
+            st.markdown("**Original parent journey**")
+            st.write(parent_journey_id or "—")
+            st.markdown("**Ticket**")
+            st.write(
+                f"{ticket_label}"
+                + (f" - {humanize_label(ticket_type)}" if ticket_type else "")
+                + (f" ({humanize_label(ticket_status)})" if ticket_status else "")
+            )
         st.markdown("**Source conversations**")
         st.write(md.get("source_conversation_count") or "—")
         st.markdown("**Source conversation IDs**")
@@ -1118,6 +1144,9 @@ def render_conversation_summary_card(
     with objective_cols[1]:
         st.markdown("**Customer primary objective**")
         st.write(pj.get("customer_primary_objective") or "—")
+    if ticket_objective:
+        st.markdown("**Ticket objective**")
+        st.write(ticket_objective)
 
     st.markdown("---")
     st.markdown("### Main Customer Problem")

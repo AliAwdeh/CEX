@@ -1,0 +1,6 @@
+Split this complete customer/contract timeline into ticket-style journeys.
+
+Return strict JSON only using the required schema.
+
+Input:
+{payload_json}

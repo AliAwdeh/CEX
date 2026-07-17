@@ -1,0 +1,94 @@
+diff --git a/correct_prompt_files/conversational prompt.txt b/correct_prompt_files/conversational prompt.txt
+--- a/correct_prompt_files/conversational prompt.txt
++++ b/correct_prompt_files/conversational prompt.txt
+@@ -358,8 +358,14 @@ If the first payment notice is mildly unclear but the agent promptly explains th
+ 
+ If a payment notice says a link or amount will be shared shortly and the next message provides it within a few minutes, do not treat the first notice as bad CX when the customer did not have to chase or express confusion.
+ 
++If a customer says a payment link is not working, and the team sends or resends a payment link that the customer later uses successfully, treat the link issue as recovered friction inside a handled + good journey unless there is a separate material problem. Do not call this a contradiction merely because the visible short URL looks similar to the earlier link, has a trailing slash, or was described as a "new" link. It becomes bad only if the customer remains blocked, the link guidance creates duplicate-payment risk, or a later reminder conflicts with a visible completed payment.
++
+ Payment-cycle, salary-cycle, credit/VAT, direct-debit, future-renewal, and payment-plan explanations are not wrong_info by default. If the agent gives concrete amounts, due dates, what is due now versus later, and the customer accepts the explanation, treat the journey as handled + good unless visible context proves the calculation false or the explanation leaves unresolved confusion.
+ 
++When judging payment reminders, match the payment purpose, amount, cycle, and obligation. A completed AED 1,743 July monthly payment does not automatically clear or contradict a separate AED 4,463 two-year visa-fee reminder. If the bot tells the customer to ignore an AED 4,463 visa-fee reminder because a different monthly payment was received, and a later human agent correctly explains the visa fee is still due, the bad experience comes from the earlier bot misguidance and repeated reminder confusion. Do not treat the later human clarification or the earlier visa-fee reminder that agrees with it as the contradiction source.
++
++When a customer says they already paid a worker's salary in advance, do not infer that the worker already collected or received that salary unless the transcript explicitly says so. Customer-side advance collection and worker-side salary release/collection can be different stages. If the bot explains that the customer's prior advance payment covered June, the new beginning-of-July deduction covers July, July salary will be released in August, and then answers that the worker can collect June salary at the beginning of July, treat the salary-cycle objective as handled. This is not a contradiction by itself because the customer's advance payment and the worker's bank collection are separate events.
++
+ Automatic bank-deduction retry is a process state, not automatically an unhandled payment outcome. If the customer says funds were added, asks the company to try again, or worries about paying by link because of prior duplicate charging, classify the payment inquiry as handled when the agent explains that retry is automatic/bank-controlled, gives the retry window or trigger, tells the customer to keep funds available, and clearly says not to use the payment link now when that could duplicate the charge. A valid payment reminder before retry may be minor pressure, but the journey can remain customer_experience = good when the final guidance is safe, clear, accepted, and no contradictory payment/refund state remains.
+ 
+ For duplicate-charge or payment/refund correction journeys, distinguish handled_status from customer_experience. If the final visible state gives a concrete usable path such as the duplicate charge was identified, a full refund is being processed, and a specific refund timeline is given, classify the payment objective as handled. Do not mark unhandled solely because earlier payment-state messages contradicted each other. However, contradictory notices such as "refund/transfer initiated", then "no refund was initiated", then "duplicate charge refund is processing" create trust risk and should usually make customer_experience = bad even when the final path is concrete.
+@@ -668,11 +674,26 @@ Agent sends a payment-process notice about a one-time card payment and future di
+ The initial notice could have been clearer, but the clarification addressed the plausible open questions and the customer accepted it.
+ → handled + good, or handled + bad only if the clarification required repeated effort or left uncertainty
+ 
++## Handled + Good (advance salary deduction and worker collection timing)
++Customer says they already paid June salary in advance and asks why there is another deduction at the beginning of July. Bot explains the advance payment covered June, the July deduction covers July under the new start-of-month cycle, and July salary will be released in August. Customer then asks when the worker can collect June salary from the bank. Bot answers that June salary can be collected at the beginning of July, usually by the 1st or 2nd.
++This is handled because the duplicate-deduction concern and the worker collection timing were both answered. Do not mark contradiction or totally_unresolved merely because the customer paid June in advance; customer payment collection and worker salary release are separate stages unless the transcript explicitly says the worker already received June salary.
++-> handled + good
++
+ ## Handled + Good (payment notice followed by link)
+ Agent announces a one-time payment or process update and says the payment link will be shared shortly. A few minutes later, the link and amount are sent. The customer does not have to chase and shows no confusion.
+ This is normal operational sequencing, not bad CX.
+ -> handled + good
+ 
++## Handled + Good (payment link recovered after customer reports link problem)
++Customer receives a failed-bank-deduction notice, asks whether the payment was taken, and says the messages are mixed. Agent clarifies that salary transfer and customer payment are different, confirms the payment is still pending, and shares the payment link. Customer says the link is not working, the team resends or refreshes the link, and the customer later says they paid. Agent confirms payment received.
++Do not mark this as bad CX or a contradiction solely because the resent short payment URL appears similar to the earlier URL or because the agent called it a new link. The material issue was recovered once the customer received a usable payment path and payment was confirmed. Penalize only if the repeated link keeps failing, duplicate-payment risk is created, or a later payment reminder contradicts the confirmed payment.
++-> handled + good
++
++## Handled + Bad (bot says ignore separate visa-fee reminders)
++Customer pays a monthly amount and receives bot answers saying payment was received, no extra payment is needed, and AED 4,463 visa-fee reminders can be ignored. The reminders continue, the customer says they relied on the earlier advice, and a human agent later explains that AED 4,463 is a separate remaining two-year visa-fee amount due July 1. The customer agrees to pay later and the agent notes the date.
++This is handled because the final payment purpose, amount, due state, and customer's planned action are clear. The experience is bad because earlier bot answers conflated a completed monthly payment with a separate visa-fee obligation and told the customer to ignore valid reminders. The contradiction source should be the earlier bot/assistant ignore/no-extra-payment answer, not the visa-fee reminder or the human agent message that correctly says the visa fee remains due.
++-> handled + bad
++
+ ## Handled + Good (brief status check then answer)
+ Customer asks whether a visa transfer, payment, or process step is complete. Agent says "I'll check" or asks for a moment, then gives the direct completed/current status shortly afterward. Customer thanks the agent and does not chase.
+ The brief check is minor or neutral, not enough to make the journey bad.
+diff --git a/correct_prompt_files/message prompt.txt b/correct_prompt_files/message prompt.txt
+--- a/correct_prompt_files/message prompt.txt
++++ b/correct_prompt_files/message prompt.txt
+@@ -126,6 +126,8 @@ If a later human agent message conflicts with, clarifies, or corrects a prior bo
+ 
+ For human-agent source-of-truth transfer, choose the first earlier automation message that directly states the opposite of the human agent's current claim. Do not point to an earlier automation message that agrees with the agent on the main status. Example: if a system first says "contract cancelled", later bots say "the cancellation was incorrect/no cancellation request", and then a human agent says "the contract was cancelled due to unpaid payment", the contradiction source for the human agent is the first bot that said "not cancelled/no cancellation", not the earlier system message that also said "cancelled".
+ 
++For payment contradictions, match the payment purpose, amount, and status before choosing a contradiction source. If a later human agent says an AED 4,463 two-year visa payment is still due, do not point to an earlier AED 4,463 visa-payment reminder as the contradiction source because it agrees with the agent. If earlier bot/assistant messages told the customer to ignore the reminder or said no extra payment was needed, those earlier bot/assistant messages are the conflicting source. A prior completed monthly payment for a different amount or purpose, such as July monthly payment, does not prove a separate visa-fee reminder is wrong.
++
+ This source-of-truth protection applies only against chatbot/automation messages: bot, assistant, system, broadcast, automated notification, template, SMS, or email. If the contradiction is caused by a prior human agent, or the human agent openly says an agent-side mistake happened in front of the customer ("I was wrong", "my mistake", "we gave you wrong information", "the previous agent was wrong"), do not transfer it to automation. Point `first_contradiction_message_id` to the earlier human-agent source when visible and evaluate the agent-side issue normally.
+ 
+ After a human agent establishes the current truth, later human-agent messages that are consistent with that agent truth are not new contradictions merely because older bot/system/broadcast messages said something different. Judge those later agent messages on clarity, completeness, delay, tone, and next step, not as contradiction.
+@@ -182,6 +184,8 @@ Wrong-context customer-status messages are strong message-level issues. If the t
+ 
+ Repeated payment reminders or duplicate operational reminders are neutral only when they are isolated, useful, and do not add pressure or confusion. Across a repeated sequence, they should usually be minor_issue, and can become major_issue when they contradict payment status, continue after a visible payment confirmation, target the wrong status, or create real payment/disruption risk. If the transcript shows payment was received or the customer's payment/agreement/authorization was completed, and a later reminder says payment failed, the bank could not deduct due to insufficient funds, cancellation may occur, or action is still required, treat it as a contradiction unless it clearly explains that it is for a different payment cycle or attempt. Use wrong_info when visibly false, unclear_guidance when it may be a different cycle but fails to explain, and major_issue when it creates cancellation, payment, or service-disruption risk.
+ 
++Do not treat a payment reminder as contradicting a completed payment unless it is for the same payment purpose, amount, cycle, or obligation. A reminder for AED 4,463 two-year visa fees can be consistent with an earlier confirmed AED 1,743 July monthly payment because they are different amounts and different payment purposes. If a bot incorrectly tells the customer to ignore the visa-fee reminder because a different monthly payment was received, the contradiction belongs to that bot answer, not to the later reminder or human agent that correctly states the visa fee remains due.
++
+ Asking what a requested callback is about is normal triage when the customer's call request is broad or the purpose is not obvious from the immediate context. Do not mark it as missing_next_step unless the context already makes the call purpose obvious and the question delays an urgent or sensitive issue.
+ 
+ If the customer asks for a callback or says they missed a call, a message can be helped or neutral when it explains that calls may take longer or the number is not set up for incoming calls, then gives a usable WhatsApp path and asks for the specific update needed to resolve the issue in chat. Use minor_issue only if a callback would clearly be better but the chat path still works. Use major_issue only if refusing or deflecting the call blocks an urgent, sensitive, or unresolved issue.
+@@ -208,6 +212,8 @@ A standard failed-bank-deduction broadcast can be helped or neutral when it stat
+ 
+ If a customer says funds were added, asks the company to try deduction again, or worries about using a link because of prior duplicate charge, a message is helped when it explains deduction is automatic or bank-controlled, gives the retry timing/trigger, tells the customer to keep funds available, and clearly says not to use the payment link now if it could duplicate the charge.
+ 
++If a customer says a payment link is not working and the agent sends or resends a payment link, do not mark contradiction=true merely because the URL looks similar to an earlier short link, includes a trailing slash, or was described as a "new" link. This is not a payment-status contradiction unless the message conflicts with a visible completed payment, paid/failed state, amount, deadline, or duplicate-charge risk. Use helped, neutral, or recovered_issue when the link gives a usable path; use minor_issue/unclear_guidance only if the repeated link leaves the customer still blocked or the transcript proves the same broken link caused continued failure.
++
+ Do not mark a payment-process update as an issue solely because it could explain more. Mark it as minor_issue only when the missing reason, amount, timing, payment link, or next step creates visible ambiguity, blocks action, or leads to follow-up confusion.
+ 
+ Use unclear_guidance for an unclear payment-process notice. Do not use major_issue unless the message creates serious confusion, contradicts visible payment status, repeats a resolved request, or blocks the customer from acting.
+@@ -222,6 +228,8 @@ A new or unexplained salary advance/deduction broadcast can be minor_issue with
+ 
+ A later payment-cycle clarification can be recovered_issue when it acknowledges the customer's confusion or concern, explains the updated flow, maps each deduction to the salary month it covers, states any cash-payment responsibility, gives deduction and transfer dates, and explains the business reason for the setup. Use frustration_change: decreased.
+ 
++When the customer says they already paid a worker's salary in advance, do not infer that the worker already collected or received that salary unless the transcript explicitly says so. Customer-side advance collection and worker-side salary release/collection can be different stages. If the agent explains that the customer's prior advance payment covered one month, the new deduction covers the next month, and then answers when the worker can collect the prior month's salary from the bank, treat that as helped or recovered_issue unless visible facts prove the collection timing is false or the customer remains confused.
++
+ If a salary deduction, salary advance, or held-salary explanation repeats earlier wording without addressing the customer's actual concern, use repetition or unclear_guidance. Escalate when the customer is disputing a deduction, asking why money was taken, or worried about whether future deductions will continue. If the agent says a prior salary/payment message was sent by mistake, the correction must materially clarify what was wrong; if it repeats the same date, status, or action with no real correction, use minor_issue with unclear_guidance or repetition, and use major_issue when it creates salary/payment trust risk.
+ 
+ If a customer asks for a replacement expired signing, direct-debit, bank authorization, or payment-form link, and the agent answers only that the signature/form is pending approval or there is no need to sign again, treat it as minor_issue with unclear_guidance unless the message explicitly reconciles why the expired link no longer matters. Do not classify it as helped merely because "pending approval" may be true; the answer must explain the relationship between the expired link, the prior signing request, and the current approval state.
+@@ -432,6 +440,9 @@ Agent announces a one-time credit card payment will be shared later and future p
+ If this gives useful operational information and the customer has not yet shown confusion, this can be neutral.
+ If the missing reason, amount, timing, or next step causes visible confusion or follow-up, use minor_issue with issue_type unclear_guidance.
+ 
++## Helped or recovered: payment link works after link problem
++Customer says the payment link is not working. Agent says they will send a new link or sends the payment link again, and there is no visible conflicting paid/failed status, amount, deadline, or duplicate-charge risk. Do not set contradiction=true just because the short URL is visually similar to the earlier link or has a trailing slash. If the customer can proceed or later confirms payment, treat the link response as helped or recovered_issue. Use minor_issue only if the customer remains blocked after the repeated link.
++
+ ## Helped or neutral: payment or renewal calculation explained
+ Customer asks why a card payment, salary payment, VAT, credit note, or future renewal amount appears. Agent explains the amount, credit/VAT/payment-plan calculation, timing, and what is due now versus later.
+ Do not use wrong_info unless visible context proves the explanation is false or contradictory.

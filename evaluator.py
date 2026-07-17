@@ -13,6 +13,7 @@ import re
 import time
 from collections import deque
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any, Callable, Optional
 
 import pandas as pd
@@ -27,6 +28,10 @@ from prompts import (
 )
 from aggregation import compute_metadata
 from data_loader import (
+    LEGACY_MESSAGE_ORDER_COLUMN,
+    JOURNEY_ID_COLUMN,
+    MESSAGE_ORDER_COLUMN,
+    TICKET_JOURNEY_ID_COLUMN,
     conversation_metadata_from_group,
     get_conversation_groups,
     message_records_from_group,
@@ -38,6 +43,154 @@ from data_loader import (
 
 _FENCE_RE = re.compile(r"```(?:json)?\s*(\{.*?\})\s*```", re.DOTALL | re.IGNORECASE)
 _FIRST_OBJ_RE = re.compile(r"\{.*\}", re.DOTALL)
+
+
+DEFAULT_TICKET_SEGMENTATION_SYSTEM_PROMPT = """You split a complete customer/contract conversation timeline into ticket-style customer journeys.
+
+Return strict JSON only.
+
+A ticket is one evaluable customer thread. A thread can be:
+- a concrete issue, request, complaint, process action, or blocked outcome
+- a grouped informational inquiry ticket that may contain several standalone questions
+
+Core rules:
+- Use only visible messages.
+- One contract/customer timeline can contain multiple tickets.
+- Include the greeting/setup messages that immediately precede the customer's first real request in the same ticket. If the customer says "Hi" and the assistant replies before the customer states the objective, keep those greeting messages inside that ticket.
+- Do not exclude a broadcast/system message only because it is a broadcast. Include broadcasts that trigger, frame, confirm, remind about, warn about, follow up on, or are referenced by the customer in relation to the ticket.
+- If the customer asks about, reacts to, complains about, confirms, or follows instructions from a broadcast, include that broadcast and the customer interaction in the same ticket.
+- Promotional or informational messages after the main answer should stay in the same ticket when they are part of the same active thread, same service lifecycle, or related next-step context. Exclude them only when they are clearly isolated, unrelated, and not referenced by the customer.
+- Do not omit substantive customer, agent, bot, or broadcast messages. If a message is not clearly isolated unrelated noise, assign it to the closest relevant ticket or create a separate ticket for it.
+- Exclude only truly isolated unrelated operational noise that has no relationship to any customer objective and is not needed to understand the ticket.
+
+Issue/request grouping:
+- Create a separate ticket for each distinct issue, complaint, process action, cancellation request, refund request, payment problem, document problem, visa/EID process problem, or operational blocker.
+- If the customer raises the same underlying issue multiple times, append the later messages to the same issue ticket until it is resolved, clearly pending, abandoned, or replaced by a different issue.
+- If two issues are different, keep them as separate tickets even if they happen close together.
+- If an informational question is only a clarification inside an active issue, include it in that issue ticket and list it in that ticket's inquiries array.
+
+Inquiry grouping:
+- A standalone inquiry is a question asking for information, explanation, timing, status, eligibility, price, policy, location, required document, or next step, without itself being a complaint or operational blocker.
+- If the customer asks multiple standalone inquiries about different matters, group them into one inquiry ticket and list every question separately in the inquiries array.
+- If the sequence is issue -> inquiry -> issue -> inquiry, keep each distinct issue as its own ticket unless it is the same underlying issue, and group the standalone inquiries together in one inquiry ticket. Preserve the visible message indexes for each inquiry.
+- For every inquiry ticket, the inquiries array must track each inquiry separately, including whether that specific inquiry was resolved, pending_unresolved, or totally_unresolved.
+- For issue tickets that contain clarification questions, include those questions in the inquiries array too.
+
+Resolved vs future follow-up logic:
+- If an inquiry or issue is not resolved, later messages that continue or follow up on it must be appended to the same ticket. Set should_append_future_conversations to true.
+- If an inquiry or issue is resolved, and later the customer raises a new question/request in the same category, create a new ticket with the same ticket_type. Do not merge it into the resolved ticket. Set previous_ticket_id to the earlier resolved ticket id.
+- If the earlier ticket is still pending_unresolved or totally_unresolved, do not create a same-category duplicate ticket for a follow-up. Append the follow-up to the open ticket.
+
+Status rules:
+- If a ticket is still waiting for a retry, review, delivery, refund, government step, customer document, bank action, internal action, or future confirmation, status is pending_unresolved.
+- If no usable current state or path remains, status is totally_unresolved.
+- If the customer objective was answered/completed/accepted, status is resolved.
+- For grouped inquiry tickets, the ticket status is resolved only if all listed inquiries are resolved. If any inquiry is pending_unresolved, the ticket status is pending_unresolved. If any inquiry is totally_unresolved and no usable path remains for it, the ticket status is totally_unresolved unless another inquiry is still pending with a clear path.
+
+Ticket type should be short snake_case, such as payment_issue, refund_request, document_request, visa_status, eid_delivery, contract_question, cancellation_request, booking_request, complaint, general_inquiry, other.
+
+Required JSON shape:
+{
+  "tickets": [
+    {
+      "ticket_id": "ticket_1",
+      "ticket_type": "short_snake_case",
+      "customer_objective": "short description",
+      "start_message_index": 1,
+      "end_message_index": 5,
+      "included_message_indexes": [1, 2, 3, 4, 5],
+      "status": "resolved|pending_unresolved|totally_unresolved",
+      "should_append_future_conversations": true,
+      "previous_ticket_id": "",
+      "inquiries": [
+        {
+          "inquiry_id": "inquiry_1",
+          "question": "short customer question",
+          "message_indexes": [3],
+          "status": "resolved|pending_unresolved|totally_unresolved",
+          "answer_summary": "short answer or current state",
+          "unresolved_reason": "short reason, or none"
+        }
+      ],
+      "segmentation_reason": "short reason"
+    }
+  ]
+}
+
+Use an empty string for previous_ticket_id when there is no predecessor. Use an empty inquiries array only when the ticket contains no informational question.
+
+Do not include markdown, comments, or extra top-level keys."""
+
+
+def _load_ticket_segmentation_system_prompt() -> str:
+    path = Path(__file__).resolve().parent / "correct_prompt_files" / "ticket segmentation prompt.txt"
+    try:
+        value = path.read_text(encoding="utf-8")
+    except OSError:
+        return DEFAULT_TICKET_SEGMENTATION_SYSTEM_PROMPT
+    return value if value.strip() else DEFAULT_TICKET_SEGMENTATION_SYSTEM_PROMPT
+
+
+TICKET_SEGMENTATION_SYSTEM_PROMPT = _load_ticket_segmentation_system_prompt()
+
+
+DEFAULT_TICKET_SEGMENTATION_OUTPUT_SCHEMA = """{
+  "tickets": [
+    {
+      "ticket_id": "ticket_1",
+      "ticket_type": "short_snake_case",
+      "customer_objective": "short description",
+      "start_message_index": 1,
+      "end_message_index": 5,
+      "included_message_indexes": [1, 2, 3, 4, 5],
+      "status": "resolved|pending_unresolved|totally_unresolved",
+      "should_append_future_conversations": true,
+      "previous_ticket_id": "",
+      "inquiries": [
+        {
+          "inquiry_id": "inquiry_1",
+          "question": "short customer question",
+          "message_indexes": [3],
+          "status": "resolved|pending_unresolved|totally_unresolved",
+          "answer_summary": "short answer or current state",
+          "unresolved_reason": "short reason, or none"
+        }
+      ],
+      "segmentation_reason": "short reason"
+    }
+  ]
+}"""
+
+
+DEFAULT_TICKET_SEGMENTATION_USER_TEMPLATE = """Split this complete customer/contract timeline into ticket-style journeys.
+
+Return strict JSON only using the required schema.
+
+Input:
+{payload_json}"""
+
+
+def _load_ticket_prompt_file(filename: str, fallback: str) -> str:
+    path = Path(__file__).resolve().parent / "correct_prompt_files" / filename
+    try:
+        value = path.read_text(encoding="utf-8")
+    except OSError:
+        return fallback
+    return value if value.strip() else fallback
+
+
+def _default_ticket_segmentation_prompt() -> PromptTemplate:
+    return PromptTemplate(
+        system_prompt=_load_ticket_segmentation_system_prompt(),
+        output_schema=_load_ticket_prompt_file(
+            "ticket segmentation scheme.txt",
+            DEFAULT_TICKET_SEGMENTATION_OUTPUT_SCHEMA,
+        ),
+        user_prompt_template=_load_ticket_prompt_file(
+            "ticket segmentation user input.txt",
+            DEFAULT_TICKET_SEGMENTATION_USER_TEMPLATE,
+        ),
+    )
 
 
 def extract_json_object(text: str) -> dict:
@@ -1158,6 +1311,9 @@ class RunConfig:
     # Conversation-level calls may use a different model while reusing the
     # same endpoint, API key, and generation settings.
     conversation_api: Optional[APIConfig] = None
+    # Ticket segmentation can use its own model while reusing the same endpoint
+    # and API key.
+    ticket_api: Optional[APIConfig] = None
     max_conversations: Optional[int] = None
     max_agent_messages_per_conv: Optional[int] = None
     truncate_messages: bool = False
@@ -1172,13 +1328,18 @@ class RunConfig:
     # Explicit set of IDs to run on. When non-None, takes
     # precedence over ``max_conversations`` — used by the random sampler.
     selected_conversation_ids: Optional[list[str]] = None
+    enable_ticket_segmentation: bool = False
     # Editable prompts (defaults to the in-memory defaults; the app loads
     # the active prompts from the DB before each run).
     message_prompt: PromptTemplate = field(default_factory=lambda: DEFAULT_MESSAGE_LEVEL_PROMPT)
     conversation_prompt: PromptTemplate = field(default_factory=lambda: DEFAULT_CONVERSATION_LEVEL_PROMPT)
+    ticket_prompt: PromptTemplate = field(default_factory=_default_ticket_segmentation_prompt)
 
     def conversation_api_config(self) -> APIConfig:
         return self.conversation_api or self.api
+
+    def ticket_api_config(self) -> APIConfig:
+        return self.ticket_api or self.conversation_api_config()
 
 
 @dataclass
@@ -1467,6 +1628,421 @@ def _eval_conversation_level(
     return record
 
 
+def _ticket_segmentation_payload(
+    conversation_id: str,
+    records: list[dict],
+    conversation_metadata: dict,
+    truncate_chars: Optional[int],
+) -> dict:
+    messages = []
+    for record in records:
+        text = str(record.get("message_text") or "")
+        if truncate_chars and len(text) > truncate_chars:
+            text = text[:truncate_chars] + "..."
+        messages.append(
+            {
+                "message_index": record.get("message_index"),
+                "time": record.get("message_time"),
+                "role": record.get("sender_role"),
+                "source_conversation_id": record.get("source_conversation_id"),
+                "text": text,
+            }
+        )
+    return {
+        "conversation_id": conversation_id,
+        "conversation_metadata": conversation_metadata,
+        "messages": messages,
+    }
+
+
+def _fallback_ticket(records: list[dict], reason: str) -> dict:
+    indexes = [
+        int(record["message_index"])
+        for record in records
+        if record.get("message_index") is not None
+    ]
+    if not indexes:
+        indexes = [1]
+    return {
+        "ticket_id": "ticket_1",
+        "ticket_type": "general_inquiry",
+        "customer_objective": "Original unsplit customer journey",
+        "start_message_index": min(indexes),
+        "end_message_index": max(indexes),
+        "included_message_indexes": indexes,
+        "status": "pending_unresolved",
+        "should_append_future_conversations": True,
+        "previous_ticket_id": "",
+        "inquiries": [],
+        "segmentation_reason": reason,
+    }
+
+
+def _normalize_ticket_inquiries(ticket: dict, valid_indexes: set[int]) -> list[dict]:
+    raw_inquiries = ticket.get("inquiries")
+    if not isinstance(raw_inquiries, list):
+        return []
+
+    normalized: list[dict] = []
+    for idx, inquiry in enumerate(raw_inquiries, start=1):
+        if not isinstance(inquiry, dict):
+            continue
+        message_indexes: list[int] = []
+        raw_indexes = inquiry.get("message_indexes")
+        if isinstance(raw_indexes, list):
+            for value in raw_indexes:
+                try:
+                    message_index = int(value)
+                except (TypeError, ValueError):
+                    continue
+                if message_index in valid_indexes and message_index not in message_indexes:
+                    message_indexes.append(message_index)
+
+        status = str(inquiry.get("status") or "").strip().lower()
+        if status not in {"resolved", "pending_unresolved", "totally_unresolved"}:
+            status = "pending_unresolved"
+
+        question = str(inquiry.get("question") or "").strip()
+        if not question and not message_indexes:
+            continue
+
+        normalized.append(
+            {
+                "inquiry_id": str(inquiry.get("inquiry_id") or f"inquiry_{idx}").strip() or f"inquiry_{idx}",
+                "question": question,
+                "message_indexes": sorted(message_indexes),
+                "status": status,
+                "answer_summary": str(inquiry.get("answer_summary") or "").strip(),
+                "unresolved_reason": str(inquiry.get("unresolved_reason") or "").strip() or "none",
+            }
+        )
+    return normalized
+
+
+def _normalize_ticket_segments(obj: dict, records: list[dict]) -> list[dict]:
+    valid_indexes = {
+        int(record["message_index"])
+        for record in records
+        if record.get("message_index") is not None
+    }
+    if not valid_indexes:
+        return [_fallback_ticket(records, "No usable message indexes were available.")]
+    material_indexes = {
+        int(record["message_index"])
+        for record in records
+        if record.get("message_index") is not None
+        and str(record.get("sender_role") or "").strip().lower() in {"customer", "agent"}
+        and str(record.get("message_text") or "").strip()
+    }
+
+    raw_tickets = obj.get("tickets") if isinstance(obj, dict) else None
+    if not isinstance(raw_tickets, list) or not raw_tickets:
+        return [_fallback_ticket(records, "Ticket segmentation returned no tickets.")]
+
+    normalized: list[dict] = []
+    for idx, ticket in enumerate(raw_tickets, start=1):
+        if not isinstance(ticket, dict):
+            continue
+        included: list[int] = []
+        raw_included = ticket.get("included_message_indexes")
+        if isinstance(raw_included, list):
+            for value in raw_included:
+                try:
+                    message_index = int(value)
+                except (TypeError, ValueError):
+                    continue
+                if message_index in valid_indexes and message_index not in included:
+                    included.append(message_index)
+
+        if not included:
+            try:
+                start = int(ticket.get("start_message_index"))
+                end = int(ticket.get("end_message_index"))
+                low, high = min(start, end), max(start, end)
+                included = sorted(i for i in valid_indexes if low <= i <= high)
+            except (TypeError, ValueError):
+                included = []
+        if not included:
+            continue
+
+        status = str(ticket.get("status") or "").strip().lower()
+        if status not in {"resolved", "pending_unresolved", "totally_unresolved"}:
+            status = "pending_unresolved"
+
+        ticket_type = re.sub(r"[^a-z0-9_]+", "_", str(ticket.get("ticket_type") or "other").strip().lower())
+        ticket_type = re.sub(r"_+", "_", ticket_type).strip("_") or "other"
+        included = sorted(included)
+        normalized.append(
+            {
+                "ticket_id": str(ticket.get("ticket_id") or f"ticket_{idx}").strip() or f"ticket_{idx}",
+                "ticket_type": ticket_type,
+                "customer_objective": str(ticket.get("customer_objective") or "").strip(),
+                "start_message_index": min(included),
+                "end_message_index": max(included),
+                "included_message_indexes": included,
+                "status": status,
+                "should_append_future_conversations": bool(ticket.get("should_append_future_conversations", status != "resolved")),
+                "previous_ticket_id": str(ticket.get("previous_ticket_id") or "").strip(),
+                "inquiries": _normalize_ticket_inquiries(ticket, valid_indexes),
+                "segmentation_reason": str(ticket.get("segmentation_reason") or "").strip(),
+            }
+        )
+
+    if not normalized:
+        return [_fallback_ticket(records, "Ticket segmentation produced only invalid tickets.")]
+
+    if material_indexes:
+        covered_indexes: set[int] = set()
+        for ticket in normalized:
+            covered_indexes.update(int(value) for value in ticket["included_message_indexes"])
+        covered_material = covered_indexes & material_indexes
+        coverage_ratio = len(covered_material) / max(len(material_indexes), 1)
+        if len(material_indexes) >= 10 and coverage_ratio < 0.75:
+            missing_count = len(material_indexes) - len(covered_material)
+            return [
+                _fallback_ticket(
+                    records,
+                    (
+                        "Ticket segmentation omitted too much of the visible journey "
+                        f"({missing_count} of {len(material_indexes)} material messages), "
+                        "so the original journey was kept intact."
+                    ),
+                )
+            ]
+
+    return normalized
+
+
+def _eval_ticket_segmentation(
+    client,
+    api: APIConfig,
+    conversation_id: str,
+    records: list[dict],
+    conversation_metadata: dict,
+    truncate_chars: Optional[int],
+    ticket_prompt: PromptTemplate | None = None,
+) -> tuple[list[dict], dict | None]:
+    payload = _ticket_segmentation_payload(
+        conversation_id,
+        records,
+        conversation_metadata,
+        truncate_chars,
+    )
+    tpl = ticket_prompt or _default_ticket_segmentation_prompt()
+    raw, debug = chat_completion(client, api, tpl.build_system(), tpl.build_user(payload))
+    obj = extract_json_object(raw)
+    return _normalize_ticket_segments(obj, records), {
+        "raw_model_response": raw,
+        "debug": debug,
+    }
+
+
+def preview_ticket_segmentation(
+    client,
+    api: APIConfig,
+    conversation_id: str,
+    records: list[dict],
+    conversation_metadata: dict,
+    truncate_chars: Optional[int] = None,
+    ticket_prompt: PromptTemplate | None = None,
+) -> dict:
+    """Run only the ticket segmentation prompt and return normalized preview data."""
+    tickets, debug = _eval_ticket_segmentation(
+        client,
+        api,
+        conversation_id,
+        records,
+        conversation_metadata,
+        truncate_chars,
+        ticket_prompt,
+    )
+    return {
+        "conversation_id": conversation_id,
+        "conversation_metadata": conversation_metadata,
+        "tickets": tickets,
+        "debug": debug,
+    }
+
+
+def _filtered_groups_for_segmentation(
+    df: pd.DataFrame,
+    config: RunConfig,
+) -> list[tuple[str, pd.DataFrame]]:
+    groups = get_conversation_groups(df)
+    if config.selected_conversation_ids is not None:
+        wanted = {str(x) for x in config.selected_conversation_ids}
+        return [group for group in groups if str(group[0]) in wanted]
+    if config.max_conversations is not None:
+        return groups[: config.max_conversations]
+    return groups
+
+
+def segment_dataframe_into_ticket_journeys(
+    df: pd.DataFrame,
+    client,
+    config: RunConfig,
+    on_progress: Optional[Callable[[dict], None]] = None,
+) -> pd.DataFrame:
+    """Split customer timelines into virtual ticket journeys using AI."""
+    if df.empty:
+        return df
+
+    groups = _filtered_groups_for_segmentation(df, config)
+    if not groups:
+        return df.iloc[0:0].copy()
+
+    index_col = MESSAGE_ORDER_COLUMN if MESSAGE_ORDER_COLUMN in df.columns else LEGACY_MESSAGE_ORDER_COLUMN
+    out_frames: list[pd.DataFrame] = []
+    truncate_chars = config.max_chars_per_message if config.truncate_messages else None
+    api = config.ticket_api_config()
+
+    if on_progress:
+        on_progress({"phase": "ticket_segmentation_start", "total_conversations": len(groups)})
+
+    for group_index, (parent_id, group) in enumerate(groups, start=1):
+        parent_id = str(parent_id)
+        records = message_records_from_group(group, parent_id)
+        metadata = conversation_metadata_from_group(group)
+        try:
+            tickets, debug = _eval_ticket_segmentation(
+                client,
+                api,
+                parent_id,
+                records,
+                metadata,
+                truncate_chars,
+                config.ticket_prompt,
+            )
+            failed_reason = ""
+        except Exception as exc:
+            tickets = [_fallback_ticket(records, f"Ticket segmentation failed: {exc}")]
+            debug = None
+            failed_reason = str(exc)
+
+        group_index_values = pd.to_numeric(group[index_col], errors="coerce")
+        for ticket_number, ticket in enumerate(tickets, start=1):
+            included = {int(value) for value in ticket["included_message_indexes"]}
+            ticket_rows = group[group_index_values.map(lambda value: pd.notna(value) and int(value) in included)].copy()
+            if ticket_rows.empty:
+                continue
+
+            ticket_journey_id = f"{parent_id}::ticket_{ticket_number:02d}"
+            ticket_rows[TICKET_JOURNEY_ID_COLUMN] = ticket_journey_id
+            ticket_rows["PARENT_JOURNEY_ID"] = parent_id
+            ticket_rows["TICKET_ID"] = ticket.get("ticket_id") or f"ticket_{ticket_number}"
+            ticket_rows["TICKET_TYPE"] = ticket.get("ticket_type") or "other"
+            ticket_rows["TICKET_STATUS"] = ticket.get("status") or "pending_unresolved"
+            ticket_rows["TICKET_OBJECTIVE"] = ticket.get("customer_objective") or ""
+            ticket_rows["TICKET_PREVIOUS_TICKET_ID"] = ticket.get("previous_ticket_id") or ""
+            ticket_rows["TICKET_INQUIRIES_JSON"] = json.dumps(ticket.get("inquiries") or [], ensure_ascii=False)
+            ticket_rows["TICKET_SEGMENTATION_REASON"] = ticket.get("segmentation_reason") or failed_reason
+            ticket_rows["TICKET_SHOULD_APPEND_FUTURE"] = bool(ticket.get("should_append_future_conversations"))
+            if debug and config.save_raw_responses:
+                ticket_rows["TICKET_SEGMENTATION_RAW"] = str(debug.get("raw_model_response") or "")
+            out_frames.append(ticket_rows)
+
+        if on_progress:
+            on_progress(
+                {
+                    "phase": "ticket_segmentation_done",
+                    "conversation_index": group_index,
+                    "total_conversations": len(groups),
+                    "conversation_id": parent_id,
+                    "tickets_created": len(tickets),
+                    "error": failed_reason,
+                }
+            )
+
+    if not out_frames:
+        return df.iloc[0:0].copy()
+    segmented = pd.concat(out_frames, ignore_index=True)
+    return segmented
+
+
+def _saved_conversations_to_dataframe(existing_conversation_results: list[dict] | None) -> pd.DataFrame:
+    """Rebuild CSV-like message rows from saved DB transcripts.
+
+    The ticket splitter already operates on the uploaded CSV shape. Saved DB
+    runs keep the same information in transcript dictionaries, so this adapter
+    gives DB-backed full runs the same optional ticket-splitting path.
+    """
+    rows: list[dict[str, Any]] = []
+    metadata_to_columns = {
+        "conversation_start_date": "CONVERSATION_START_DATE",
+        "conversation_end_date": "CONVERSATION_END_DATE",
+        "conversation_status": "CONVERSATION_STATUS",
+        "initial_skill": "INITIAL_SKILL",
+        "last_skill": "LAST_SKILL",
+        "joined_skills": "JOINED_SKILLS",
+        "conversation_agent_full_name": "CONVERSATION_AGENT_FULL_NAME",
+        "conversation_agent_login_name": "CONVERSATION_AGENT_LOGIN_NAME",
+        "customer_name": "CUSTOMER_NAME",
+        "ticket_journey_id": "TICKET_JOURNEY_ID",
+        "parent_journey_id": "PARENT_JOURNEY_ID",
+        "ticket_id": "TICKET_ID",
+        "ticket_type": "TICKET_TYPE",
+        "ticket_status": "TICKET_STATUS",
+        "ticket_objective": "TICKET_OBJECTIVE",
+        "ticket_previous_ticket_id": "TICKET_PREVIOUS_TICKET_ID",
+        "ticket_inquiries_json": "TICKET_INQUIRIES_JSON",
+        "ticket_segmentation_reason": "TICKET_SEGMENTATION_REASON",
+        "ticket_should_append_future": "TICKET_SHOULD_APPEND_FUTURE",
+        "source_conversation_ids": "CONVERSATION_IDS",
+        "source_conversation_count": "SOURCE_CONVERSATION_COUNT",
+        "total_visible_messages": "TOTAL_VISIBLE_MESSAGES",
+        "customer_message_count": "CUSTOMER_MESSAGE_COUNT",
+        "agent_message_count": "AGENT_MESSAGE_COUNT",
+    }
+    for loaded in existing_conversation_results or []:
+        if not isinstance(loaded, dict):
+            continue
+        parent_id = str(loaded.get("conversation_id") or loaded.get("thread_id") or "").strip()
+        if not parent_id:
+            continue
+        metadata = dict(loaded.get("conversation_metadata") or {})
+        records = list(loaded.get("transcript") or [])
+        for fallback_index, record in enumerate(records, start=1):
+            if not isinstance(record, dict):
+                continue
+            msg_index = (
+                record.get("appended_message_index")
+                if record.get("appended_message_index") is not None
+                else record.get("message_index")
+            )
+            if msg_index is None:
+                msg_index = fallback_index
+            source_conversation_id = (
+                record.get("source_conversation_id")
+                or record.get("conversation_id")
+                or metadata.get("source_conversation_ids")
+                or ""
+            )
+            row = {
+                JOURNEY_ID_COLUMN: parent_id,
+                MESSAGE_ORDER_COLUMN: msg_index,
+                LEGACY_MESSAGE_ORDER_COLUMN: msg_index,
+                "MESSAGE_TIME": record.get("message_time") or "",
+                "SENDER_ROLE": str(record.get("sender_role") or "unknown").strip().lower(),
+                "RAW_SENDER_ROLE": record.get("raw_sender_role"),
+                "MESSAGE_TEXT": record.get("message_text") or "",
+                "CONVERSATION_ID": source_conversation_id,
+                "MESSAGE_AGENT_FULL_NAME": record.get("agent_full_name"),
+                "MESSAGE_SKILL": record.get("message_skill"),
+                "HAS_RAG_RETRIEVAL": record.get("has_rag_retrieval"),
+                "RAG_RETRIEVAL_COUNT": record.get("rag_retrieval_count"),
+                "RAG_RETRIEVALS": record.get("rag_retrievals"),
+                "CHUNKS_FETCHED": record.get("chunks_fetched"),
+                "CHUNK_JUSTIFICATION": record.get("chunk_justification"),
+                "CHUNK_TIME": record.get("chunk_time"),
+            }
+            for md_key, column in metadata_to_columns.items():
+                value = metadata.get(md_key)
+                if value not in (None, ""):
+                    row[column] = value
+            rows.append(row)
+    return pd.DataFrame(rows)
+
+
 def _evaluation_sources(
     df: pd.DataFrame | None,
     existing_conversation_results: Optional[list[dict]] = None,
@@ -1541,20 +2117,63 @@ def run_evaluation(
     if target_role not in ("agent", "customer"):
         target_role = "agent"
 
-    sources = _evaluation_sources(df, existing_conversation_results)
+    segmented_input = False
+    source_df = df
+    source_existing_conversation_results = existing_conversation_results
+    if (
+        config.enable_ticket_segmentation
+        and df is not None
+        and not df.empty
+        and existing_conversation_results is None
+    ):
+        source_df = segment_dataframe_into_ticket_journeys(
+            df,
+            client,
+            config,
+            on_progress=on_progress,
+        )
+        segmented_input = True
+    elif (
+        config.enable_ticket_segmentation
+        and (df is None or df.empty)
+        and existing_conversation_results is not None
+    ):
+        rebuilt_df = _saved_conversations_to_dataframe(existing_conversation_results)
+        if not rebuilt_df.empty:
+            source_df = segment_dataframe_into_ticket_journeys(
+                rebuilt_df,
+                client,
+                config,
+                on_progress=on_progress,
+            )
+            source_existing_conversation_results = None
+            segmented_input = True
+
+    sources = _evaluation_sources(source_df, source_existing_conversation_results)
     # Selection precedence: explicit IDs (random sampler) > max_conversations slice.
-    if config.selected_conversation_ids is not None:
+    if segmented_input:
+        pass
+    elif config.selected_conversation_ids is not None:
         wanted = set(str(x) for x in config.selected_conversation_ids)
         sources = [source for source in sources if str(source[0]) in wanted]
     elif config.max_conversations is not None:
         sources = sources[: config.max_conversations]
 
     total_conversations = len(sources)
+    planned_message_calls = 0
+    for _, records, _ in sources:
+        targets = [r for r in records if r.get("sender_role") == target_role]
+        if config.max_agent_messages_per_conv is not None:
+            targets = targets[: config.max_agent_messages_per_conv]
+        planned_message_calls += len(targets)
     if on_progress:
         on_progress(
             {
                 "phase": "start",
                 "total_conversations": total_conversations,
+                "total_message_calls": int(planned_message_calls),
+                "total_conversation_calls": int(total_conversations),
+                "total_calls": int(planned_message_calls + total_conversations),
                 "workers": workers,
             }
         )

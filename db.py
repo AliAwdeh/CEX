@@ -36,6 +36,33 @@ from prompts import (
 DEFAULT_DB_PATH = Path("cx_evaluator.db")
 
 
+def _load_prompt_file(filename: str, fallback: str = "") -> str:
+    root = Path(__file__).resolve().parent / "correct_prompt_files"
+    for candidate in (filename, f"{filename}.txt"):
+        path = root / candidate
+        try:
+            value = path.read_text(encoding="utf-8")
+        except OSError:
+            continue
+        if value.strip():
+            return value
+    return fallback
+
+
+def _default_ticket_segmentation_prompt() -> PromptTemplate:
+    return PromptTemplate(
+        system_prompt=_load_prompt_file(
+            "ticket segmentation prompt",
+            "You split a complete customer/contract conversation timeline into ticket-style customer journeys.\n\nRequired schema:\n{output_schema}",
+        ),
+        output_schema=_load_prompt_file("ticket segmentation scheme", '{"tickets":[]}'),
+        user_prompt_template=_load_prompt_file(
+            "ticket segmentation user input",
+            "Input:\n{payload_json}",
+        ),
+    )
+
+
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS settings (
     key TEXT PRIMARY KEY,
@@ -173,6 +200,39 @@ CREATE TABLE IF NOT EXISTS journey_review_history (
 );
 
 CREATE INDEX IF NOT EXISTS idx_journey_review_history_lookup ON journey_review_history(run_id, conversation_id, reviewer_name, reviewed_at);
+
+CREATE TABLE IF NOT EXISTS ticket_preview_runs (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    name TEXT,
+    source TEXT,
+    source_run_id INTEGER,
+    source_label TEXT,
+    created_at TEXT NOT NULL,
+    model TEXT,
+    thinking_effort TEXT,
+    config_json TEXT,
+    n_previews INTEGER NOT NULL DEFAULT 0,
+    n_tickets INTEGER NOT NULL DEFAULT 0
+);
+
+CREATE INDEX IF NOT EXISTS idx_ticket_preview_runs_created ON ticket_preview_runs(created_at);
+
+CREATE TABLE IF NOT EXISTS ticket_preview_results (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    preview_run_id INTEGER NOT NULL,
+    conversation_id TEXT NOT NULL,
+    label TEXT,
+    conversation_metadata TEXT,
+    transcript_json TEXT,
+    tickets_json TEXT,
+    debug_json TEXT,
+    error_message TEXT,
+    created_at TEXT NOT NULL,
+    FOREIGN KEY (preview_run_id) REFERENCES ticket_preview_runs(id) ON DELETE CASCADE
+);
+
+CREATE INDEX IF NOT EXISTS idx_ticket_preview_results_run ON ticket_preview_results(preview_run_id);
+CREATE INDEX IF NOT EXISTS idx_ticket_preview_results_conv ON ticket_preview_results(conversation_id);
 """
 
 
@@ -568,6 +628,7 @@ class Database:
         for kind, tpl in (
             ("message_level", DEFAULT_MESSAGE_LEVEL_PROMPT),
             ("conversation_level", DEFAULT_CONVERSATION_LEVEL_PROMPT),
+            ("ticket_segmentation", _default_ticket_segmentation_prompt()),
         ):
             existing = self._fetchone(
                 "SELECT id FROM prompt_templates WHERE kind=? AND is_default=1",
@@ -823,16 +884,20 @@ class Database:
             (_json_dump(config), int(run_id)),
         )
 
-    def list_runs(self, limit: int = 200) -> list[dict]:
-        rows = self._fetchall(
+    def list_runs(self, limit: int | None = None) -> list[dict]:
+        sql = (
             "SELECT id, name, csv_name, started_at, finished_at, status, "
             "n_conversations, n_message_calls, n_errors, "
             "(SELECT COUNT(*) FROM conversation_results WHERE run_id=runs.id) AS saved_conversations, "
             "(SELECT COUNT(*) FROM message_results WHERE run_id=runs.id) AS saved_message_results, "
             "(SELECT COUNT(*) FROM run_errors WHERE run_id=runs.id) AS saved_errors "
-            "FROM runs ORDER BY started_at DESC LIMIT ?",
-            (int(limit),),
+            "FROM runs ORDER BY started_at DESC"
         )
+        params: tuple[Any, ...] = ()
+        if limit is not None:
+            sql += " LIMIT ?"
+            params = (int(limit),)
+        rows = self._fetchall(sql, params)
         return [dict(r) for r in rows]
 
     def get_run(self, run_id: int) -> Optional[dict]:
@@ -950,6 +1015,98 @@ class Database:
     def delete_run(self, run_id: int) -> None:
         # ON DELETE CASCADE handles related rows.
         self._exec("DELETE FROM runs WHERE id=?", (int(run_id),))
+
+    # -------- ticket preview runs --------
+
+    def save_ticket_preview_run(
+        self,
+        *,
+        name: str | None,
+        source: str,
+        source_run_id: int | None,
+        source_label: str | None,
+        model: str | None,
+        thinking_effort: str | None,
+        config: dict | None,
+        previews: list[dict],
+    ) -> int:
+        now = _now_iso()
+        n_tickets = sum(len(preview.get("tickets") or []) for preview in previews)
+        with self._tx() as con:
+            cur = con.execute(
+                "INSERT INTO ticket_preview_runs"
+                "(name, source, source_run_id, source_label, created_at, model, thinking_effort, "
+                "config_json, n_previews, n_tickets) "
+                "VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    name,
+                    source,
+                    int(source_run_id) if source_run_id is not None else None,
+                    source_label,
+                    now,
+                    model,
+                    thinking_effort,
+                    _json_dump(config or {}),
+                    len(previews),
+                    n_tickets,
+                ),
+            )
+            preview_run_id = int(cur.lastrowid)
+            for preview in previews:
+                con.execute(
+                    "INSERT INTO ticket_preview_results"
+                    "(preview_run_id, conversation_id, label, conversation_metadata, transcript_json, "
+                    "tickets_json, debug_json, error_message, created_at) "
+                    "VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    (
+                        preview_run_id,
+                        str(preview.get("conversation_id") or ""),
+                        preview.get("label"),
+                        _json_dump(preview.get("conversation_metadata") or {}),
+                        _json_dump(preview.get("records") or []),
+                        _json_dump(preview.get("tickets") or []),
+                        _json_dump(preview.get("debug")) if preview.get("debug") is not None else None,
+                        preview.get("error"),
+                        now,
+                    ),
+                )
+        return preview_run_id
+
+    def list_ticket_preview_runs(self) -> list[dict]:
+        rows = self._fetchall(
+            "SELECT id, name, source, source_run_id, source_label, created_at, model, "
+            "thinking_effort, n_previews, n_tickets "
+            "FROM ticket_preview_runs ORDER BY created_at DESC"
+        )
+        return [dict(row) for row in rows]
+
+    def load_ticket_preview_run(self, preview_run_id: int) -> dict | None:
+        run = self._fetchone(
+            "SELECT * FROM ticket_preview_runs WHERE id=?",
+            (int(preview_run_id),),
+        )
+        if not run:
+            return None
+        rows = self._fetchall(
+            "SELECT * FROM ticket_preview_results WHERE preview_run_id=? ORDER BY id",
+            (int(preview_run_id),),
+        )
+        previews: list[dict] = []
+        for row in rows:
+            preview = dict(row)
+            preview["conversation_metadata"] = _json_load(preview.pop("conversation_metadata")) or {}
+            preview["records"] = _json_load(preview.pop("transcript_json")) or []
+            preview["tickets"] = _json_load(preview.pop("tickets_json")) or []
+            preview["debug"] = _json_load(preview.pop("debug_json"))
+            preview["error"] = preview.pop("error_message")
+            previews.append(preview)
+        out = dict(run)
+        out["config"] = _json_load(out.pop("config_json")) or {}
+        out["previews"] = previews
+        return out
+
+    def delete_ticket_preview_run(self, preview_run_id: int) -> None:
+        self._exec("DELETE FROM ticket_preview_runs WHERE id=?", (int(preview_run_id),))
 
     # -------- results --------
 

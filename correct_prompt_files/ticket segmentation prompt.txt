@@ -1,0 +1,50 @@
+You split a complete customer/contract conversation timeline into ticket-style customer journeys.
+
+Return strict JSON only.
+
+A ticket is one evaluable customer thread. A thread can be:
+- a concrete issue, request, complaint, process action, or blocked outcome
+- a grouped informational inquiry ticket that may contain several standalone questions
+
+Core rules:
+- Use only visible messages.
+- One contract/customer timeline can contain multiple tickets.
+- Include the greeting/setup messages that immediately precede the customer's first real request in the same ticket. If the customer says "Hi" and the assistant replies before the customer states the objective, keep those greeting messages inside that ticket.
+- Do not exclude a broadcast/system message only because it is a broadcast. Include broadcasts that trigger, frame, confirm, remind about, warn about, follow up on, or are referenced by the customer in relation to the ticket.
+- If the customer asks about, reacts to, complains about, confirms, or follows instructions from a broadcast, include that broadcast and the customer interaction in the same ticket.
+- Promotional or informational messages after the main answer should stay in the same ticket when they are part of the same active thread, same service lifecycle, or related next-step context. Exclude them only when they are clearly isolated, unrelated, and not referenced by the customer.
+- Do not omit substantive customer, agent, bot, or broadcast messages. If a message is not clearly isolated unrelated noise, assign it to the closest relevant ticket or create a separate ticket for it.
+- Exclude only truly isolated unrelated operational noise that has no relationship to any customer objective and is not needed to understand the ticket.
+
+Issue/request grouping:
+- Create a separate ticket for each distinct issue, complaint, process action, cancellation request, refund request, payment problem, document problem, visa/EID process problem, or operational blocker.
+- If the customer raises the same underlying issue multiple times, append the later messages to the same issue ticket until it is resolved, clearly pending, abandoned, or replaced by a different issue.
+- If two issues are different, keep them as separate tickets even if they happen close together.
+- If an informational question is only a clarification inside an active issue, include it in that issue ticket and list it in that ticket's inquiries array.
+
+Inquiry grouping:
+- A standalone inquiry is a question asking for information, explanation, timing, status, eligibility, price, policy, location, required document, or next step, without itself being a complaint or operational blocker.
+- If the customer asks multiple standalone inquiries about different matters, group them into one inquiry ticket and list every question separately in the inquiries array.
+- If the sequence is issue -> inquiry -> issue -> inquiry, keep each distinct issue as its own ticket unless it is the same underlying issue, and group the standalone inquiries together in one inquiry ticket. Preserve the visible message indexes for each inquiry.
+- For every inquiry ticket, the inquiries array must track each inquiry separately, including whether that specific inquiry was resolved, pending_unresolved, or totally_unresolved.
+- For issue tickets that contain clarification questions, include those questions in the inquiries array too.
+
+Resolved vs future follow-up logic:
+- If an inquiry or issue is not resolved, later messages that continue or follow up on it must be appended to the same ticket. Set should_append_future_conversations to true.
+- If an inquiry or issue is resolved, and later the customer raises a new question/request in the same category, create a new ticket with the same ticket_type. Do not merge it into the resolved ticket. Set previous_ticket_id to the earlier resolved ticket id.
+- If the earlier ticket is still pending_unresolved or totally_unresolved, do not create a same-category duplicate ticket for a follow-up. Append the follow-up to the open ticket.
+
+Status rules:
+- If a ticket is still waiting for a retry, review, delivery, refund, government step, customer document, bank action, internal action, or future confirmation, status is pending_unresolved.
+- If no usable current state or path remains, status is totally_unresolved.
+- If the customer objective was answered/completed/accepted, status is resolved.
+- For grouped inquiry tickets, the ticket status is resolved only if all listed inquiries are resolved. If any inquiry is pending_unresolved, the ticket status is pending_unresolved. If any inquiry is totally_unresolved and no usable path remains for it, the ticket status is totally_unresolved unless another inquiry is still pending with a clear path.
+
+Ticket type should be short snake_case, such as payment_issue, refund_request, document_request, visa_status, eid_delivery, contract_question, cancellation_request, booking_request, complaint, general_inquiry, other.
+
+Use an empty string for previous_ticket_id when there is no predecessor. Use an empty inquiries array only when the ticket contains no informational question.
+
+Do not include markdown, comments, or extra top-level keys.
+
+Required schema:
+{output_schema}

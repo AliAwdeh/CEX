@@ -499,6 +499,24 @@ def flatten_conversation_row(
         return None
 
     transcript = conv_result.get("transcript") or []
+    conversation_id = str(conv_result.get("conversation_id", "") or "")
+    parent_journey_id = get_md("parent_journey_id") or (
+        conversation_id.split("::ticket_", 1)[0]
+        if "::ticket_" in conversation_id
+        else conversation_id
+    )
+    ticket_id = get_md("ticket_id") or (
+        f"ticket_{conversation_id.split('::ticket_', 1)[1]}"
+        if "::ticket_" in conversation_id
+        else None
+    )
+    ticket_label = str(ticket_id or "").strip()
+    if ticket_label and ticket_label.lower().startswith("ticket_"):
+        suffix = ticket_label.split("_", 1)[1]
+        ticket_label = f"Ticket {suffix}"
+    elif ticket_label:
+        ticket_label = humanize_label(ticket_label)
+
     journey_starter = None
     if isinstance(transcript, list) and transcript and isinstance(transcript[0], dict):
         first_message = transcript[0]
@@ -513,12 +531,20 @@ def flatten_conversation_row(
         }.get(journey_starter, journey_starter)
 
     row = {
-        "conversation_id": conv_result.get("conversation_id", ""),
-        "customer_journey_id": conv_result.get("conversation_id", ""),
+        "conversation_id": conversation_id,
+        "customer_journey_id": conversation_id,
+        "parent_journey_id": parent_journey_id,
+        "ticket_id": ticket_id,
+        "ticket_label": ticket_label,
+        "ticket_type": get_md("ticket_type"),
+        "ticket_status": get_md("ticket_status"),
+        "ticket_objective": get_md("ticket_objective"),
+        "ticket_segmentation_reason": get_md("ticket_segmentation_reason"),
+        "ticket_should_append_future": get_md("ticket_should_append_future"),
         "journey_starter": journey_starter,
         **_agent_presence_summary(
             transcript if isinstance(transcript, list) else [],
-            fallback_conversation_id=str(conv_result.get("conversation_id", "") or ""),
+            fallback_conversation_id=conversation_id,
         ),
         "customer_name": get_md("customer_name"),
         "customer_phone": get_md("customer_phone"),

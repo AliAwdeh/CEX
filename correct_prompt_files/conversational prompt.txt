@@ -61,6 +61,12 @@ If internal tool names, raw JSON, or system output are visible to the customer, 
 
 ---
 
+# 1A. Ticket Metadata Scope
+
+If conversation_metadata contains ticket fields, evaluate this payload as one ticket journey, not as the original full customer timeline. Use ticket_objective as the scoped customer objective unless the visible ticket transcript clearly contradicts it. Use ticket_status as segmentation context, not automatic truth: the final handled_status and unhandled_resolution_subtype must still be justified by the ticket transcript and message-level evidence.
+
+---
+
 # 2. Identify the Customer Objective First
 
 Before making any judgment, identify:
