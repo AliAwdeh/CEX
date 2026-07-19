@@ -9,11 +9,14 @@ import hashlib
 import hmac
 import importlib
 import os
+import re
 import secrets as secrets_lib
 import sqlite3
 import textwrap
 import time
+from collections import Counter
 from dataclasses import asdict
+from difflib import SequenceMatcher
 from pathlib import Path
 from typing import Any
 
@@ -22,7 +25,7 @@ import streamlit as st
 import streamlit.components.v1 as components
 import ui_components as ui_components_module
 
-from api_client import APIConfig, DEFAULT_BASE_URL, MAX_CONCURRENCY, build_client, fetch_models
+from api_client import APIConfig, DEFAULT_BASE_URL, MAX_CONCURRENCY, build_client, chat_completion, fetch_models
 from cost_estimator import estimate_run_tokens_and_cost
 from data_loader import (
     JOURNEY_ID_COLUMN,
@@ -34,6 +37,7 @@ from data_loader import (
     load_csv,
     normalize_dataframe,
     proportional_stratified_sample_ids,
+    strip_inline_rag_context,
     summarize_dataframe,
     validate_csv,
 )
@@ -41,6 +45,7 @@ from db import DEFAULT_DB_PATH, Database
 from evaluator import (
     RunConfig,
     RunResults,
+    extract_json_object,
     run_message_level_repair,
     run_conversation_level_only,
     run_evaluation,
@@ -96,10 +101,13 @@ DEFAULT_EVALUATION_SETTINGS = {
     "api_base_url": DEFAULT_BASE_URL,
     "selected_model": DEFAULT_SELECTED_MODEL,
     "conversation_selected_model": DEFAULT_SELECTED_MODEL,
+    "broadcast_selected_model": DEFAULT_SELECTED_MODEL,
     "message_thinking_effort": "default",
     "conversation_thinking_effort": "default",
+    "broadcast_thinking_effort": "default",
     "use_flex_service_tier": False,
     "temperature": 0.1,
+    "broadcast_temperature": 0.1,
     "top_p": 1.0,
     "max_tokens": 100000,
     "timeout": 300.0,
@@ -349,6 +357,8 @@ def _init_state() -> None:
         st.session_state.selected_model = DEFAULT_SELECTED_MODEL
     if not st.session_state.get("conversation_selected_model"):
         st.session_state.conversation_selected_model = st.session_state.selected_model
+    if not st.session_state.get("broadcast_selected_model"):
+        st.session_state.broadcast_selected_model = st.session_state.conversation_selected_model
     if not st.session_state.get("api_base_url"):
         st.session_state.api_base_url = DEFAULT_BASE_URL
     if st.session_state.get("_separate_thinking_effort_version") != 1:
@@ -4734,6 +4744,29 @@ def render_sidebar() -> None:
                 key="conversation_selected_model",
                 help="Uses the same base URL and API key as the message-level model.",
             )
+            broadcast_current = str(
+                st.session_state.get("broadcast_selected_model")
+                or st.session_state.get("conversation_selected_model")
+                or st.session_state.selected_model
+            )
+            if broadcast_current not in models:
+                broadcast_current = (
+                    st.session_state.conversation_selected_model
+                    if st.session_state.get("conversation_selected_model") in models
+                    else (
+                        st.session_state.selected_model
+                        if st.session_state.selected_model in models
+                        else models[0]
+                    )
+                )
+                st.session_state.broadcast_selected_model = broadcast_current
+            st.selectbox(
+                "Broadcast-analysis model",
+                models,
+                index=models.index(broadcast_current),
+                key="broadcast_selected_model",
+                help="Used only when running grouped Broadcast Analysis AI.",
+            )
         else:
             st.text_input(
                 "Message-level model",
@@ -4748,6 +4781,11 @@ def render_sidebar() -> None:
                 "Conversation-level model",
                 key="conversation_selected_model",
                 help="May differ from the message-level model; it reuses the same API key.",
+            )
+            st.text_input(
+                "Broadcast-analysis model",
+                key="broadcast_selected_model",
+                help="Used only when running grouped Broadcast Analysis AI.",
             )
 
         st.markdown("---")
@@ -4787,6 +4825,16 @@ def render_sidebar() -> None:
                 "compatible thinking toggle."
             ),
         )
+        st.selectbox(
+            "Broadcast-analysis thinking effort",
+            thinking_options,
+            key="broadcast_thinking_effort",
+            format_func=thinking_labels.__getitem__,
+            help=(
+                "Reasoning used only for grouped Broadcast Analysis AI. "
+                "Broadcast clustering itself never uses an LLM."
+            ),
+        )
         st.toggle(
             "Use Flex service tier",
             key="use_flex_service_tier",
@@ -4804,6 +4852,14 @@ def render_sidebar() -> None:
             step=0.05,
             key="temperature",
             help=f"Default: {DEFAULT_EVALUATION_SETTINGS['temperature']}",
+        )
+        st.slider(
+            "Broadcast-analysis temperature",
+            min_value=0.0,
+            max_value=2.0,
+            step=0.05,
+            key="broadcast_temperature",
+            help="Used only when running grouped Broadcast Analysis AI.",
         )
         st.slider(
             "Top P",
@@ -9008,6 +9064,1031 @@ def _message_results_by_index(message_results: list[dict] | None) -> dict[str, d
     }
 
 
+_BROADCAST_CLUSTER_VERSION = "deterministic_similarity_v1"
+_BROADCAST_DYNAMIC_PATTERNS = [
+    (re.compile(r"https?://\S+|www\.\S+", re.IGNORECASE), " <url> "),
+    (re.compile(r"\b[\w.+-]+@[\w-]+(?:\.[\w-]+)+\b", re.IGNORECASE), " <email> "),
+    (re.compile(r"\b(?:aed|usd|eur|lbp|sar|qar|kwd)?\s*\d[\d,]*(?:\.\d+)?\s*(?:aed|usd|eur|lbp|sar|qar|kwd)?\b", re.IGNORECASE), " <number> "),
+    (re.compile(r"\b\d{1,2}[/-]\d{1,2}[/-]\d{2,4}\b"), " <date> "),
+    (re.compile(r"\b\d{4}-\d{1,2}-\d{1,2}\b"), " <date> "),
+    (re.compile(r"\b[A-Z]{1,6}[-_]?\d{3,}[A-Z0-9-]*\b", re.IGNORECASE), " <ref> "),
+    (re.compile(r"\b\+?\d[\d\s().-]{6,}\d\b"), " <phone> "),
+]
+
+
+def _normalize_broadcast_text(text: Any) -> str:
+    """Normalize dynamic broadcast values without using an LLM."""
+    normalized = html_lib.unescape(str(text or "")).lower()
+    for pattern, replacement in _BROADCAST_DYNAMIC_PATTERNS:
+        normalized = pattern.sub(replacement, normalized)
+    normalized = re.sub(r"[\u200b-\u200f\u202a-\u202e]", "", normalized)
+    normalized = re.sub(r"[^\w<>]+", " ", normalized, flags=re.UNICODE)
+    normalized = re.sub(r"\s+", " ", normalized).strip()
+    return normalized
+
+
+def _broadcast_tokens(normalized_text: str) -> list[str]:
+    return [token for token in str(normalized_text or "").split() if token]
+
+
+def _broadcast_similarity(a_normalized: str, b_normalized: str) -> dict[str, float]:
+    """Return required 60/40 sentence + word similarity for two broadcasts."""
+    a_normalized = str(a_normalized or "")
+    b_normalized = str(b_normalized or "")
+    if not a_normalized or not b_normalized:
+        return {"sentence_similarity": 0.0, "word_similarity": 0.0, "combined_similarity": 0.0}
+    sentence_similarity = SequenceMatcher(None, a_normalized, b_normalized).ratio()
+    a_tokens = _broadcast_tokens(a_normalized)
+    b_tokens = _broadcast_tokens(b_normalized)
+    word_sequence = SequenceMatcher(None, a_tokens, b_tokens).ratio() if a_tokens and b_tokens else 0.0
+    a_set = set(a_tokens)
+    b_set = set(b_tokens)
+    word_overlap = (len(a_set & b_set) / len(a_set | b_set)) if a_set and b_set else 0.0
+    word_similarity = max(word_sequence, word_overlap)
+    combined = (0.60 * sentence_similarity) + (0.40 * word_similarity)
+    return {
+        "sentence_similarity": round(sentence_similarity, 4),
+        "word_similarity": round(word_similarity, 4),
+        "combined_similarity": round(combined, 4),
+    }
+
+
+def _safe_json_load(value: Any, default: Any = None) -> Any:
+    if value is None:
+        return default
+    if isinstance(value, (dict, list)):
+        return value
+    try:
+        return json.loads(str(value))
+    except Exception:
+        return default
+
+
+def _message_datetime_value(value: Any) -> pd.Timestamp | None:
+    parsed = pd.to_datetime(value, errors="coerce")
+    if pd.isna(parsed):
+        return None
+    return parsed
+
+
+def _message_sort_key(message: dict) -> tuple[Any, int, str]:
+    parsed = _message_datetime_value(message.get("message_time"))
+    time_key = parsed.to_pydatetime() if parsed is not None else pd.Timestamp.max.to_pydatetime()
+    try:
+        idx = int(message.get("appended_message_index", message.get("message_index")) or 0)
+    except Exception:
+        idx = 0
+    return (time_key, idx, str(message.get("message_id") or ""))
+
+
+def _is_system_broadcast_message(message: dict) -> bool:
+    raw = str(
+        message.get("RAW_SENDER_TYPE")
+        or message.get("raw_sender_type")
+        or message.get("raw_sender_role")
+        or ""
+    ).strip().lower()
+    return raw == "system"
+
+
+def _meaningful_customer_facing_message(message: dict) -> bool:
+    text = str(message.get("message_text") or "").strip()
+    if not text:
+        return False
+    raw = str(message.get("raw_sender_role") or message.get("raw_sender_type") or "").strip().lower()
+    sender = str(message.get("sender_role") or "").strip().lower()
+    return raw in {"system", "bot", "agent", "consumer", "customer"} or sender in {"customer", "agent", "bot", "assistant"}
+
+
+def _broadcast_issue_types(parsed: dict) -> list[str]:
+    issue_types: list[str] = []
+    issue_type = str((parsed or {}).get("issue_type") or "").strip()
+    if issue_type and issue_type != "none":
+        issue_types.append(issue_type)
+    return sorted(set(issue_types))
+
+
+def _broadcast_justification(parsed: dict, error_message: str | None = None) -> str:
+    if not parsed:
+        return str(error_message or "").strip()
+    parts = []
+    for key in ("evidence", "business_impact", "frustration_cause", "recommended_fix"):
+        value = str(parsed.get(key) or "").strip()
+        if value and value.lower() != "none":
+            parts.append(f"{humanize_label(key)}: {value}")
+    return "\n".join(parts)
+
+
+def _compact_context_message(message: dict, *, is_broadcast: bool = False) -> dict[str, Any]:
+    return {
+        "time": message.get("message_time"),
+        "sender": humanize_label(message.get("raw_sender_role") or message.get("sender_role") or "unknown"),
+        "sender_role": message.get("sender_role"),
+        "raw_sender_role": message.get("raw_sender_role"),
+        "message_index": message.get("message_index"),
+        "text": strip_inline_rag_context(message.get("message_text") or ""),
+        "is_broadcast": is_broadcast,
+    }
+
+
+def _broadcast_context_for_message(transcript: list[dict], target_message: dict) -> tuple[list[dict], str, str]:
+    """Return 5 before + broadcast + 2 after within the source conversation."""
+    source_id = str(target_message.get("source_conversation_id") or "").strip()
+    if source_id:
+        scoped = [
+            message for message in transcript
+            if str(message.get("source_conversation_id") or "").strip() == source_id
+        ]
+    else:
+        scoped = list(transcript)
+    scoped = sorted(scoped, key=_message_sort_key)
+    target_idx = None
+    target_message_index = target_message.get("message_index")
+    target_message_id = target_message.get("message_id")
+    for idx, message in enumerate(scoped):
+        if target_message_id and message.get("message_id") == target_message_id:
+            target_idx = idx
+            break
+        if target_message_index is not None and message.get("message_index") == target_message_index:
+            target_idx = idx
+            break
+    if target_idx is None:
+        target_idx = 0
+
+    before = scoped[max(0, target_idx - 5):target_idx]
+    after = scoped[target_idx + 1:target_idx + 3]
+    context = [
+        *[_compact_context_message(message) for message in before],
+        _compact_context_message(scoped[target_idx], is_broadcast=True),
+        *[_compact_context_message(message) for message in after],
+    ]
+    prior_meaningful = any(_meaningful_customer_facing_message(message) for message in scoped[:target_idx])
+    position = "middle_of_conversation" if prior_meaningful else "conversation_start"
+    customer_responses = [
+        strip_inline_rag_context(message.get("message_text") or "")
+        for message in scoped[target_idx + 1:]
+        if str(message.get("sender_role") or "").strip().lower() == "customer"
+        and str(message.get("message_text") or "").strip()
+    ][:2]
+    return context, position, "\n".join(customer_responses)
+
+
+def _broadcast_customer_id(metadata: dict, transcript: list[dict]) -> str:
+    for key in ("customer_id", "customer_phone", "customer_name", "phone_number"):
+        value = str((metadata or {}).get(key) or "").strip()
+        if value:
+            return value
+    for message in transcript:
+        for key in ("customer_id", "customer_phone", "phone_number"):
+            value = str(message.get(key) or "").strip()
+            if value:
+                return value
+    return ""
+
+
+def _broadcast_sender_skill(message: dict, metadata: dict) -> str:
+    for key in ("skill", "sender_skill", "current_skill", "message_skill"):
+        value = str(message.get(key) or "").strip()
+        if value:
+            return value
+    for key in ("initial_skill", "last_skill", "joined_skills"):
+        value = str((metadata or {}).get(key) or "").strip()
+        if value:
+            return value
+    return ""
+
+
+def _load_broadcast_source_occurrences(db: Database, run_id: int) -> list[dict[str, Any]]:
+    """Load SYSTEM messages from saved transcripts for the selected run."""
+    conv_rows = db._fetchall(
+        "SELECT conversation_id, parsed_json, conversation_metadata, transcript_json "
+        "FROM conversation_results WHERE run_id=? ORDER BY id ASC",
+        (int(run_id),),
+    )
+    msg_rows = db._fetchall(
+        "SELECT conversation_id, message_index, parse_status, error_message, parsed_json "
+        "FROM message_results WHERE run_id=?",
+        (int(run_id),),
+    )
+    msg_eval_by_key: dict[tuple[str, str], dict[str, Any]] = {}
+    for row in msg_rows:
+        if row["message_index"] is None:
+            continue
+        parsed = _safe_json_load(row["parsed_json"], {}) or {}
+        msg_eval_by_key[(str(row["conversation_id"]), str(row["message_index"]))] = {
+            "parse_status": row["parse_status"],
+            "error_message": row["error_message"],
+            "parsed_json": parsed,
+        }
+
+    occurrences: list[dict[str, Any]] = []
+    for row in conv_rows:
+        conversation_id = str(row["conversation_id"] or "")
+        metadata = _safe_json_load(row["conversation_metadata"], {}) or {}
+        conversation_parsed = _safe_json_load(row["parsed_json"], {}) or {}
+        transcript = _safe_json_load(row["transcript_json"], []) or []
+        if not isinstance(transcript, list):
+            continue
+        transcript = [message for message in transcript if isinstance(message, dict)]
+        customer_id = _broadcast_customer_id(metadata, transcript)
+        outcome = {
+            "handled_status": conversation_parsed.get("handled_status"),
+            "customer_experience": conversation_parsed.get("customer_experience"),
+            "score": (conversation_parsed.get("conversation_score") or {}).get("final_score")
+            if isinstance(conversation_parsed.get("conversation_score"), dict)
+            else None,
+        }
+        for message in transcript:
+            if not _is_system_broadcast_message(message):
+                continue
+            text = strip_inline_rag_context(message.get("message_text") or "")
+            if not text.strip():
+                continue
+            message_index = message.get("message_index")
+            eval_result = msg_eval_by_key.get((conversation_id, str(message_index))) if message_index is not None else None
+            parsed = (eval_result or {}).get("parsed_json") or {}
+            flag_level = _message_flag_level(eval_result) if eval_result else "Not evaluated"
+            context, position, customer_response = _broadcast_context_for_message(transcript, message)
+            occurrences.append(
+                {
+                    "conversation_id": conversation_id,
+                    "source_conversation_id": message.get("source_conversation_id"),
+                    "customer_id": customer_id,
+                    "message_index": int(message_index) if message_index is not None else None,
+                    "message_time": message.get("message_time"),
+                    "message_text": text,
+                    "normalized_text": _normalize_broadcast_text(text),
+                    "sender_skill": _broadcast_sender_skill(message, metadata),
+                    "flag_level": flag_level,
+                    "issue_types": _broadcast_issue_types(parsed),
+                    "justification": _broadcast_justification(parsed, (eval_result or {}).get("error_message")),
+                    "position": position,
+                    "context": context,
+                    "customer_response_text": customer_response,
+                    "conversation_outcome": outcome,
+                }
+            )
+    return occurrences
+
+
+def _make_broadcast_cluster_id(run_id: int, normalized_text: str, existing_ids: set[str]) -> str:
+    digest = hashlib.sha1(f"{run_id}:{normalized_text}:{len(existing_ids)}".encode("utf-8")).hexdigest()[:12]
+    base = f"bc_{int(run_id)}_{digest}"
+    candidate = base
+    suffix = 2
+    while candidate in existing_ids:
+        candidate = f"{base}_{suffix}"
+        suffix += 1
+    return candidate
+
+
+def _persist_broadcast_clusters(
+    db: Database,
+    run_id: int,
+    *,
+    threshold: float = 0.80,
+    rebuild: bool = False,
+) -> dict[str, int]:
+    """Cluster SYSTEM messages deterministically and persist the result."""
+    run_id = int(run_id)
+    threshold = float(threshold or 0.80)
+    source_occurrences = _load_broadcast_source_occurrences(db, run_id)
+    now = pd.Timestamp.utcnow().isoformat()
+
+    with db._lock:
+        if rebuild:
+            db._conn.execute("DELETE FROM broadcast_ai_analyses WHERE run_id=?", (run_id,))
+            db._conn.execute("DELETE FROM broadcast_occurrences WHERE run_id=?", (run_id,))
+            db._conn.execute("DELETE FROM broadcast_clusters WHERE run_id=?", (run_id,))
+
+        existing_occurrence_keys = {
+            (str(row["conversation_id"]), int(row["message_index"]) if row["message_index"] is not None else None)
+            for row in db._conn.execute(
+                "SELECT conversation_id, message_index FROM broadcast_occurrences WHERE run_id=?",
+                (run_id,),
+            ).fetchall()
+        }
+        cluster_rows = db._conn.execute(
+            "SELECT broadcast_cluster_id, representative_text, representative_normalized "
+            "FROM broadcast_clusters WHERE run_id=? ORDER BY id ASC",
+            (run_id,),
+        ).fetchall()
+        clusters = [
+            {
+                "broadcast_cluster_id": str(row["broadcast_cluster_id"]),
+                "representative_text": str(row["representative_text"] or ""),
+                "representative_normalized": str(row["representative_normalized"] or ""),
+            }
+            for row in cluster_rows
+        ]
+        existing_ids = {cluster["broadcast_cluster_id"] for cluster in clusters}
+
+        inserted_occurrences = 0
+        inserted_clusters = 0
+        for occurrence in source_occurrences:
+            occurrence_key = (str(occurrence["conversation_id"]), occurrence.get("message_index"))
+            if occurrence_key in existing_occurrence_keys:
+                continue
+            best_cluster = None
+            best_similarity = {"combined_similarity": 0.0}
+            for cluster in clusters:
+                similarity = _broadcast_similarity(
+                    occurrence["normalized_text"],
+                    cluster.get("representative_normalized") or _normalize_broadcast_text(cluster.get("representative_text")),
+                )
+                if similarity["combined_similarity"] > best_similarity["combined_similarity"]:
+                    best_cluster = cluster
+                    best_similarity = similarity
+
+            if best_cluster is None or best_similarity["combined_similarity"] < threshold:
+                cluster_id = _make_broadcast_cluster_id(run_id, occurrence["normalized_text"], existing_ids)
+                existing_ids.add(cluster_id)
+                best_cluster = {
+                    "broadcast_cluster_id": cluster_id,
+                    "representative_text": occurrence["message_text"],
+                    "representative_normalized": occurrence["normalized_text"],
+                }
+                best_similarity = {
+                    "sentence_similarity": 1.0,
+                    "word_similarity": 1.0,
+                    "combined_similarity": 1.0,
+                }
+                clusters.append(best_cluster)
+                inserted_clusters += 1
+                db._conn.execute(
+                    "INSERT INTO broadcast_clusters"
+                    "(run_id, broadcast_cluster_id, threshold, representative_text, representative_normalized, "
+                    "occurrence_count, first_seen_at, last_seen_at, average_similarity, minimum_similarity, created_at, updated_at) "
+                    "VALUES(?, ?, ?, ?, ?, 0, NULL, NULL, NULL, NULL, ?, ?)",
+                    (
+                        run_id,
+                        cluster_id,
+                        threshold,
+                        occurrence["message_text"],
+                        occurrence["normalized_text"],
+                        now,
+                        now,
+                    ),
+                )
+
+            db._conn.execute(
+                "INSERT OR IGNORE INTO broadcast_occurrences"
+                "(run_id, broadcast_cluster_id, conversation_id, source_conversation_id, customer_id, "
+                "message_index, message_time, message_text, normalized_text, sender_skill, flag_level, "
+                "issue_types_json, justification, position, context_json, customer_response_text, "
+                "conversation_outcome_json, similarity_to_cluster, created_at) "
+                "VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    run_id,
+                    best_cluster["broadcast_cluster_id"],
+                    occurrence["conversation_id"],
+                    occurrence.get("source_conversation_id"),
+                    occurrence.get("customer_id"),
+                    occurrence.get("message_index"),
+                    occurrence.get("message_time"),
+                    occurrence["message_text"],
+                    occurrence["normalized_text"],
+                    occurrence.get("sender_skill"),
+                    occurrence.get("flag_level"),
+                    json.dumps(occurrence.get("issue_types") or [], ensure_ascii=False),
+                    occurrence.get("justification"),
+                    occurrence.get("position"),
+                    json.dumps(occurrence.get("context") or [], ensure_ascii=False),
+                    occurrence.get("customer_response_text"),
+                    json.dumps(occurrence.get("conversation_outcome") or {}, ensure_ascii=False),
+                    best_similarity["combined_similarity"],
+                    now,
+                ),
+            )
+            existing_occurrence_keys.add(occurrence_key)
+            inserted_occurrences += 1
+
+        stat_rows = db._conn.execute(
+            "SELECT broadcast_cluster_id, COUNT(*) AS n, MIN(message_time) AS first_seen, "
+            "MAX(message_time) AS last_seen, AVG(similarity_to_cluster) AS avg_sim, "
+            "MIN(similarity_to_cluster) AS min_sim "
+            "FROM broadcast_occurrences WHERE run_id=? GROUP BY broadcast_cluster_id",
+            (run_id,),
+        ).fetchall()
+        for row in stat_rows:
+            db._conn.execute(
+                "UPDATE broadcast_clusters SET occurrence_count=?, first_seen_at=?, last_seen_at=?, "
+                "average_similarity=?, minimum_similarity=?, threshold=?, updated_at=? "
+                "WHERE run_id=? AND broadcast_cluster_id=?",
+                (
+                    int(row["n"] or 0),
+                    row["first_seen"],
+                    row["last_seen"],
+                    float(row["avg_sim"] or 0.0),
+                    float(row["min_sim"] or 0.0),
+                    threshold,
+                    now,
+                    run_id,
+                    row["broadcast_cluster_id"],
+                ),
+            )
+    return {
+        "source_broadcasts": len(source_occurrences),
+        "inserted_occurrences": inserted_occurrences,
+        "inserted_clusters": inserted_clusters,
+    }
+
+
+def _load_persisted_broadcast_analysis(db: Database, run_id: int) -> tuple[pd.DataFrame, pd.DataFrame, dict[str, dict]]:
+    cluster_rows = db._fetchall(
+        "SELECT * FROM broadcast_clusters WHERE run_id=? ORDER BY occurrence_count DESC, first_seen_at ASC",
+        (int(run_id),),
+    )
+    occurrence_rows = db._fetchall(
+        "SELECT * FROM broadcast_occurrences WHERE run_id=? ORDER BY message_time ASC, conversation_id ASC, message_index ASC",
+        (int(run_id),),
+    )
+    analysis_rows = db._fetchall(
+        "SELECT broadcast_cluster_id, analysis_json, created_at FROM broadcast_ai_analyses WHERE run_id=?",
+        (int(run_id),),
+    )
+    clusters = pd.DataFrame([dict(row) for row in cluster_rows])
+    occurrences = pd.DataFrame([dict(row) for row in occurrence_rows])
+    if not occurrences.empty:
+        occurrences["issue_types"] = occurrences["issue_types_json"].map(lambda raw: _safe_json_load(raw, []) or [])
+        occurrences["context"] = occurrences["context_json"].map(lambda raw: _safe_json_load(raw, []) or [])
+        occurrences["conversation_outcome"] = occurrences["conversation_outcome_json"].map(lambda raw: _safe_json_load(raw, {}) or {})
+        occurrences["message_date"] = pd.to_datetime(occurrences["message_time"], errors="coerce")
+    analyses = {
+        str(row["broadcast_cluster_id"]): {
+            "analysis": _safe_json_load(row["analysis_json"], {}) or {},
+            "created_at": row["created_at"],
+        }
+        for row in analysis_rows
+    }
+    return clusters, occurrences, analyses
+
+
+def _broadcast_cluster_summary_df(clusters_df: pd.DataFrame, occurrences_df: pd.DataFrame) -> pd.DataFrame:
+    if clusters_df.empty or occurrences_df.empty:
+        return pd.DataFrame()
+    cluster_lookup = {
+        str(row["broadcast_cluster_id"]): row.to_dict()
+        for _, row in clusters_df.iterrows()
+    }
+    rows: list[dict[str, Any]] = []
+    for cluster_id, group in occurrences_df.groupby("broadcast_cluster_id", dropna=False):
+        cluster = cluster_lookup.get(str(cluster_id), {})
+        flag_counts = group["flag_level"].fillna("Not evaluated").astype(str).value_counts()
+        green = int(flag_counts.get("Green", 0))
+        yellow = int(flag_counts.get("Yellow", 0))
+        red = int(flag_counts.get("Red", 0))
+        flagged = yellow + red
+        unflagged = green
+        occurrence_count = int(len(group))
+        unique_conversations = int(group["source_conversation_id"].fillna(group["conversation_id"]).nunique())
+        unique_customers = int(group["customer_id"].replace("", pd.NA).dropna().nunique()) if "customer_id" in group else 0
+        start_count = int((group["position"] == "conversation_start").sum())
+        middle_count = int((group["position"] == "middle_of_conversation").sum())
+        rows.append(
+            {
+                "Broadcast cluster ID": str(cluster_id),
+                "Representative broadcast text": cluster.get("representative_text") or group["message_text"].iloc[0],
+                "Times sent": occurrence_count,
+                "Unique conversations": unique_conversations,
+                "Unique customers": unique_customers,
+                "First date used": group["message_time"].min(),
+                "Last date used": group["message_time"].max(),
+                "Average similarity": round(float(group["similarity_to_cluster"].fillna(1.0).mean()), 3),
+                "Minimum similarity": round(float(group["similarity_to_cluster"].fillna(1.0).min()), 3),
+                "Started conversation": start_count,
+                "During existing conversation": middle_count,
+                "Green": green,
+                "Yellow": yellow,
+                "Red": red,
+                "Flagged": flagged,
+                "Unflagged": unflagged,
+                "Flagged percentage": round(_pct(flagged, max(flagged + unflagged, 1)), 1),
+            }
+        )
+    return pd.DataFrame(rows).sort_values(["Flagged", "Times sent"], ascending=[False, False])
+
+
+def _filter_broadcast_occurrences(
+    occurrences_df: pd.DataFrame,
+    *,
+    date_range: Any,
+    cluster_ids: list[str],
+    flag_levels: list[str],
+    flagged_mode: str,
+    positions: list[str],
+    issue_types: list[str],
+    sender_skills: list[str],
+) -> pd.DataFrame:
+    if occurrences_df.empty:
+        return occurrences_df
+    filtered = occurrences_df.copy()
+    if date_range and "message_date" in filtered.columns:
+        try:
+            start, end = date_range
+            filtered = filtered[
+                (filtered["message_date"].dt.date >= start)
+                & (filtered["message_date"].dt.date <= end)
+            ]
+        except Exception:
+            pass
+    if cluster_ids:
+        filtered = filtered[filtered["broadcast_cluster_id"].astype(str).isin({str(v) for v in cluster_ids})]
+    if flag_levels:
+        filtered = filtered[filtered["flag_level"].fillna("Not evaluated").astype(str).isin(flag_levels)]
+    if flagged_mode == "Flagged only":
+        filtered = filtered[filtered["flag_level"].isin(["Red", "Yellow"])]
+    elif flagged_mode == "Unflagged only":
+        filtered = filtered[filtered["flag_level"].isin(["Green"])]
+    if positions:
+        filtered = filtered[filtered["position"].astype(str).isin(positions)]
+    if issue_types:
+        selected = {str(value) for value in issue_types}
+        filtered = filtered[filtered["issue_types"].map(lambda values: bool(selected & set(values or [])))]
+    if sender_skills:
+        filtered = filtered[filtered["sender_skill"].fillna("").astype(str).isin(sender_skills)]
+    return filtered
+
+
+def _broadcast_flagged_occurrences_for_ai(group: pd.DataFrame, max_examples: int | None = None) -> list[dict[str, Any]]:
+    if group.empty:
+        return []
+    flagged_group = group[group["flag_level"].isin(["Red", "Yellow"])].copy()
+    if flagged_group.empty:
+        return []
+    flagged_group = flagged_group.sort_values(
+        ["flag_level", "message_time", "conversation_id", "message_index"],
+        ascending=[True, True, True, True],
+    )
+    if max_examples is not None:
+        flagged_group = flagged_group.head(max(1, int(max_examples)))
+    examples = []
+    for _, occurrence in flagged_group.iterrows():
+        examples.append(
+            {
+                "message_time": occurrence.get("message_time"),
+                "position": occurrence.get("position"),
+                "flag_level": occurrence.get("flag_level"),
+                "issue_types": occurrence.get("issue_types") or [],
+                "message_level_justification": occurrence.get("justification") or "",
+                "customer_response_after_broadcast": occurrence.get("customer_response_text") or "",
+                "conversation_outcome": occurrence.get("conversation_outcome") or {},
+                "context": occurrence.get("context") or [],
+            }
+        )
+    return examples
+
+
+def _build_broadcast_ai_payload(
+    summary_df: pd.DataFrame,
+    occurrences_df: pd.DataFrame,
+    selected_cluster_ids: list[str],
+    *,
+    max_flagged_examples_per_cluster: int | None = None,
+) -> dict[str, Any]:
+    summaries = {
+        str(row["Broadcast cluster ID"]): row.to_dict()
+        for _, row in summary_df.iterrows()
+    }
+    clusters_payload = []
+    for cluster_id in selected_cluster_ids:
+        group = occurrences_df[occurrences_df["broadcast_cluster_id"].astype(str) == str(cluster_id)]
+        if group.empty:
+            continue
+        summary = summaries.get(str(cluster_id), {})
+        send_times = group["message_time"].dropna().astype(str).head(50).tolist()
+        issue_counts = Counter(
+            issue
+            for values in group["issue_types"]
+            for issue in (values or [])
+        )
+        clusters_payload.append(
+            {
+                "broadcast_cluster_id": str(cluster_id),
+                "representative_broadcast_text": summary.get("Representative broadcast text") or group["message_text"].iloc[0],
+                "total_occurrence_count": int(summary.get("Times sent") or len(group)),
+                "green_count": int(summary.get("Green") or 0),
+                "yellow_count": int(summary.get("Yellow") or 0),
+                "red_count": int(summary.get("Red") or 0),
+                "flagged_percentage": float(summary.get("Flagged percentage") or 0.0),
+                "conversation_start_count": int(summary.get("Started conversation") or 0),
+                "middle_of_conversation_count": int(summary.get("During existing conversation") or 0),
+                "issue_type_counts": dict(issue_counts),
+                "broadcast_send_times_sample": send_times,
+                "max_flagged_examples_requested": max_flagged_examples_per_cluster,
+                "flagged_examples": _broadcast_flagged_occurrences_for_ai(
+                    group,
+                    max_examples=max_flagged_examples_per_cluster,
+                ),
+            }
+        )
+    return {
+            "analysis_rules": {
+                "broadcasts_already_grouped": True,
+                "do_not_regroup_broadcasts": True,
+                "use_simple_direct_language": True,
+                "one_broadcast_cluster_per_api_call": True,
+            },
+        "clusters": clusters_payload,
+    }
+
+
+def _broadcast_ai_system_prompt() -> str:
+    prompt_path = Path("correct_prompt_files") / "broadcast analysis prompt.txt"
+    try:
+        prompt = prompt_path.read_text(encoding="utf-8").strip()
+        if prompt:
+            return prompt
+    except Exception:
+        pass
+    return (
+        "Analyze already-clustered operational broadcast messages for CX issues. "
+        "Do not regroup broadcasts. Return strict JSON with an analyses array."
+    )
+
+
+def _run_broadcast_ai_analysis(
+    db: Database,
+    run_id: int,
+    payload: dict[str, Any],
+    *,
+    threshold: float,
+) -> list[dict[str, Any]]:
+    if not payload.get("clusters"):
+        return []
+    api = APIConfig(
+        base_url=st.session_state.api_base_url,
+        api_key=st.session_state.api_key,
+        model=(
+            st.session_state.get("broadcast_selected_model")
+            or st.session_state.get("conversation_selected_model")
+            or st.session_state.selected_model
+        ),
+        service_tier="flex" if st.session_state.get("use_flex_service_tier") else None,
+        thinking_effort=st.session_state.get("broadcast_thinking_effort", "default"),
+        temperature=float(st.session_state.get("broadcast_temperature", st.session_state.temperature)),
+        top_p=float(st.session_state.top_p),
+        max_tokens=int(st.session_state.max_tokens),
+        timeout=float(st.session_state.timeout),
+        retries=int(st.session_state.retries),
+        concurrency=1,
+    )
+    client = build_client(api.base_url, api.api_key)
+    raw, debug = chat_completion(
+        client,
+        api,
+        _broadcast_ai_system_prompt(),
+        json.dumps(payload, ensure_ascii=False),
+    )
+    parsed = extract_json_object(raw)
+    analyses = parsed.get("analyses") if isinstance(parsed, dict) else None
+    if not isinstance(analyses, list):
+        raise ValueError("Broadcast AI response did not contain an analyses array.")
+    now = pd.Timestamp.utcnow().isoformat()
+    with db._lock:
+        for analysis in analyses:
+            if not isinstance(analysis, dict):
+                continue
+            cluster_id = str(analysis.get("broadcast_cluster_id") or "").strip()
+            if not cluster_id:
+                continue
+            db._conn.execute(
+                "INSERT INTO broadcast_ai_analyses"
+                "(run_id, broadcast_cluster_id, threshold, analysis_json, raw_response, debug_json, created_at) "
+                "VALUES(?, ?, ?, ?, ?, ?, ?) "
+                "ON CONFLICT(run_id, broadcast_cluster_id, threshold) DO UPDATE SET "
+                "analysis_json=excluded.analysis_json, raw_response=excluded.raw_response, "
+                "debug_json=excluded.debug_json, created_at=excluded.created_at",
+                (
+                    int(run_id),
+                    cluster_id,
+                    float(threshold),
+                    json.dumps(analysis, ensure_ascii=False),
+                    raw,
+                    json.dumps(debug, ensure_ascii=False),
+                    now,
+                ),
+            )
+    return [analysis for analysis in analyses if isinstance(analysis, dict)]
+
+
+def _render_broadcast_context(context: list[dict]) -> None:
+    for message in context or []:
+        is_broadcast = bool(message.get("is_broadcast"))
+        border = "#ef4444" if is_broadcast else "#303744"
+        background = "rgba(239, 68, 68, 0.14)" if is_broadcast else "rgba(148, 163, 184, 0.06)"
+        sender = html_lib.escape(str(message.get("sender") or "Unknown"))
+        time_label = html_lib.escape(str(message.get("time") or ""))
+        text = html_lib.escape(str(message.get("text") or ""))
+        badge = "Selected broadcast" if is_broadcast else sender
+        st.markdown(
+            f"""
+            <div style="border:1px solid {border}; background:{background}; border-radius:12px; padding:10px 12px; margin:8px 0;">
+              <div style="font-size:12px; opacity:.78;">{html_lib.escape(badge)} · {time_label}</div>
+              <div style="white-space:pre-wrap; margin-top:4px;">{text}</div>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+
+
+def _render_broadcast_ai_results(analyses: dict[str, dict], cluster_ids: list[str]) -> None:
+    shown = [analyses.get(str(cluster_id)) for cluster_id in cluster_ids if analyses.get(str(cluster_id))]
+    shown = [item for item in shown if item]
+    if not shown:
+        st.info("No saved AI analysis yet for the selected broadcast clusters.")
+        return
+    for item in shown:
+        analysis = item.get("analysis") or {}
+        cluster_id = str(analysis.get("broadcast_cluster_id") or "")
+        with st.expander(f"{cluster_id} · {analysis.get('overall_status', 'analysis')}", expanded=False):
+            metric_row(
+                [
+                    ("Green", f"{int(analysis.get('green_count') or 0):,}", None),
+                    ("Yellow", f"{int(analysis.get('yellow_count') or 0):,}", None),
+                    ("Red", f"{int(analysis.get('red_count') or 0):,}", None),
+                ]
+            )
+            st.markdown(f"**Purpose:** {analysis.get('business_purpose') or '-'}")
+            st.markdown(f"**Main problem:** {analysis.get('main_problem') or '-'}")
+            st.markdown(f"**Recommended fix:** {analysis.get('recommended_fix') or '-'}")
+            if analysis.get("suggested_rewritten_broadcast"):
+                st.markdown("**Suggested rewrite**")
+                st.code(str(analysis.get("suggested_rewritten_broadcast")), language="text")
+            trigger_changes = analysis.get("suggested_trigger_changes") or []
+            if trigger_changes:
+                st.markdown("**Suggested trigger / suppression changes**")
+                for change in trigger_changes:
+                    st.write(f"- {change}")
+            if analysis.get("suggested_timing_rule"):
+                st.markdown(f"**Suggested timing rule:** {analysis.get('suggested_timing_rule')}")
+            evidence = analysis.get("evidence") or []
+            if evidence:
+                st.markdown("**Evidence**")
+                for evidence_item in evidence:
+                    st.write(f"- {evidence_item}")
+
+
+def tab_broadcast_analysis() -> None:
+    st.subheader("Broadcast Analysis")
+    if not _has_results() or not st.session_state.get("current_run_id"):
+        st.info("Load or run an evaluation first.")
+        return
+    if _current_role() == ROLE_READ_ONLY:
+        st.warning("Broadcast Analysis is available to active users and master admins.")
+        return
+
+    db = get_active_db()
+    run_id = int(st.session_state.current_run_id)
+    st.caption(
+        "Groups SYSTEM messages into generated broadcast clusters using deterministic text similarity. "
+        "No LLM is used for unification; AI is only used when you analyze an already grouped broadcast cluster."
+    )
+
+    c1, c2, c3 = st.columns([1, 1, 1.2])
+    with c1:
+        threshold = st.number_input(
+            "Similarity threshold",
+            min_value=0.50,
+            max_value=0.99,
+            value=0.80,
+            step=0.01,
+            help="Default 0.80. Combined similarity = 60% sentence similarity + 40% word similarity.",
+        )
+    with c2:
+        rebuild = st.button("Rebuild broadcast clusters", use_container_width=True, type="secondary")
+    with c3:
+        match_new = st.button("Match new broadcasts", use_container_width=True)
+
+    clusters_df, occurrences_df, analyses = _load_persisted_broadcast_analysis(db, run_id)
+    if rebuild or match_new or clusters_df.empty:
+        with st.spinner("Building broadcast clusters from SYSTEM messages..."):
+            result = _persist_broadcast_clusters(db, run_id, threshold=float(threshold), rebuild=bool(rebuild or clusters_df.empty))
+        st.success(
+            f"Broadcast clustering complete: {result['source_broadcasts']:,} SYSTEM messages found, "
+            f"{result['inserted_clusters']:,} new clusters, {result['inserted_occurrences']:,} new occurrences."
+        )
+        clusters_df, occurrences_df, analyses = _load_persisted_broadcast_analysis(db, run_id)
+
+    if occurrences_df.empty:
+        st.info("No SYSTEM broadcast messages were found in the selected run.")
+        return
+
+    st.markdown("### Filters")
+    min_date = occurrences_df["message_date"].dropna().min()
+    max_date = occurrences_df["message_date"].dropna().max()
+    date_value = None
+    if pd.notna(min_date) and pd.notna(max_date):
+        date_value = st.date_input(
+            "Date range",
+            value=(min_date.date(), max_date.date()),
+            min_value=min_date.date(),
+            max_value=max_date.date(),
+            key="broadcast_analysis_date_range",
+        )
+
+    f1, f2, f3, f4 = st.columns(4)
+    with f1:
+        cluster_options = sorted(occurrences_df["broadcast_cluster_id"].dropna().astype(str).unique())
+        selected_clusters_filter = st.multiselect("Broadcast cluster", cluster_options, default=[])
+        selected_flags = st.multiselect("Message indication", ["Green", "Yellow", "Red", "Not evaluated"], default=[])
+    with f2:
+        flagged_mode = st.selectbox("Flag mode", ["All", "Flagged only", "Unflagged only"], index=0)
+        selected_positions = st.multiselect(
+            "Conversation position",
+            ["conversation_start", "middle_of_conversation"],
+            default=[],
+            format_func=humanize_label,
+        )
+    with f3:
+        issue_options = sorted(
+            {
+                issue
+                for values in occurrences_df["issue_types"]
+                for issue in (values or [])
+            }
+        )
+        selected_issue_types = st.multiselect("Issue type", issue_options, default=[], format_func=humanize_label)
+        skill_options = sorted([value for value in occurrences_df["sender_skill"].fillna("").astype(str).unique() if value])
+        selected_skills = st.multiselect("Sender or skill", skill_options, default=[])
+    with f4:
+        min_occurrences = st.number_input("Minimum occurrences", min_value=1, value=1, step=1)
+        min_flagged_pct = st.number_input("Minimum flagged %", min_value=0.0, max_value=100.0, value=0.0, step=1.0)
+
+    filtered_occurrences = _filter_broadcast_occurrences(
+        occurrences_df,
+        date_range=date_value,
+        cluster_ids=selected_clusters_filter,
+        flag_levels=selected_flags,
+        flagged_mode=flagged_mode,
+        positions=selected_positions,
+        issue_types=selected_issue_types,
+        sender_skills=selected_skills,
+    )
+    summary_df = _broadcast_cluster_summary_df(clusters_df, filtered_occurrences)
+    if not summary_df.empty:
+        summary_df = summary_df[
+            (summary_df["Times sent"] >= int(min_occurrences))
+            & (summary_df["Flagged percentage"] >= float(min_flagged_pct))
+        ]
+        allowed_ids = set(summary_df["Broadcast cluster ID"].astype(str))
+        filtered_occurrences = filtered_occurrences[
+            filtered_occurrences["broadcast_cluster_id"].astype(str).isin(allowed_ids)
+        ]
+
+    total_occurrences = int(len(filtered_occurrences))
+    total_clusters = int(summary_df["Broadcast cluster ID"].nunique()) if not summary_df.empty else 0
+    flagged_count = int(filtered_occurrences["flag_level"].isin(["Red", "Yellow"]).sum()) if not filtered_occurrences.empty else 0
+    start_count = int((filtered_occurrences["position"] == "conversation_start").sum()) if not filtered_occurrences.empty else 0
+    metric_row(
+        [
+            ("Unique broadcasts", f"{total_clusters:,}", None),
+            ("Broadcast occurrences", f"{total_occurrences:,}", None),
+            ("Flagged", f"{flagged_count:,}", f"{_pct(flagged_count, total_occurrences):.1f}%"),
+            ("Conversation start", f"{start_count:,}", f"{_pct(start_count, total_occurrences):.1f}%"),
+        ]
+    )
+
+    st.markdown("### Unique broadcast clusters")
+    if summary_df.empty:
+        st.info("No broadcast clusters match the current filters.")
+        return
+    st.dataframe(summary_df, width="stretch", hide_index=True, height=min(520, 92 + len(summary_df) * 36))
+
+    csv_export = summary_df.to_csv(index=False).encode("utf-8-sig")
+    st.download_button(
+        "Export broadcast cluster summary CSV",
+        data=csv_export,
+        file_name=f"broadcast_cluster_summary_run_{run_id}.csv",
+        mime="text/csv",
+    )
+
+    selected_cluster = st.selectbox(
+        "View occurrences for broadcast",
+        summary_df["Broadcast cluster ID"].astype(str).tolist(),
+        format_func=lambda cluster_id: (
+            f"{cluster_id} · "
+            f"{summary_df.loc[summary_df['Broadcast cluster ID'].astype(str) == str(cluster_id), 'Times sent'].iloc[0]:,} sent"
+        ),
+    )
+    cluster_occurrences = filtered_occurrences[
+        filtered_occurrences["broadcast_cluster_id"].astype(str) == str(selected_cluster)
+    ].copy()
+
+    st.markdown("### Broadcast occurrence list")
+    occurrence_display = cluster_occurrences[
+        [
+            "message_time",
+            "conversation_id",
+            "source_conversation_id",
+            "flag_level",
+            "position",
+            "sender_skill",
+            "message_text",
+            "justification",
+        ]
+    ].rename(
+        columns={
+            "message_time": "Time",
+            "conversation_id": "Journey ID",
+            "source_conversation_id": "Conversation ID",
+            "flag_level": "Indication",
+            "position": "Position",
+            "sender_skill": "Sender / skill",
+            "message_text": "Broadcast text",
+            "justification": "Message-level justification",
+        }
+    )
+    st.dataframe(occurrence_display, width="stretch", hide_index=True, height=min(420, 92 + len(occurrence_display) * 36))
+
+    st.markdown("### Eight-message context viewer")
+    max_contexts = st.slider("Contexts to show", min_value=1, max_value=50, value=min(10, max(1, len(cluster_occurrences))))
+    for _, occurrence in cluster_occurrences.head(max_contexts).iterrows():
+        label = (
+            f"{occurrence.get('message_time') or 'No time'} · "
+            f"{occurrence.get('flag_level') or 'Not evaluated'} · "
+            f"{occurrence.get('position') or ''} · "
+            f"{occurrence.get('source_conversation_id') or occurrence.get('conversation_id')}"
+        )
+        with st.expander(label, expanded=False):
+            st.markdown(f"**Message-level indication:** {occurrence.get('flag_level') or 'Not evaluated'}")
+            issues = occurrence.get("issue_types") or []
+            if issues:
+                st.markdown(f"**Issue types:** {', '.join(humanize_label(issue) for issue in issues)}")
+            justification = str(occurrence.get("justification") or "").strip()
+            if justification:
+                st.markdown("**Message-level justification**")
+                st.text(justification)
+            _render_broadcast_context(occurrence.get("context") or [])
+
+    st.markdown("### Grouped AI analysis")
+    analysis_cluster_options = summary_df["Broadcast cluster ID"].astype(str).tolist()
+    default_analysis_clusters = [selected_cluster] if selected_cluster in analysis_cluster_options else analysis_cluster_options[:5]
+    selected_analysis_clusters = st.multiselect(
+        "Broadcast clusters to analyze",
+        analysis_cluster_options,
+        default=default_analysis_clusters,
+        help=(
+            "Uses the currently filtered occurrence set. Each selected cluster gets its own AI request "
+            "with aggregate counts plus the selected number of red/yellow flagged occurrences. Green occurrence messages are not sent."
+        ),
+    )
+    c_examples, c_run = st.columns([1, 1])
+    with c_examples:
+        max_flagged_examples = st.number_input(
+            "Flagged examples per cluster",
+            min_value=1,
+            value=50,
+            step=10,
+            help="Maximum red/yellow occurrences to send for each cluster. There is no fixed upper cap.",
+        )
+    with c_run:
+        run_ai = st.button("Run AI analysis per selected cluster", type="primary", use_container_width=True)
+
+    if run_ai:
+        if not selected_analysis_clusters:
+            st.warning("Select at least one broadcast cluster to analyze.")
+        elif not (
+            st.session_state.get("broadcast_selected_model")
+            or st.session_state.get("conversation_selected_model")
+            or st.session_state.get("selected_model")
+        ):
+            st.warning("Select a model before running broadcast AI analysis.")
+        else:
+            with st.spinner("Running one broadcast AI analysis per selected cluster..."):
+                try:
+                    new_analyses: list[dict[str, Any]] = []
+                    for cluster_id in selected_analysis_clusters:
+                        payload = _build_broadcast_ai_payload(
+                            summary_df,
+                            filtered_occurrences,
+                            [cluster_id],
+                            max_flagged_examples_per_cluster=int(max_flagged_examples),
+                        )
+                        new_analyses.extend(
+                            _run_broadcast_ai_analysis(db, run_id, payload, threshold=float(threshold))
+                        )
+                    st.success(f"Saved AI analysis for {len(new_analyses):,} broadcast cluster(s).")
+                    _, _, analyses = _load_persisted_broadcast_analysis(db, run_id)
+                except Exception as exc:
+                    st.error(f"Broadcast AI analysis failed: {exc}")
+
+    _render_broadcast_ai_results(analyses, selected_analysis_clusters or [selected_cluster])
+
+    saved_analysis_rows = [
+        item["analysis"]
+        for item in analyses.values()
+        if isinstance(item.get("analysis"), dict)
+    ]
+    if saved_analysis_rows:
+        st.download_button(
+            "Export saved AI analysis JSON",
+            data=json.dumps(saved_analysis_rows, ensure_ascii=False, indent=2).encode("utf-8"),
+            file_name=f"broadcast_ai_analysis_run_{run_id}.json",
+            mime="application/json",
+        )
+
+
 def _agent_presence_summary_for_review(conversation_result: dict) -> dict[str, Any]:
     """Return small human-agent presence markers for Journey Review filtering."""
     conversation_id = str(conversation_result.get("conversation_id") or "").strip()
@@ -10101,10 +11182,13 @@ def tab_exports() -> None:
         "model": st.session_state.selected_model,
         "message_model": st.session_state.selected_model,
         "conversation_model": st.session_state.get("conversation_selected_model"),
+        "broadcast_analysis_model": st.session_state.get("broadcast_selected_model"),
         "service_tier": "flex" if st.session_state.use_flex_service_tier else None,
         "message_thinking_effort": st.session_state.message_thinking_effort,
         "conversation_thinking_effort": st.session_state.conversation_thinking_effort,
+        "broadcast_analysis_thinking_effort": st.session_state.broadcast_thinking_effort,
         "temperature": st.session_state.temperature,
+        "broadcast_analysis_temperature": st.session_state.broadcast_temperature,
         "top_p": st.session_state.top_p,
         "max_tokens": st.session_state.max_tokens,
         "timeout": st.session_state.timeout,
@@ -10431,10 +11515,13 @@ def tab_debug() -> None:
         "model": st.session_state.selected_model,
         "message_model": st.session_state.selected_model,
         "conversation_model": st.session_state.get("conversation_selected_model"),
+        "broadcast_analysis_model": st.session_state.get("broadcast_selected_model"),
         "service_tier": "flex" if st.session_state.use_flex_service_tier else None,
         "message_thinking_effort": st.session_state.message_thinking_effort,
         "conversation_thinking_effort": st.session_state.conversation_thinking_effort,
+        "broadcast_analysis_thinking_effort": st.session_state.broadcast_thinking_effort,
         "temperature": st.session_state.temperature,
+        "broadcast_analysis_temperature": st.session_state.broadcast_temperature,
         "top_p": st.session_state.top_p,
         "max_tokens": st.session_state.max_tokens,
         "timeout": st.session_state.timeout,
@@ -10475,6 +11562,7 @@ def _workspace_tab_specs(auth_role: str) -> list[tuple[str, Any]]:
             ("Upload & Settings", tab_upload),
             ("Run Evaluation", tab_run),
             *review_tabs,
+            ("Broadcast Analysis", tab_broadcast_analysis),
             ("Exports", tab_exports),
         ]
     admin_tabs = [
@@ -10482,6 +11570,7 @@ def _workspace_tab_specs(auth_role: str) -> list[tuple[str, Any]]:
         ("Upload & Settings", tab_upload),
         ("Run Evaluation", tab_run),
         *review_tabs,
+        ("Broadcast Analysis", tab_broadcast_analysis),
         ("Exports", tab_exports),
         ("Debug", tab_debug),
     ]

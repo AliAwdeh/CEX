@@ -173,6 +173,70 @@ CREATE TABLE IF NOT EXISTS journey_review_history (
 );
 
 CREATE INDEX IF NOT EXISTS idx_journey_review_history_lookup ON journey_review_history(run_id, conversation_id, reviewer_name, reviewed_at);
+
+CREATE TABLE IF NOT EXISTS broadcast_clusters (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    run_id INTEGER NOT NULL,
+    broadcast_cluster_id TEXT NOT NULL,
+    threshold REAL NOT NULL DEFAULT 0.80,
+    representative_text TEXT NOT NULL,
+    representative_normalized TEXT,
+    occurrence_count INTEGER NOT NULL DEFAULT 0,
+    first_seen_at TEXT,
+    last_seen_at TEXT,
+    average_similarity REAL,
+    minimum_similarity REAL,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    FOREIGN KEY (run_id) REFERENCES runs(id) ON DELETE CASCADE,
+    UNIQUE(run_id, broadcast_cluster_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_broadcast_clusters_run ON broadcast_clusters(run_id);
+
+CREATE TABLE IF NOT EXISTS broadcast_occurrences (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    run_id INTEGER NOT NULL,
+    broadcast_cluster_id TEXT NOT NULL,
+    conversation_id TEXT NOT NULL,
+    source_conversation_id TEXT,
+    customer_id TEXT,
+    message_index INTEGER,
+    message_time TEXT,
+    message_text TEXT NOT NULL,
+    normalized_text TEXT,
+    sender_skill TEXT,
+    flag_level TEXT,
+    issue_types_json TEXT,
+    justification TEXT,
+    position TEXT,
+    context_json TEXT,
+    customer_response_text TEXT,
+    conversation_outcome_json TEXT,
+    similarity_to_cluster REAL,
+    created_at TEXT NOT NULL,
+    FOREIGN KEY (run_id) REFERENCES runs(id) ON DELETE CASCADE,
+    UNIQUE(run_id, conversation_id, message_index)
+);
+
+CREATE INDEX IF NOT EXISTS idx_broadcast_occurrences_run ON broadcast_occurrences(run_id);
+CREATE INDEX IF NOT EXISTS idx_broadcast_occurrences_cluster ON broadcast_occurrences(run_id, broadcast_cluster_id);
+CREATE INDEX IF NOT EXISTS idx_broadcast_occurrences_time ON broadcast_occurrences(run_id, message_time);
+
+CREATE TABLE IF NOT EXISTS broadcast_ai_analyses (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    run_id INTEGER NOT NULL,
+    broadcast_cluster_id TEXT NOT NULL,
+    threshold REAL NOT NULL DEFAULT 0.80,
+    analysis_json TEXT NOT NULL,
+    raw_response TEXT,
+    debug_json TEXT,
+    created_at TEXT NOT NULL,
+    FOREIGN KEY (run_id) REFERENCES runs(id) ON DELETE CASCADE,
+    UNIQUE(run_id, broadcast_cluster_id, threshold)
+);
+
+CREATE INDEX IF NOT EXISTS idx_broadcast_ai_analyses_run ON broadcast_ai_analyses(run_id);
 """
 
 
@@ -422,6 +486,78 @@ class Database:
                 "(run_id, conversation_id, reviewer_key_id, reviewer_name, reviewed_at, review_comment) "
                 "SELECT run_id, conversation_id, reviewer_key_id, reviewer_name, reviewed_at, review_comment "
                 "FROM journey_reviews"
+            )
+
+            self._conn.execute(
+                "CREATE TABLE IF NOT EXISTS broadcast_clusters ("
+                "id INTEGER PRIMARY KEY AUTOINCREMENT, "
+                "run_id INTEGER NOT NULL, "
+                "broadcast_cluster_id TEXT NOT NULL, "
+                "threshold REAL NOT NULL DEFAULT 0.80, "
+                "representative_text TEXT NOT NULL, "
+                "representative_normalized TEXT, "
+                "occurrence_count INTEGER NOT NULL DEFAULT 0, "
+                "first_seen_at TEXT, "
+                "last_seen_at TEXT, "
+                "average_similarity REAL, "
+                "minimum_similarity REAL, "
+                "created_at TEXT NOT NULL, "
+                "updated_at TEXT NOT NULL, "
+                "FOREIGN KEY (run_id) REFERENCES runs(id) ON DELETE CASCADE, "
+                "UNIQUE(run_id, broadcast_cluster_id))"
+            )
+            self._conn.execute("CREATE INDEX IF NOT EXISTS idx_broadcast_clusters_run ON broadcast_clusters(run_id)")
+
+            self._conn.execute(
+                "CREATE TABLE IF NOT EXISTS broadcast_occurrences ("
+                "id INTEGER PRIMARY KEY AUTOINCREMENT, "
+                "run_id INTEGER NOT NULL, "
+                "broadcast_cluster_id TEXT NOT NULL, "
+                "conversation_id TEXT NOT NULL, "
+                "source_conversation_id TEXT, "
+                "customer_id TEXT, "
+                "message_index INTEGER, "
+                "message_time TEXT, "
+                "message_text TEXT NOT NULL, "
+                "normalized_text TEXT, "
+                "sender_skill TEXT, "
+                "flag_level TEXT, "
+                "issue_types_json TEXT, "
+                "justification TEXT, "
+                "position TEXT, "
+                "context_json TEXT, "
+                "customer_response_text TEXT, "
+                "conversation_outcome_json TEXT, "
+                "similarity_to_cluster REAL, "
+                "created_at TEXT NOT NULL, "
+                "FOREIGN KEY (run_id) REFERENCES runs(id) ON DELETE CASCADE, "
+                "UNIQUE(run_id, conversation_id, message_index))"
+            )
+            self._conn.execute("CREATE INDEX IF NOT EXISTS idx_broadcast_occurrences_run ON broadcast_occurrences(run_id)")
+            self._conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_broadcast_occurrences_cluster "
+                "ON broadcast_occurrences(run_id, broadcast_cluster_id)"
+            )
+            self._conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_broadcast_occurrences_time "
+                "ON broadcast_occurrences(run_id, message_time)"
+            )
+
+            self._conn.execute(
+                "CREATE TABLE IF NOT EXISTS broadcast_ai_analyses ("
+                "id INTEGER PRIMARY KEY AUTOINCREMENT, "
+                "run_id INTEGER NOT NULL, "
+                "broadcast_cluster_id TEXT NOT NULL, "
+                "threshold REAL NOT NULL DEFAULT 0.80, "
+                "analysis_json TEXT NOT NULL, "
+                "raw_response TEXT, "
+                "debug_json TEXT, "
+                "created_at TEXT NOT NULL, "
+                "FOREIGN KEY (run_id) REFERENCES runs(id) ON DELETE CASCADE, "
+                "UNIQUE(run_id, broadcast_cluster_id, threshold))"
+            )
+            self._conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_broadcast_ai_analyses_run ON broadcast_ai_analyses(run_id)"
             )
 
             self._conn.execute("DELETE FROM settings WHERE key='auth_master_hash'")
