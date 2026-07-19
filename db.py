@@ -237,6 +237,98 @@ CREATE TABLE IF NOT EXISTS broadcast_ai_analyses (
 );
 
 CREATE INDEX IF NOT EXISTS idx_broadcast_ai_analyses_run ON broadcast_ai_analyses(run_id);
+
+CREATE TABLE IF NOT EXISTS bot_issue_clusters (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    run_id INTEGER NOT NULL,
+    cluster_key TEXT NOT NULL,
+    issue_type TEXT NOT NULL,
+    position TEXT NOT NULL,
+    representative_text TEXT,
+    occurrence_count INTEGER NOT NULL DEFAULT 0,
+    first_seen_at TEXT,
+    last_seen_at TEXT,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    FOREIGN KEY (run_id) REFERENCES runs(id) ON DELETE CASCADE,
+    UNIQUE(run_id, cluster_key)
+);
+
+CREATE INDEX IF NOT EXISTS idx_bot_issue_clusters_run ON bot_issue_clusters(run_id);
+
+CREATE TABLE IF NOT EXISTS bot_issue_occurrences (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    run_id INTEGER NOT NULL,
+    cluster_key TEXT NOT NULL,
+    issue_type TEXT NOT NULL,
+    position TEXT NOT NULL,
+    conversation_id TEXT NOT NULL,
+    source_conversation_id TEXT,
+    customer_id TEXT,
+    message_index INTEGER,
+    message_time TEXT,
+    message_text TEXT NOT NULL,
+    sender_skill TEXT,
+    flag_level TEXT,
+    issue_types_json TEXT,
+    justification TEXT,
+    chunks_json TEXT,
+    rag_justification TEXT,
+    context_json TEXT,
+    customer_response_text TEXT,
+    conversation_outcome_json TEXT,
+    created_at TEXT NOT NULL,
+    FOREIGN KEY (run_id) REFERENCES runs(id) ON DELETE CASCADE,
+    UNIQUE(run_id, conversation_id, message_index)
+);
+
+CREATE INDEX IF NOT EXISTS idx_bot_issue_occurrences_run ON bot_issue_occurrences(run_id);
+CREATE INDEX IF NOT EXISTS idx_bot_issue_occurrences_cluster ON bot_issue_occurrences(run_id, cluster_key);
+CREATE INDEX IF NOT EXISTS idx_bot_issue_occurrences_time ON bot_issue_occurrences(run_id, message_time);
+
+CREATE TABLE IF NOT EXISTS bot_issue_ai_analyses (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    run_id INTEGER NOT NULL,
+    cluster_key TEXT NOT NULL,
+    analysis_json TEXT NOT NULL,
+    raw_response TEXT,
+    debug_json TEXT,
+    created_at TEXT NOT NULL,
+    FOREIGN KEY (run_id) REFERENCES runs(id) ON DELETE CASCADE,
+    UNIQUE(run_id, cluster_key)
+);
+
+CREATE INDEX IF NOT EXISTS idx_bot_issue_ai_analyses_run ON bot_issue_ai_analyses(run_id);
+
+CREATE TABLE IF NOT EXISTS analysis_runs (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    run_id INTEGER NOT NULL,
+    feature TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    model TEXT,
+    thinking_effort TEXT,
+    temperature REAL,
+    percentage_threshold REAL,
+    cluster_count INTEGER NOT NULL DEFAULT 0,
+    trigger TEXT,
+    params_json TEXT,
+    FOREIGN KEY (run_id) REFERENCES runs(id) ON DELETE CASCADE
+);
+
+CREATE INDEX IF NOT EXISTS idx_analysis_runs_lookup ON analysis_runs(run_id, feature, created_at);
+
+CREATE TABLE IF NOT EXISTS analysis_run_items (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    batch_id INTEGER NOT NULL,
+    run_id INTEGER NOT NULL,
+    feature TEXT NOT NULL,
+    cluster_key TEXT NOT NULL,
+    analysis_json TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    FOREIGN KEY (batch_id) REFERENCES analysis_runs(id) ON DELETE CASCADE
+);
+
+CREATE INDEX IF NOT EXISTS idx_analysis_run_items_batch ON analysis_run_items(batch_id);
 """
 
 
@@ -558,6 +650,114 @@ class Database:
             )
             self._conn.execute(
                 "CREATE INDEX IF NOT EXISTS idx_broadcast_ai_analyses_run ON broadcast_ai_analyses(run_id)"
+            )
+
+            self._conn.execute(
+                "CREATE TABLE IF NOT EXISTS bot_issue_clusters ("
+                "id INTEGER PRIMARY KEY AUTOINCREMENT, "
+                "run_id INTEGER NOT NULL, "
+                "cluster_key TEXT NOT NULL, "
+                "issue_type TEXT NOT NULL, "
+                "position TEXT NOT NULL, "
+                "representative_text TEXT, "
+                "occurrence_count INTEGER NOT NULL DEFAULT 0, "
+                "first_seen_at TEXT, "
+                "last_seen_at TEXT, "
+                "created_at TEXT NOT NULL, "
+                "updated_at TEXT NOT NULL, "
+                "FOREIGN KEY (run_id) REFERENCES runs(id) ON DELETE CASCADE, "
+                "UNIQUE(run_id, cluster_key))"
+            )
+            self._conn.execute("CREATE INDEX IF NOT EXISTS idx_bot_issue_clusters_run ON bot_issue_clusters(run_id)")
+
+            self._conn.execute(
+                "CREATE TABLE IF NOT EXISTS bot_issue_occurrences ("
+                "id INTEGER PRIMARY KEY AUTOINCREMENT, "
+                "run_id INTEGER NOT NULL, "
+                "cluster_key TEXT NOT NULL, "
+                "issue_type TEXT NOT NULL, "
+                "position TEXT NOT NULL, "
+                "conversation_id TEXT NOT NULL, "
+                "source_conversation_id TEXT, "
+                "customer_id TEXT, "
+                "message_index INTEGER, "
+                "message_time TEXT, "
+                "message_text TEXT NOT NULL, "
+                "sender_skill TEXT, "
+                "flag_level TEXT, "
+                "issue_types_json TEXT, "
+                "justification TEXT, "
+                "chunks_json TEXT, "
+                "rag_justification TEXT, "
+                "context_json TEXT, "
+                "customer_response_text TEXT, "
+                "conversation_outcome_json TEXT, "
+                "created_at TEXT NOT NULL, "
+                "FOREIGN KEY (run_id) REFERENCES runs(id) ON DELETE CASCADE, "
+                "UNIQUE(run_id, conversation_id, message_index))"
+            )
+            self._conn.execute("CREATE INDEX IF NOT EXISTS idx_bot_issue_occurrences_run ON bot_issue_occurrences(run_id)")
+            for _bot_col, _bot_type in (("chunks_json", "TEXT"), ("rag_justification", "TEXT")):
+                try:
+                    self._conn.execute(f"ALTER TABLE bot_issue_occurrences ADD COLUMN {_bot_col} {_bot_type}")
+                except sqlite3.OperationalError:
+                    pass
+            self._conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_bot_issue_occurrences_cluster "
+                "ON bot_issue_occurrences(run_id, cluster_key)"
+            )
+            self._conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_bot_issue_occurrences_time "
+                "ON bot_issue_occurrences(run_id, message_time)"
+            )
+
+            self._conn.execute(
+                "CREATE TABLE IF NOT EXISTS bot_issue_ai_analyses ("
+                "id INTEGER PRIMARY KEY AUTOINCREMENT, "
+                "run_id INTEGER NOT NULL, "
+                "cluster_key TEXT NOT NULL, "
+                "analysis_json TEXT NOT NULL, "
+                "raw_response TEXT, "
+                "debug_json TEXT, "
+                "created_at TEXT NOT NULL, "
+                "FOREIGN KEY (run_id) REFERENCES runs(id) ON DELETE CASCADE, "
+                "UNIQUE(run_id, cluster_key))"
+            )
+            self._conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_bot_issue_ai_analyses_run ON bot_issue_ai_analyses(run_id)"
+            )
+
+            self._conn.execute(
+                "CREATE TABLE IF NOT EXISTS analysis_runs ("
+                "id INTEGER PRIMARY KEY AUTOINCREMENT, "
+                "run_id INTEGER NOT NULL, "
+                "feature TEXT NOT NULL, "
+                "created_at TEXT NOT NULL, "
+                "model TEXT, "
+                "thinking_effort TEXT, "
+                "temperature REAL, "
+                "percentage_threshold REAL, "
+                "cluster_count INTEGER NOT NULL DEFAULT 0, "
+                "trigger TEXT, "
+                "params_json TEXT, "
+                "FOREIGN KEY (run_id) REFERENCES runs(id) ON DELETE CASCADE)"
+            )
+            self._conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_analysis_runs_lookup ON analysis_runs(run_id, feature, created_at)"
+            )
+            self._conn.execute(
+                "CREATE TABLE IF NOT EXISTS analysis_run_items ("
+                "id INTEGER PRIMARY KEY AUTOINCREMENT, "
+                "batch_id INTEGER NOT NULL, "
+                "run_id INTEGER NOT NULL, "
+                "feature TEXT NOT NULL, "
+                "cluster_key TEXT NOT NULL, "
+                "analysis_json TEXT NOT NULL, "
+                "created_at TEXT NOT NULL, "
+                "FOREIGN KEY (batch_id) REFERENCES analysis_runs(id) ON DELETE CASCADE)"
+            )
+            self._conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_analysis_run_items_batch ON analysis_run_items(batch_id)"
             )
 
             self._conn.execute("DELETE FROM settings WHERE key='auth_master_hash'")
