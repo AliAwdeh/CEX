@@ -8,6 +8,7 @@ pyarrow==24.0.0
 pydantic==2.13.4
 pydantic_core==2.46.4
 pydeck==0.9.2
+pytest==9.1.1
 python-dateutil==2.9.0.post0
 python-dotenv==1.2.2
 python-multipart==0.0.32

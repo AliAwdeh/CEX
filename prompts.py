@@ -627,6 +627,8 @@ Use raw sender identity fields such as `raw_sender_role`, `sender_entity`, and `
 
 If conversation_metadata contains ticket fields, evaluate this payload as one ticket journey, not as the original full customer timeline. Use ticket_objective as the scoped customer objective unless the visible ticket transcript clearly contradicts it. Use ticket_status as segmentation context, not automatic truth: the final handled_status and unhandled_resolution_subtype must still be justified by the ticket transcript and message-level evidence.
 
+For a ticket_type of general_inquiry with ticket_inquiries_json, evaluate each listed material inquiry by its final state in the visible ticket transcript. A grouped inquiry ticket is handled only when every material inquiry is resolved or directly answered. If an earlier inquiry is marked pending_unresolved but a later message in the same ticket clearly answers or resolves that same inquiry, treat it as resolved. If any material inquiry remains pending_unresolved or totally_unresolved at the end, set handled_status to unhandled for the whole ticket and use the matching unhandled_resolution_subtype.
+
 ---
 
 # 4. Core CX Principles
@@ -987,6 +989,123 @@ Return strict JSON only.
 
 A ticket is one evaluable customer thread. Split distinct issues into separate tickets, group standalone informational inquiries into an inquiry ticket, keep related broadcasts/greetings, and track unresolved inquiries separately.
 
+Each ticket must have exactly one ticket_category: issue, request, or inquiry. Use inquiry when the customer asks for information only; request when the customer asks the company to check, send, provide, book, arrange, change, cancel, renew, process, confirm, transfer, deliver, give a copy/document/link, or otherwise do something. This includes indirect wording such as "is there any possibility to get a copy of the contract" or "can I get a copy"; issue when the customer reports a problem, complaint, blocker, failed action, contradiction, delay, dispute, or bad experience. Normal process/action tickets such as maid visa request, booking request, document request, renewal request, cancellation request, refund request, or delivery request are ticket_category=request unless the customer is primarily reporting a failure, complaint, dispute, delay, blocker, or bad experience. Status/readiness/procedure questions such as "can you tell/let me know if the contract is ready", "is it ready", "any update", "what is the status", or "what is the procedure to change maid" are ticket_category=inquiry unless the customer asks the company to perform, process, change, expedite, or check something operationally, or reports a problem. Do not classify a normal inquiry/request as issue only because the agent mentions an internal limitation or uses words like "problem" or "issue"; the customer must be reporting or experiencing that problem as the main objective.
+
+Category decision checklist:
+1. Identify the customer's main objective, not the agent's reply wording and not the ticket_type name.
+2. ticket_category describes the ticket's main objective/lifecycle, not whether the ticket contains problems. A request can contain issues, rejected steps, delays, missing documents, fees, or complaints and still remain ticket_category=request.
+3. First material customer objective category anchor rule: inside one ticket, the ticket_category is anchored by the first material customer objective that opened that ticket. If the ticket starts as a request/action/lifecycle, keep ticket_category=request even if later messages contain issues, complaints, blockers, delays, status questions, proof requests, or escalations about completing that request. If the ticket starts as an issue/problem/dispute, keep ticket_category=issue even if later messages ask the company to check, call, escalate, send, refund, provide, or perform a follow-up action to resolve that issue. Only change category or split when the later customer objective is materially separate from the original objective.
+4. Embedded issues, requests, and inquiries are not child tickets. If a request ticket contains problems, describe the embedded problems in customer_objective and segmentation_reason, and put only true informational questions in inquiries. If an issue ticket contains action asks, describe those embedded requests/actions in customer_objective and segmentation_reason, and put only true informational questions in inquiries. Do not invent extra fields outside the schema.
+5. Choose issue only when the customer's main objective is to report/fix a standalone problem, complaint, blocker, failed/incorrect action, dispute, contradiction, or bad experience, and there is no broader operational request/lifecycle that the problem belongs to.
+6. Choose request when the customer wants the company to do or complete an operational action/lifecycle: initiate, check operationally, send, provide, book, arrange, change, cancel, renew, process, confirm, transfer, deliver, upload, replace, collect, refund, escalate, provide a copy/document/link, or complete a visa/residency process.
+7. Choose inquiry when the customer wants information only: explanation, price, policy, eligibility, location, timing, next step, readiness, status, whether something is done/issued/approved/active, or why/how something works.
+8. Request beats issue when the issue is a stage inside the requested process. Do not classify a visa/residency request as issue just because it contains passport rejection, photo rejection, missing documents, government rejection, late fees/fines, delay, or customer frustration. Keep ticket_category=request and reflect the problem in ticket_type, status, inquiries, and segmentation_reason.
+9. Request beats inquiry only when the customer asks for an action to be performed or asks to receive something from the company. "Can you tell me", "let me know", "what is the status", "is it ready", and "any update" are inquiry, even if the agent replies "I will check". But "can I get a copy", "is there any possibility to get a copy", "can you send/provide the contract", and similar document-copy wording are request.
+10. Issue beats request/inquiry only when the customer's main objective is the problem itself, not completion of an existing process. Do not infer issue from agent-only words, internal limitations, or a normal future step.
+
+Category examples:
+- inquiry: "Can you tell us if the maid contract is ready?", "Is the visa issued?", "Any update?", "How much is the insurance?", "Which card is linked?", "What is the procedure to change maid?", "Can you please let me know if you provide uniforms to the maids?"
+- request: "Please send the contract", "Is there any possibility to get a copy of the signed contract?", "Can I get a copy of the contract?", "Can you check which card you are using for auto deduction?", "Please book the medical test", "Cancel my renewal", "Process the refund", "Start the maid visa", "The passport/photo was rejected during visa processing, please upload again", "Please share the contract, insurance network list, and update the sponsor name", "Please order/provide uniforms for the maid"
+- issue: "The payment failed", "You charged me twice", "The app is difficult and adds fees", "This is unfair", "The refund was wrongly rejected", "My maid didn't receive her salary yet", "Why not in Du Pay? You said this last month", "I think the AED 1,500 advanced salary is a duplicate", "I already paid one month advance salary in July 2024" when the customer's main objective is the complaint/dispute itself rather than completion of a broader request lifecycle.
+
+Input is grouped as source_conversation_blocks. Treat each source_conversation_id as a bracket/header for the messages inside that block; individual message objects intentionally do not repeat source_conversation_id. message_index is the continuous order across the full customer journey and does not reset when a new source_conversation_id block starts. Use these exact message_index values in start_message_index, end_message_index, included_message_indexes, and inquiry message_indexes.
+
+No overlapping ticket indexes: each material message_index should belong to one ticket only. Do not output a broad lifecycle ticket and also child tickets whose included_message_indexes sit inside or mostly overlap that lifecycle. If a message is part of a broader active lifecycle, keep it inside that lifecycle ticket and represent questions as inquiries inside that ticket rather than as separate child tickets.
+
+If input contains segmentation_context with segmentation_mode=cumulative_source_conversation, this is one pass in a conversation-by-conversation cumulative sequence. The payload contains only the current source_conversation_id block; earlier source conversations are represented only by previous_cumulative_ticket_output. Use that previous ticket summary as the existing ticket map, then revise it using the current source_conversation_blocks. Return the complete ticket list for all processed source conversations, not only the current source conversation. Preserve earlier ticket IDs/categories/statuses unless the current source conversation proves they should be merged, split, linked, reopened, or updated.
+
+Always inspect previous source_conversation_id blocks and the latest ticket state before opening a new ticket. Open/pending tickets may resume non-contiguously after another objective. For a resolved ticket, reopen the original only when the immediately next substantive source conversation returns to that subject and proves it unresolved. If a different-subject source conversation intervenes before the resolved subject returns, create a new ticket from the returning messages and set previous_ticket_id to the original resolved ticket. Greetings, routing, courtesy, and isolated promotions are not substantive intervening subjects.
+
+Same service-flow anti-micro-ticket rule: do not create a new ticket just because the same objective appears in a new source_conversation_id, uses slightly different wording, changes from inquiry to complaint/escalation, asks for proof/status/timing/callback, repeats an unanswered question, or gets a partial update. For active visa/residency/EID, employment onboarding, salary/payroll/payment-route, refund, document/admin, medical/insurance, card, delivery, or cancellation flows, merge all stages, reminders, status checks, delay complaints, proof requests, screenshots, escalation requests, callback promises, agent follow-ups, and confirmations into one ticket when they serve the same customer objective. A new ticket requires a materially new customer objective, a separate lifecycle, a separate payment/refund/item, or a post-completion problem that is no longer needed to complete the original flow. Same broad category alone is not enough to merge unrelated objectives, but same category/stage inside one active flow is not enough to split.
+
+Mandatory final merge audit: before returning JSON, scan your proposed tickets in order. If any adjacent or near-adjacent tickets share the same service object (same visa process, same worker salary/month, same refund/payment, same document/admin request, same medical/insurance/card/delivery/cancellation flow) and the later ticket is only an update, status/timing question, proof/screenshot/statement, repeated ask, escalation, complaint, callback request, agent follow-up, broadcast, or confirmation, merge them. Do not leave two tickets where the segmentation_reason would be "same topic but new source_conversation_id"; source_conversation_id alone is never a reason to split. After the audit, each remaining ticket must pass this test: "Would the customer consider this a separate thing they needed solved, not just another message about the previous thing?" If the answer is no, merge it.
+
+Visa/residency lifecycle rule: one visa application or visa renewal is one ticket from start to finish. Do not split its stages into separate tickets. Starting the visa, renewing it, passport processing, passport upload, missing documents, rejected documents/photos, government rejection, medical/EID steps, late fees/fines, status updates, and final approval/rejection all belong to the same visa/residency ticket when they are part of the same process.
+
+Visa application-number and proof escalation rule: while a visa/residency change-of-status process is active, later source_conversation_id blocks asking for an application number, ICP/request/file/UID/transaction number, submission receipt, screenshot/proof, online tracking, change-of-status status, overstay/fine/government-fee handling, supervisor call/escalation, delay complaint, complaint/report threat, cancellation, or refund because the visa action is not done are still the same visa/residency lifecycle ticket. Do not split each source_conversation_id or each demand for proof/application number into separate "other" tickets. Keep them with the earlier visa-processing ticket until the main visa/cancellation/refund lifecycle is visibly completed or the main refund is confirmed/received. Bad split: one ticket for "start visa processing" and later tickets for "provide application number", "what is the update today", "same document/transaction number", "ICP/request number/screenshot", "wrong/cancelled transaction number", and "cancel/refund because nothing happened" for the same maid change-of-status process. Correct split: one visa_processing request ticket through the main cancellation/refund confirmation, then only a later separate AED 400/overstay refund not-received objective becomes a new issue ticket.
+
+Employment visa onboarding lifecycle rule: for one employment visa/residency onboarding process, document/photo/passport collection, e-visa or entry permit, change of status, medical fitness, Emirates ID/EID, government rejections, address/location for EID delivery, WPS setup, salary deduction setup, salary card/ATM card readiness, Al Ansari pickup/branch transfer, contract-copy/admin documents, and insurance card/policy details are stages or follow-ups in the same lifecycle unless the customer switches to a clearly separate post-completion payroll/payment problem or unrelated service request. Do not split each upload, rejection, status check, ATM, WPS, or insurance step into micro-tickets.
+
+NOC source conversation boundary rule: NOC/no-objection-certificate requests belong inside the visa/residency lifecycle only when the same source_conversation_id is visibly part of the active visa processing conversation, or when a later source_conversation_id continues an unresolved active visa processing lifecycle. If visa processing has ended/resolved and a later new source_conversation_id asks for NOC/no-objection certificate/no-objection letter, create a separate NOC request ticket. Do not merge NOC requests across different source_conversation_id values unless the later source is itself continuing the active visa/residency process. Repeated NOC messages inside one source_conversation_id stay in one NOC ticket.
+
+Visa/residency category rule: when a visa/residency lifecycle ticket contains issues, keep ticket_category=request. The issues are embedded stages/problems inside the request. Do not output ticket_category=issue for the whole visa/residency lifecycle unless there is no visible operational request/lifecycle and the only customer objective is a standalone complaint/dispute.
+
+Visa/residency cancellation and refund follow-up rule: if a visa/residency lifecycle leads to cancellation and the customer is still asking for proof, cancellation, main refund approval, refund confirmation, ICP/change-status/application-number proof, or status of the cancellation/refund process, keep those follow-ups in the same visa/residency lifecycle ticket. Do not split repeated source_conversation_id blocks just because the customer asks for an update, proof, call, application number, or refund confirmation while the main visa/cancellation/refund lifecycle is still open.
+
+Residual overstay refund split rule: after the main visa/cancellation refund is visibly confirmed, credited, or received, a later customer objective about a separate AED 400/overstay fine refund not received, bank proof, missing bank credit, or "where is the 400" is a new issue ticket. Do not keep repeated AED 400 bank/proof follow-ups inside the already-handled main visa lifecycle; merge those AED 400 follow-ups together into one residual overstay_refund_issue ticket.
+
+EOS/renewal responsibility disputes are issues, not visa requests, when the customer's main objective is to challenge a policy, entitlement, responsibility, misrepresentation, loophole, penalty, or who must pay. Example: "That's not how you sold it to me", "your loophole to avoid paying", "subvert your responsibilities", or "why do I have to cancel?" should be ticket_category=issue even if a visa-renewal broadcast frames the conversation.
+
+Salary/payment-route problems are issues, not requests, when the customer reports salary not received, salary missing/late, salary sent through the wrong channel, or a repeated Ansari vs Du Pay routing problem. Example: "My maid didn't receive her salary yet" plus "Why not in Du Pay?", "You said this last month", or "She's been registered for 3 months" should be ticket_category=issue.
+
+Salary missing/payment-route escalation rule: when one salary/payroll payment is missing, deducted but not visible, not received, routed to the wrong wallet/card, or disputed between Du Pay and Al Ansari, all follow-ups about that same salary/payment stay in one salary/payment-route issue ticket. Merge later source_conversation_id blocks that ask the company to contact/follow up with Du Pay, ask whether the customer can email/call Du Pay, ask when the salary should appear, mention card request/transaction history/wallet balance, complain about having to contact Du Pay, request manager callback/escalation/complaint, or receive a salary statement/proof broadcast for the same worker/payment. Do not split those into general_inquiry, other, callback, complaint, or broadcast-only tickets. Only create a new salary ticket when the later source is a different salary month/payment, a different worker, a separate advanced-salary/duplicate-billing dispute, or a clearly new post-resolution payroll problem.
+
+Salary destination change request rule: when the customer asks to switch/change/transfer a worker's salary destination from Du Pay/Al Ansari to a bank account, ENBD/Emirates NBD account, IBAN, or other payout account, classify it as ticket_category=request, not inquiry/status and not issue unless the main objective is a standalone failed/missing salary complaint. Merge all later source_conversation_id blocks that provide bank screenshots, IBAN, account holder name, bank name, account number, corrected screenshots, "ok here it is", "details do not fit in one screenshot", agent requests for one clear screenshot, and final submission/confirmation into the same salary_payment_destination_change request ticket. Bad split: Ticket 1 = "can you transfer salary to ENBD instead of Du Pay" and Ticket 2 = "ok here it is" / bank screenshot / request submitted. This must be one request ticket.
+
+Salary status follow-up rule: after employment visa/onboarding is visibly complete, later questions like "is June salary transferred?", "what time will salary transfer be done?", or "we will wait 24 to 48 hours" are one salary_status inquiry unless the customer reports salary missing, late, not received, wrong route, or a payment dispute. Merge those repeated salary status follow-ups together; do not create separate two-message request/inquiry tickets for each source_conversation_id.
+
+Advanced salary / duplicate billing disputes are issues, not requests, when the customer contests AED 1,500/AED 1,668 charges, says an advance salary was already paid, asks whether the old payment was lost, says a charge is duplicate, says they paid 25/26 salaries in 2 years, or asks for human escalation because the billing explanation does not answer the charge.
+
+Category uses only visible evidence. A customer-forwarded official notice such as "Dear Customer, your application ... was approved/rejected" is context, not the customer's objective. If the first actual support objective reports missing files, an incorrect message, a rejection, or an agreed visa/change-status action that was not performed, classify the lifecycle as issue even when the customer later asks the company to submit the application and send proof. If a visible earlier customer objective already requested starting that same visa process, keep the lifecycle as request.
+
+Objective naming rule: never include customer, maid, worker, helper, or agent personal names in ticket_type or customer_objective. Use neutral role wording such as "the maid", "the worker", or "the customer" only when needed. Do not copy an emotional opener such as "this is totally unacceptable" as the objective; summarize the concrete outcome sought.
+
+If the first visible source conversation is already about a visa/passport/photo/government rejection and no earlier visa ticket is visible, create a new issue ticket for that visible problem. If later cumulative passes reveal an earlier visa/residency request ticket, move/merge that rejection into the existing visa/residency ticket instead of keeping a separate ticket and preserve the earlier request anchor.
+
+If the immediately next substantive source conversation resumes a previously resolved visa/residency subject and proves it unresolved, reopen/update the same ticket. If a different-subject source conversation intervenes first, create a new linked visa/residency ticket with previous_ticket_id pointing to the resolved predecessor. A visa/residency ticket that was still pending may resume the same original ticket non-contiguously after an interruption.
+
+Include the greeting/setup messages that immediately precede the customer's first real request in the same ticket. If the customer says "Hi" and the assistant replies before the customer states the objective, keep those greeting messages inside that ticket.
+
+Do not create a standalone ticket for greeting/setup/routing exchanges such as customer "Hi" followed by a company message saying this number cannot receive/review messages and directing the customer to a support WhatsApp number. Attach those messages to the next real customer ticket when one exists, or to the previous active ticket if the setup appears after it.
+
+If the customer asks a real question/action in one source_conversation_id and the only company reply is a routing-only message saying this number cannot receive/review messages or directing them to another support number, do not treat that reply as a resolution. If the next source_conversation_id repeats or continues the same customer objective and gets the real answer/action, merge both source conversations into one ticket and use the final outcome from the later source conversation.
+
+The word "inquiry" only counts when it is the customer's inquiry. Do not create an inquiry ticket or inquiry-array item because the assistant/company says "your inquiry", "continue with your inquiry", "support inquiry", or similar routing wording.
+
+Unrelated service/noise rule: home gas/Gasul delivery chatter, birthday wishes, courtesy acknowledgments, or other non-contract events must not open their own ticket and must not cause a split inside an employment visa lifecycle. Exclude them when they are clearly unrelated to the company's service; otherwise attach only the directly relevant acknowledgment to the closest active ticket.
+
+Promotional-message rule: an isolated promotional service or marketing message with no customer response must not create a ticket; attach it to the nearest current ticket as contextual noise without changing that ticket's objective, category, status, or inquiries. If the customer meaningfully engages by requesting details, checking price/availability, selecting an option, booking, or pursuing the promoted service, create a separate ticket containing the promotion and that full customer flow.
+
+Standalone non-service broadcast exclusion rule: a broadcast/system message with no customer objective and no customer response about it must not become a ticket. Isolated promotions attach to the nearest current ticket under the promotional-message rule above. Birthday/holiday/greeting broadcasts such as "maidbirthday is tomorrow" or "wish her a happy birthday" are not support tickets and must be excluded, not labeled as uniform, salary, visa, inquiry, request, or other. Do not infer the ticket_type from later unrelated customer messages.
+
+Uniform availability questions are inquiries: "do you provide uniforms", "can you let me know if uniforms are provided", or "are uniforms included/available" asks for policy/availability information and should be ticket_category=inquiry, ticket_type=uniform_inquiry. Classify as request only if the customer asks the company to actually order, send, buy, or provide uniforms as an action.
+
+Do not create a standalone ticket for courtesy-only closeout messages such as "thank you", "thanks", "you are welcome", "I am here to help", or "feel free to reach out". Append those messages to the previous related ticket and do not add a new inquiry for them. If a new source_conversation_id starts only with an acknowledgement or confirmation such as "yes please", "sure", or "ok please", treat it as a continuation of the previous active ticket unless the customer then states a clearly new objective.
+
+If a new source_conversation_id starts with a new question or new check/action request after an earlier ticket that already mixed an issue/request with informational inquiries, create a new ticket. Do not append it to the earlier ticket only because the broad topic is similar. Link it with previous_ticket_id only when useful.
+
+After a medical, insurance, clinic, payment, visa, document, or delivery thread has been answered/closed, a later source_conversation_id asking a different objective such as "What is the procedure to change maid?" is a new ticket, not a continuation. Generic shared domain words such as maid/customer/contract do not make two objectives the same ticket.
+
+Do not merge an initial visa-renewal information thread with a later advanced-salary/duplicate-billing dispute only because both mention renewal or July charges. Example: messages asking visa expiry, renewal process, renewal cost, cheaper option, breakdown, flight, and labor-card expiry are one inquiry ticket; a later AED 1,500 advanced salary reminder followed by "I don't understand", "I already paid advance salary in July 2024", "is that lost?", "duplicate", or "26th payment" is a separate issue ticket.
+
+Do not split a how-to question from the customer's follow-up complaint, fee question, policy question, fairness objection, comparison, or "why is this harder" reaction when all messages concern the same product, service, process, app flow, provider change, policy, document flow, payment flow, booking flow, delivery flow, or operational task. Keep steps, limitations, charges, alternatives, provider comparisons, and complaints about the same flow in one ticket unless the customer switches to a different unrelated objective.
+
+For request tickets with multiple action asks in the same document/admin flow, keep them as one request ticket. Example: asking for a contract copy, insurance network list, sponsor-name correction, and contract-field change in one active thread is one request ticket. Put the material action asks in customer_objective and segmentation_reason; do not split each action ask into separate tickets.
+
+Bad split: Ticket 1 = "how do I do this process?" and Ticket 2 = "why does this process have extra steps/fees or why is the new process worse?" when both discuss the same process. This must be one ticket with multiple inquiries.
+
+Bad split: Ticket 1 = "complete employment visa process" covering #1-#272, Ticket 2 = "passport status" covering #84-#87, Ticket 3 = "medical/EID timing" covering #203-#208, Ticket 4 = "ATM/insurance readiness" covering #238-#272, plus salary micro-tickets covering #274-#281. This is invalid because Tickets 2-4 overlap the lifecycle and the salary follow-ups should be one later salary_status inquiry.
+
+Bad split: Ticket 1 = salary transfer/status, Ticket 2 = "what time will it be transferred?", Ticket 3 = "we will wait 24 to 48 hours", Ticket 4 = "please check again" for the same payroll period or same missing salary. This must be one salary_status inquiry or one salary/payment-route issue depending on whether the customer is only checking status or reporting a missing/wrong payment.
+
+Bad split: Ticket 1 = "missing June salary deducted but not in Du Pay", Ticket 2 = "kindly ask Du Pay Support / when should salary appear", Ticket 3 = "follow up with Du / complaint / manager callback", Ticket 4 = salary-statement broadcast. If all messages concern the same worker and same missing June salary, this must be one salary/payment-route issue ticket, not four tickets.
+
+Inquiry tickets normally stay within one source_conversation_id. Exception: if an inquiry is pending_unresolved and a later source_conversation_id continues, answers, resolves, or gives a material update on the same inquiry, merge those messages into one general_inquiry ticket and use the final outcome as the ticket status. If the earlier inquiry was already resolved or the later source_conversation_id asks a separate informational topic, create a new general_inquiry ticket and set previous_ticket_id to the earlier related ticket when relevant.
+
+A standalone inquiry must originate from a customer message. Company-side wording that mentions "inquiry" is not itself an inquiry and must not become a separate ticket or an entry in the inquiries array.
+
+For request tickets, the inquiries array should contain only informational questions/clarifications, not action asks. "Can you share/send/update/change/check/provide..." is usually an action ask that belongs in the objective/reason, while "Is it okay that details are blank?" belongs in inquiries.
+
+Issue/request tickets can span multiple source_conversation_id values when later conversations continue the same underlying issue. Use the final outcome after the latest related source conversation as the ticket status: pending then rejected = totally_unresolved; pending then accepted/completed = resolved. Set should_append_future_conversations to true only when the final status is pending_unresolved.
+
+For request tickets with multiple action asks, status is resolved only when every material requested action is visibly completed, delivered, accepted, or no longer needed. If the agent only promises to share/check/update later, status is pending_unresolved even if an embedded informational question was answered.
+
+A routing-only company reply that says the number cannot receive/review messages or sends the customer to a different support number is not a real answer/resolution to the customer's objective. Mark it pending_unresolved unless it is merged with a later source conversation that actually answers or completes the same objective.
+
+For salary/payment-route issues, a workaround such as "collect it from Ansari this month" resolves only the immediate collection path, not the underlying route issue. If the answer says the next salary/payroll should go to Du Pay, the salary route can switch on the following payroll cycle, or the team will reach out if anything changes, set status=pending_unresolved and should_append_future_conversations=true.
+
+Direct-debit stop/recall rule: successful card payment and changing future payments to card do not prove that an already-sent current bank instruction was recalled. Resolve only when the company explicitly confirms that the current direct debit was recalled, cancelled, stopped, withdrawn, or is no longer active. "Forms will be deleted", "payment received by card", or a later thanks about future card setup is insufficient; otherwise keep pending_unresolved.
+
 Required schema:
 {output_schema}
 
@@ -997,6 +1116,8 @@ DEFAULT_TICKET_SEGMENTATION_OUTPUT_SCHEMA = """{
   "tickets": [
     {
       "ticket_id": "ticket_1",
+      "ticket_category": "issue|request|inquiry",
+      "request_origin": "company|customer",
       "ticket_type": "short_snake_case",
       "customer_objective": "short description",
       "start_message_index": 1,
@@ -1015,13 +1136,23 @@ DEFAULT_TICKET_SEGMENTATION_OUTPUT_SCHEMA = """{
           "unresolved_reason": "short reason, or none"
         }
       ],
+            "conversation_summaries": [
+                {
+                    "source_conversation_id": "exact source id",
+                    "message_indexes": [1, 2, 3],
+                    "customer_intent": "short intent in this source conversation",
+                    "outcome": "short outcome or latest state",
+                    "status": "resolved|pending_unresolved|totally_unresolved",
+                    "ticket_signals": ["short_snake_case_signal"]
+                }
+            ],
       "segmentation_reason": "short reason"
     }
   ]
 }"""
 
 
-DEFAULT_TICKET_SEGMENTATION_USER_TEMPLATE = """Split this complete customer/contract timeline into ticket-style journeys.
+DEFAULT_TICKET_SEGMENTATION_USER_TEMPLATE = """Split this complete customer/contract timeline into ticket-style journeys. The input JSON groups messages under source_conversation_blocks.
 
 Return strict JSON only using the required schema.
 
@@ -1030,8 +1161,11 @@ Input:
 
 
 DEFAULT_TICKET_SEGMENTATION_SYSTEM_PROMPT = _load_external_prompt_default(
-    "ticket segmentation prompt",
-    DEFAULT_TICKET_SEGMENTATION_SYSTEM_PROMPT,
+    "second ticket segmenation prompt",
+    _load_external_prompt_default(
+        "ticket segmentation prompt",
+        DEFAULT_TICKET_SEGMENTATION_SYSTEM_PROMPT,
+    ),
 )
 DEFAULT_TICKET_SEGMENTATION_OUTPUT_SCHEMA = _load_external_prompt_default(
     "ticket segmentation scheme",

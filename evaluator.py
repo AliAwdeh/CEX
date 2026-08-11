@@ -53,39 +53,119 @@ A ticket is one evaluable customer thread. A thread can be:
 - a concrete issue, request, complaint, process action, or blocked outcome
 - a grouped informational inquiry ticket that may contain several standalone questions
 
+Each ticket must have exactly one ticket_category:
+- inquiry: the customer asks for information, explanation, price, timing, policy, eligibility, location, status, or a next step, and does not ask the company to perform an action.
+- request: the customer asks the company to check, send, provide, book, arrange, change, cancel, renew, process, confirm, transfer, deliver, give a copy/document/link, or otherwise do something, without primarily complaining about a failure. This includes indirect wording such as "is there any possibility to get a copy of the contract" or "can I get a copy".
+- issue: the customer reports a problem, complaint, blocker, failed/incorrect action, payment/refund dispute, contradiction, delay, or bad experience.
+- Normal process/action tickets such as maid visa request, booking request, document request, renewal request, cancellation request, refund request, or delivery request are ticket_category=request unless the customer is primarily reporting a failure, complaint, dispute, delay, blocker, or bad experience.
+- Status/readiness/procedure questions such as "can you tell/let me know if the contract is ready", "is it ready", "any update", "what is the status", or "what is the procedure to change maid" are ticket_category=inquiry unless the customer asks the company to perform, process, change, expedite, or check something operationally, or reports a problem.
+- Do not classify a normal inquiry/request as issue only because the agent mentions an internal limitation or uses words like "problem" or "issue". The customer must be reporting or experiencing that problem as the main objective.
+
+Category decision checklist:
+1. Identify the customer's main objective, not the agent's reply wording and not the ticket_type name.
+2. ticket_category describes the ticket's main objective/lifecycle, not whether the ticket contains problems. A request can contain issues, rejected steps, delays, missing documents, fees, or complaints and still remain ticket_category=request.
+3. First material customer objective category anchor rule: inside one ticket, the ticket_category is anchored by the first material customer objective that opened that ticket. If the ticket starts as a request/action/lifecycle, keep ticket_category=request even if later messages contain issues, complaints, blockers, delays, status questions, proof requests, or escalations about completing that request. If the ticket starts as an issue/problem/dispute, keep ticket_category=issue even if later messages ask the company to check, call, escalate, send, refund, provide, or perform a follow-up action to resolve that issue. Only change category or split when the later customer objective is materially separate from the original objective.
+4. Embedded issues, requests, and inquiries are not child tickets. If a request ticket contains problems, describe the embedded problems in customer_objective and segmentation_reason, and put only true informational questions in inquiries. If an issue ticket contains action asks, describe those embedded requests/actions in customer_objective and segmentation_reason, and put only true informational questions in inquiries. Do not invent extra fields outside the schema.
+5. Choose issue only when the customer's main objective is to report/fix a standalone problem, complaint, blocker, failed/incorrect action, dispute, contradiction, or bad experience, and there is no broader operational request/lifecycle that the problem belongs to.
+6. Choose request when the customer wants the company to do or complete an operational action/lifecycle: initiate, check operationally, send, provide, book, arrange, change, cancel, renew, process, confirm, transfer, deliver, upload, replace, collect, refund, escalate, provide a copy/document/link, or complete a visa/residency process.
+7. Choose inquiry when the customer wants information only: explanation, price, policy, eligibility, location, timing, next step, readiness, status, whether something is done/issued/approved/active, or why/how something works.
+Future renewal eligibility/timing wording such as "can we renew in February?", "am I right that I can renew?", or "when shall we process it, January 15 onward?" is inquiry when the customer is planning and will contact the company later. Operational words inside a question do not make it a request unless the customer asks the company to start, submit, or perform the renewal.
+8. Request beats issue when the issue is a stage inside the requested process. Do not classify a visa/residency request as issue just because it contains passport rejection, photo rejection, missing documents, government rejection, late fees/fines, delay, or customer frustration. Keep ticket_category=request and reflect the problem in ticket_type, status, inquiries, and segmentation_reason.
+9. Request beats inquiry only when the customer asks for an action to be performed or asks to receive something from the company. "Can you tell me", "let me know", "what is the status", "is it ready", and "any update" are inquiry, even if the agent replies "I will check". But "can I get a copy", "is there any possibility to get a copy", "can you send/provide the contract", and similar document-copy wording are request.
+10. Issue beats request/inquiry only when the customer's main objective is the problem itself, not completion of an existing process. Do not infer issue from agent-only words, internal limitations, or a normal future step.
+
+Category examples:
+- inquiry: "Can you tell us if the maid contract is ready?", "Is the visa issued?", "Any update?", "How much is the insurance?", "Which card is linked?", "What is the procedure to change maid?", "Can you please let me know if you provide uniforms to the maids?"
+- request: "Please send the contract", "Is there any possibility to get a copy of the signed contract?", "Can I get a copy of the contract?", "Can you check which card you are using for auto deduction?", "Please book the medical test", "Cancel my renewal", "Process the refund", "Start the maid visa", "The passport/photo was rejected during visa processing, please upload again", "Please share the contract, insurance network list, and update the sponsor name", "Please order/provide uniforms for the maid"
+- issue: "The payment failed", "You charged me twice", "The app is difficult and adds fees", "This is unfair", "The refund was wrongly rejected", "My maid didn't receive her salary yet", "Why not in Du Pay? You said this last month", "I think the AED 1,500 advanced salary is a duplicate", "I already paid one month advance salary in July 2024" when the customer's main objective is the complaint/dispute itself rather than completion of a broader request lifecycle.
+
 Core rules:
 - Use only visible messages.
+- Input is grouped as source_conversation_blocks. Treat each source_conversation_id as a bracket/header for the messages inside that block; individual message objects intentionally do not repeat source_conversation_id.
+- message_index is the continuous order across the full customer journey and does not reset when a new source_conversation_id block starts. Use these exact message_index values in start_message_index, end_message_index, included_message_indexes, and inquiry message_indexes.
+- No overlapping ticket indexes: each material message_index should belong to one ticket only. Do not output a broad lifecycle ticket and also child tickets whose included_message_indexes sit inside or mostly overlap that lifecycle. If a message is part of a broader active lifecycle, keep it inside that lifecycle ticket and represent questions as inquiries inside that ticket rather than as separate child tickets.
+- If input contains segmentation_context with segmentation_mode=cumulative_source_conversation, this is one pass in a conversation-by-conversation cumulative sequence. The payload contains only the current source_conversation_id block; earlier source conversations are represented only by previous_cumulative_ticket_output. Use that previous ticket summary as the existing ticket map, then revise it using the current source_conversation_blocks. Return the complete ticket list for all processed source conversations, not only the current source conversation. Preserve earlier ticket IDs/categories/statuses unless the current source conversation proves they should be merged, split, linked, reopened, or updated.
 - One contract/customer timeline can contain multiple tickets.
+- Always inspect previous source_conversation_id blocks and the latest ticket state before opening a new ticket. Open/pending tickets may resume non-contiguously after another objective. For a resolved ticket, reopen the original only when the immediately next substantive source conversation returns to that subject and proves it unresolved. If a different-subject source conversation intervenes before the resolved subject returns, create a new ticket from the returning messages and set previous_ticket_id to the original resolved ticket. Greetings, routing, courtesy, and isolated promotions are not substantive intervening subjects.
+- Same service-flow anti-micro-ticket rule: do not create a new ticket just because the same objective appears in a new source_conversation_id, uses slightly different wording, changes from inquiry to complaint/escalation, asks for proof/status/timing/callback, repeats an unanswered question, or gets a partial update. For active visa/residency/EID, employment onboarding, salary/payroll/payment-route, refund, document/admin, medical/insurance, card, delivery, or cancellation flows, merge all stages, reminders, status checks, delay complaints, proof requests, screenshots, escalation requests, callback promises, agent follow-ups, and confirmations into one ticket when they serve the same customer objective. A new ticket requires a materially new customer objective, a separate lifecycle, a separate payment/refund/item, or a post-completion problem that is no longer needed to complete the original flow. Same broad category alone is not enough to merge unrelated objectives, but same category/stage inside one active flow is not enough to split.
+- Mandatory final merge audit: before returning JSON, scan your proposed tickets in order. If any adjacent or near-adjacent tickets share the same service object (same visa process, same worker salary/month, same refund/payment, same document/admin request, same medical/insurance/card/delivery/cancellation flow) and the later ticket is only an update, status/timing question, proof/screenshot/statement, repeated ask, escalation, complaint, callback request, agent follow-up, broadcast, or confirmation, merge them. Do not leave two tickets where the segmentation_reason would be "same topic but new source_conversation_id"; source_conversation_id alone is never a reason to split. After the audit, each remaining ticket must pass this test: "Would the customer consider this a separate thing they needed solved, not just another message about the previous thing?" If the answer is no, merge it.
+- Visa/residency lifecycle rule: one visa application or visa renewal is one ticket from start to finish. Do not split its stages into separate tickets. Starting the visa, renewing it, passport processing, passport upload, missing documents, rejected documents/photos, government rejection, medical/EID steps, late fees/fines, status updates, and final approval/rejection all belong to the same visa/residency ticket when they are part of the same process.
+- Visa application-number and proof escalation rule: while a visa/residency change-of-status process is active, later source_conversation_id blocks asking for an application number, ICP/request/file/UID/transaction number, submission receipt, screenshot/proof, online tracking, change-of-status status, overstay/fine/government-fee handling, supervisor call/escalation, delay complaint, complaint/report threat, cancellation, or refund because the visa action is not done are still the same visa/residency lifecycle ticket. Do not split each source_conversation_id or each demand for proof/application number into separate "other" tickets. Keep them with the earlier visa-processing ticket until the main visa/cancellation/refund lifecycle is visibly completed or the main refund is confirmed/received. Bad split: one ticket for "start visa processing" and later tickets for "provide application number", "what is the update today", "same document/transaction number", "ICP/request number/screenshot", "wrong/cancelled transaction number", and "cancel/refund because nothing happened" for the same maid change-of-status process. Correct split: one visa_processing request ticket through the main cancellation/refund confirmation, then only a later separate AED 400/overstay refund not-received objective becomes a new issue ticket.
+- Employment visa onboarding lifecycle rule: for one employment visa/residency onboarding process, document/photo/passport collection, e-visa or entry permit, change of status, medical fitness, Emirates ID/EID, government rejections, address/location for EID delivery, WPS setup, salary deduction setup, salary card/ATM card readiness, Al Ansari pickup/branch transfer, contract-copy/admin documents, and insurance card/policy details are stages or follow-ups in the same lifecycle unless the customer switches to a clearly separate post-completion payroll/payment problem or unrelated service request. Do not split each upload, rejection, status check, ATM, WPS, or insurance step into micro-tickets.
+- NOC source conversation boundary rule: NOC/no-objection-certificate requests belong inside the visa/residency lifecycle only when the same source_conversation_id is visibly part of the active visa processing conversation, or when a later source_conversation_id continues an unresolved active visa processing lifecycle. If visa processing has ended/resolved and a later new source_conversation_id asks for NOC/no-objection certificate/no-objection letter, create a separate NOC request ticket. Do not merge NOC requests across different source_conversation_id values unless the later source is itself continuing the active visa/residency process. Repeated NOC messages inside one source_conversation_id stay in one NOC ticket.
+- Visa/residency category rule: when a visa/residency lifecycle ticket contains issues, keep ticket_category=request. The issues are embedded stages/problems inside the request. Do not output ticket_category=issue for the whole visa/residency lifecycle unless there is no visible operational request/lifecycle and the only customer objective is a standalone complaint/dispute.
+- Visa/residency cancellation and refund follow-up rule: if a visa/residency lifecycle leads to cancellation and the customer is still asking for proof, cancellation, main refund approval, refund confirmation, ICP/change-status/application-number proof, or status of the cancellation/refund process, keep those follow-ups in the same visa/residency lifecycle ticket. Do not split repeated source_conversation_id blocks just because the customer asks for an update, proof, call, application number, or refund confirmation while the main visa/cancellation/refund lifecycle is still open.
+- Residual overstay refund split rule: after the main visa/cancellation refund is visibly confirmed, credited, or received, a later customer objective about a separate AED 400/overstay fine refund not received, bank proof, missing bank credit, or "where is the 400" is a new issue ticket. Do not keep repeated AED 400 bank/proof follow-ups inside the already-handled main visa lifecycle; merge those AED 400 follow-ups together into one residual overstay_refund_issue ticket.
+- EOS/renewal responsibility disputes are issues, not visa requests, when the customer's main objective is to challenge a policy, entitlement, responsibility, misrepresentation, loophole, penalty, or who must pay. Example: "That's not how you sold it to me", "your loophole to avoid paying", "subvert your responsibilities", or "why do I have to cancel?" should be ticket_category=issue even if a visa-renewal broadcast frames the conversation.
+- Salary/payment-route problems are issues, not requests, when the customer reports salary not received, salary missing/late, salary sent through the wrong channel, or a repeated Ansari vs Du Pay routing problem. Example: "My maid didn't receive her salary yet" plus "Why not in Du Pay?", "You said this last month", or "She's been registered for 3 months" should be ticket_category=issue.
+- Salary missing/payment-route escalation rule: when one salary/payroll payment is missing, deducted but not visible, not received, routed to the wrong wallet/card, or disputed between Du Pay and Al Ansari, all follow-ups about that same salary/payment stay in one salary/payment-route issue ticket. Merge later source_conversation_id blocks that ask the company to contact/follow up with Du Pay, ask whether the customer can email/call Du Pay, ask when the salary should appear, mention card request/transaction history/wallet balance, complain about having to contact Du Pay, request manager callback/escalation/complaint, or receive a salary statement/proof broadcast for the same worker/payment. Do not split those into general_inquiry, other, callback, complaint, or broadcast-only tickets. Only create a new salary ticket when the later source is a different salary month/payment, a different worker, a separate advanced-salary/duplicate-billing dispute, or a clearly new post-resolution payroll problem.
+- Salary destination change request rule: when the customer asks to switch/change/transfer a worker's salary destination from Du Pay/Al Ansari to a bank account, ENBD/Emirates NBD account, IBAN, or other payout account, classify it as ticket_category=request, not inquiry/status and not issue unless the main objective is a standalone failed/missing salary complaint. Merge all later source_conversation_id blocks that provide bank screenshots, IBAN, account holder name, bank name, account number, corrected screenshots, "ok here it is", "details do not fit in one screenshot", agent requests for one clear screenshot, and final submission/confirmation into the same salary_payment_destination_change request ticket. Bad split: Ticket 1 = "can you transfer salary to ENBD instead of Du Pay" and Ticket 2 = "ok here it is" / bank screenshot / request submitted. This must be one request ticket.
+- Salary status follow-up rule: after employment visa/onboarding is visibly complete, later questions like "is June salary transferred?", "what time will salary transfer be done?", or "we will wait 24 to 48 hours" are one salary_status inquiry unless the customer reports salary missing, late, not received, wrong route, or a payment dispute. Merge those repeated salary status follow-ups together; do not create separate two-message request/inquiry tickets for each source_conversation_id.
+- Advanced salary / duplicate billing disputes are issues, not requests, when the customer contests AED 1,500/AED 1,668 charges, says an advance salary was already paid, asks whether the old payment was lost, says a charge is duplicate, says they paid 25/26 salaries in 2 years, or asks for human escalation because the billing explanation does not answer the charge.
+- Category uses only visible evidence. A customer-forwarded official notice such as "Dear Customer, your application ... was approved/rejected" is context, not the customer's objective. If the first actual support objective reports missing files, an incorrect message, a rejection, or an agreed visa/change-status action that was not performed, classify the lifecycle as issue even when the customer later asks the company to submit the application and send proof. If a visible earlier customer objective already requested starting that same visa process, keep the lifecycle as request.
+- Objective naming rule: never include customer, maid, worker, helper, or agent personal names in ticket_type or customer_objective. Use neutral role wording such as "the maid", "the worker", or "the customer" only when needed. Do not copy an emotional opener such as "this is totally unacceptable" as the objective; summarize the concrete outcome sought.
+- If the first visible source conversation is already about a visa/passport/photo/government rejection and no earlier visa ticket is visible, create a new issue ticket for that visible problem. If later cumulative passes reveal an earlier visa/residency request ticket, move/merge that rejection into the existing visa/residency ticket instead of keeping a separate ticket and preserve the earlier request anchor.
+- If the immediately next substantive source conversation resumes a previously resolved visa/residency subject and proves it unresolved, reopen/update the same ticket. If a different-subject source conversation intervenes first, create a new linked visa/residency ticket with previous_ticket_id pointing to the resolved predecessor. A visa/residency ticket that was still pending may resume the same original ticket non-contiguously after an interruption.
 - Include the greeting/setup messages that immediately precede the customer's first real request in the same ticket. If the customer says "Hi" and the assistant replies before the customer states the objective, keep those greeting messages inside that ticket.
+- Do not create a standalone ticket for greeting/setup/routing exchanges such as customer "Hi" followed by a company message saying this number cannot receive/review messages and directing the customer to a support WhatsApp number. Attach those messages to the next real customer ticket when one exists, or to the previous active ticket if the setup appears after it.
+- If the customer asks a real question/action in one source_conversation_id and the only company reply is a routing-only message saying this number cannot receive/review messages or directing them to another support number, do not treat that reply as a resolution. If the next source_conversation_id repeats or continues the same customer objective and gets the real answer/action, merge both source conversations into one ticket and use the final outcome from the later source conversation.
+- The word "inquiry" only counts when it is the customer's inquiry. Do not create an inquiry ticket or inquiry-array item because the assistant/company says "your inquiry", "continue with your inquiry", "support inquiry", or similar routing wording.
 - Do not exclude a broadcast/system message only because it is a broadcast. Include broadcasts that trigger, frame, confirm, remind about, warn about, follow up on, or are referenced by the customer in relation to the ticket.
 - If the customer asks about, reacts to, complains about, confirms, or follows instructions from a broadcast, include that broadcast and the customer interaction in the same ticket.
-- Promotional or informational messages after the main answer should stay in the same ticket when they are part of the same active thread, same service lifecycle, or related next-step context. Exclude them only when they are clearly isolated, unrelated, and not referenced by the customer.
+- An isolated promotional service or marketing message with no customer response must not create a ticket; attach it to the nearest current ticket as contextual noise without changing that ticket's objective, category, status, or inquiries. If the customer meaningfully engages by requesting details, checking price/availability, selecting an option, booking, or pursuing the promoted service, create a separate ticket containing the promotion and that full customer flow.
 - Do not omit substantive customer, agent, bot, or broadcast messages. If a message is not clearly isolated unrelated noise, assign it to the closest relevant ticket or create a separate ticket for it.
 - Exclude only truly isolated unrelated operational noise that has no relationship to any customer objective and is not needed to understand the ticket.
+- Standalone non-service broadcast exclusion rule: a broadcast/system message with no customer objective and no customer response about it must not become a ticket. Isolated promotions attach to the nearest current ticket under the promotional-message rule above. Birthday/holiday/greeting broadcasts such as "maidbirthday is tomorrow" or "wish her a happy birthday" are not support tickets and must be excluded, not labeled as uniform, salary, visa, inquiry, request, or other. Do not infer the ticket_type from later unrelated customer messages.
+- Unrelated service/noise rule: home gas/Gasul delivery chatter, birthday wishes, courtesy acknowledgments, or other non-contract events must not open their own ticket and must not cause a split inside an employment visa lifecycle. Exclude them when they are clearly unrelated to the company's service; otherwise attach only the directly relevant acknowledgment to the closest active ticket.
+- Uniform availability questions are inquiries: "do you provide uniforms", "can you let me know if uniforms are provided", or "are uniforms included/available" asks for policy/availability information and should be ticket_category=inquiry, ticket_type=uniform_inquiry. Classify as request only if the customer asks the company to actually order, send, buy, or provide uniforms as an action.
+- Do not create a standalone ticket for courtesy-only closeout messages such as "thank you", "thanks", "you are welcome", "I am here to help", or "feel free to reach out". Append those messages to the previous related ticket and do not add a new inquiry for them.
+- If a new source_conversation_id starts only with an acknowledgement or confirmation such as "yes please", "sure", or "ok please", treat it as a continuation of the previous active ticket unless the customer then states a clearly new objective.
+- If a new source_conversation_id starts with a new question or new check/action request after an earlier ticket that already mixed an issue/request with informational inquiries, create a new ticket. Do not append it to the earlier ticket only because the broad topic is similar. Link it with previous_ticket_id only when useful.
+- After a medical, insurance, clinic, payment, visa, document, or delivery thread has been answered/closed, a later source_conversation_id asking a different objective such as "What is the procedure to change maid?" is a new ticket, not a continuation. Generic shared domain words such as maid/customer/contract do not make two objectives the same ticket.
+- Do not merge an initial visa-renewal information thread with a later advanced-salary/duplicate-billing dispute only because both mention renewal or July charges. Example: messages asking visa expiry, renewal process, renewal cost, cheaper option, breakdown, flight, and labor-card expiry are one inquiry ticket; a later AED 1,500 advanced salary reminder followed by "I don't understand", "I already paid advance salary in July 2024", "is that lost?", "duplicate", or "26th payment" is a separate issue ticket.
 
 Issue/request grouping:
-- Create a separate ticket for each distinct issue, complaint, process action, cancellation request, refund request, payment problem, document problem, visa/EID process problem, or operational blocker.
+- Create a separate ticket for each distinct issue, complaint, process action, cancellation request, refund request, payment problem, document problem, or operational blocker. Exception: visa/residency/EID process problems are stages inside the same visa/residency lifecycle ticket when they belong to the same process.
 - If the customer raises the same underlying issue multiple times, append the later messages to the same issue ticket until it is resolved, clearly pending, abandoned, or replaced by a different issue.
+- Do not split a how-to question from the customer's follow-up complaint, fee question, policy question, fairness objection, comparison, or "why is this harder" reaction when all messages concern the same product, service, process, app flow, provider change, policy, document flow, payment flow, booking flow, delivery flow, or operational task. Treat those follow-ups as clarifications/escalation inside one ticket.
+- Keep steps, limitations, charges, alternatives, provider comparisons, and complaints about the same flow in one ticket unless the customer switches to a different unrelated objective.
 - If two issues are different, keep them as separate tickets even if they happen close together.
 - If an informational question is only a clarification inside an active issue, include it in that issue ticket and list it in that ticket's inquiries array.
+- For request tickets with multiple action asks in the same document/admin flow, keep them as one request ticket. Example: asking for a contract copy, insurance network list, sponsor-name correction, and contract-field change in one active thread is one request ticket. Put the material action asks in customer_objective and segmentation_reason; do not split each action ask into separate tickets.
+- Bad split: Ticket 1 = "how do I do this process?" and Ticket 2 = "why does this process have extra steps/fees or why is the new process worse?" when both discuss the same process. This must be one ticket with multiple inquiries.
+- Bad split: Ticket 1 = "complete employment visa process" covering #1-#272, Ticket 2 = "passport status" covering #84-#87, Ticket 3 = "medical/EID timing" covering #203-#208, Ticket 4 = "ATM/insurance readiness" covering #238-#272, plus salary micro-tickets covering #274-#281. This is invalid because Tickets 2-4 overlap the lifecycle and the salary follow-ups should be one later salary_status inquiry.
+- Bad split: Ticket 1 = salary transfer/status, Ticket 2 = "what time will it be transferred?", Ticket 3 = "we will wait 24 to 48 hours", Ticket 4 = "please check again" for the same payroll period or same missing salary. This must be one salary_status inquiry or one salary/payment-route issue depending on whether the customer is only checking status or reporting a missing/wrong payment.
+- Bad split: Ticket 1 = "missing June salary deducted but not in Du Pay", Ticket 2 = "kindly ask Du Pay Support / when should salary appear", Ticket 3 = "follow up with Du / complaint / manager callback", Ticket 4 = salary-statement broadcast. If all messages concern the same worker and same missing June salary, this must be one salary/payment-route issue ticket, not four tickets.
 
 Inquiry grouping:
 - A standalone inquiry is a question asking for information, explanation, timing, status, eligibility, price, policy, location, required document, or next step, without itself being a complaint or operational blocker.
+- A standalone inquiry must originate from a customer message. Company-side wording that mentions "inquiry" is not itself an inquiry and must not become a separate ticket or an entry in the inquiries array.
 - If the customer asks multiple standalone inquiries about different matters, group them into one inquiry ticket and list every question separately in the inquiries array.
+- A general_inquiry ticket may span any number of source_conversation_id blocks. Continue the same ticket when the later block answers an agent question, clarifies, follows up on, repeats, resolves, or materially updates the same customer objective. Create a new inquiry ticket only when the customer introduces a materially different informational objective; the source_conversation_id boundary itself is never evidence of a new ticket.
+- If an earlier inquiry was already resolved and the customer later asks a materially different informational topic, create a new general_inquiry ticket and set previous_ticket_id to the earlier related ticket when relevant. A short contextual answer such as "one-time", "in UAE", "yes", a name, a date, or a supplied document continues the preceding exchange even when it starts a new source_conversation_id.
 - If the sequence is issue -> inquiry -> issue -> inquiry, keep each distinct issue as its own ticket unless it is the same underlying issue, and group the standalone inquiries together in one inquiry ticket. Preserve the visible message indexes for each inquiry.
+- If a sequence looks like inquiry -> complaint -> fee/policy follow-up but all parts are about the same underlying flow, do not use the inquiry-ticket rule. Keep it as one issue/request ticket and list each question in inquiries.
 - For every inquiry ticket, the inquiries array must track each inquiry separately, including whether that specific inquiry was resolved, pending_unresolved, or totally_unresolved.
 - For issue tickets that contain clarification questions, include those questions in the inquiries array too.
+- For request tickets, the inquiries array should contain only informational questions/clarifications, not action asks. "Can you share/send/update/change/check/provide..." is usually an action ask that belongs in the objective/reason, while "Is it okay that details are blank?" belongs in inquiries.
 
 Resolved vs future follow-up logic:
-- If an inquiry or issue is not resolved, later messages that continue or follow up on it must be appended to the same ticket. Set should_append_future_conversations to true.
-- If an inquiry or issue is resolved, and later the customer raises a new question/request in the same category, create a new ticket with the same ticket_type. Do not merge it into the resolved ticket. Set previous_ticket_id to the earlier resolved ticket id.
-- If the earlier ticket is still pending_unresolved or totally_unresolved, do not create a same-category duplicate ticket for a follow-up. Append the follow-up to the open ticket.
+- For issue/request tickets, if the issue is not resolved and later source conversations continue or follow up on the same underlying issue, append those later messages to the same issue ticket.
+- For issue/request tickets, use the final outcome after the latest related source conversation as the ticket status. Example: refund pending in source conversation 1, then refund rejected in source conversation 2 = one refund ticket with status totally_unresolved; if source conversation 2 confirms refund accepted = one refund ticket with status resolved.
+- For issue/request tickets, if the issue was resolved and later the customer raises a new separate request in the same category, create a new ticket with the same ticket_type and set previous_ticket_id to the earlier resolved ticket id.
+- For inquiry tickets, source_conversation_id does not control ticket boundaries. Group messages by the customer's objective, merge related continuations across source blocks, and use the final visible outcome as the ticket status.
+- Set should_append_future_conversations to true only for tickets whose final status is pending_unresolved. Resolved and totally_unresolved tickets are closed.
 
 Status rules:
 - If a ticket is still waiting for a retry, review, delivery, refund, government step, customer document, bank action, internal action, or future confirmation, status is pending_unresolved.
 - If no usable current state or path remains, status is totally_unresolved.
 - If the customer objective was answered/completed/accepted, status is resolved.
+- For request tickets with multiple action asks, status is resolved only when every material requested action is visibly completed, delivered, accepted, or no longer needed. If the agent only promises to share/check/update later, status is pending_unresolved even if an embedded informational question was answered.
+- Direct-debit stop/recall rule: successful card payment and changing future payments to card do not prove that an already-sent current bank instruction was recalled. Resolve only when the company explicitly confirms that the current direct debit was recalled, cancelled, stopped, withdrawn, or is no longer active. "Forms will be deleted", "payment received by card", or a later thanks about future card setup is insufficient; otherwise keep pending_unresolved.
+- A routing-only company reply that says the number cannot receive/review messages or sends the customer to a different support number is not a real answer/resolution to the customer's objective. Mark it pending_unresolved unless it is merged with a later source conversation that actually answers or completes the same objective.
+- For salary/payment-route issues, a workaround such as "collect it from Ansari this month" resolves only the immediate collection path, not the underlying route issue. If the answer says the next salary/payroll should go to Du Pay, the salary route can switch on the following payroll cycle, or the team will reach out if anything changes, set status=pending_unresolved and should_append_future_conversations=true.
 - For grouped inquiry tickets, the ticket status is resolved only if all listed inquiries are resolved. If any inquiry is pending_unresolved, the ticket status is pending_unresolved. If any inquiry is totally_unresolved and no usable path remains for it, the ticket status is totally_unresolved unless another inquiry is still pending with a clear path.
+- For grouped inquiry tickets, should_append_future_conversations must be true only when the final ticket status is pending_unresolved.
 
 Ticket type should be short snake_case, such as payment_issue, refund_request, document_request, visa_status, eid_delivery, contract_question, cancellation_request, booking_request, complaint, general_inquiry, other.
 
@@ -94,6 +174,8 @@ Required JSON shape:
   "tickets": [
     {
       "ticket_id": "ticket_1",
+      "ticket_category": "issue|request|inquiry",
+      "request_origin": "company|customer",
       "ticket_type": "short_snake_case",
       "customer_objective": "short description",
       "start_message_index": 1,
@@ -112,6 +194,16 @@ Required JSON shape:
           "unresolved_reason": "short reason, or none"
         }
       ],
+            "conversation_summaries": [
+                {
+                    "source_conversation_id": "exact source id",
+                    "message_indexes": [1, 2, 3],
+                    "customer_intent": "short intent in this source conversation",
+                    "outcome": "short outcome or latest state",
+                    "status": "resolved|pending_unresolved|totally_unresolved",
+                    "ticket_signals": ["short_snake_case_signal"]
+                }
+            ],
       "segmentation_reason": "short reason"
     }
   ]
@@ -123,12 +215,16 @@ Do not include markdown, comments, or extra top-level keys."""
 
 
 def _load_ticket_segmentation_system_prompt() -> str:
-    path = Path(__file__).resolve().parent / "correct_prompt_files" / "ticket segmentation prompt.txt"
-    try:
-        value = path.read_text(encoding="utf-8")
-    except OSError:
-        return DEFAULT_TICKET_SEGMENTATION_SYSTEM_PROMPT
-    return value if value.strip() else DEFAULT_TICKET_SEGMENTATION_SYSTEM_PROMPT
+    root = Path(__file__).resolve().parent / "correct_prompt_files"
+    for filename in ("second ticket segmenation prompt.txt", "ticket segmentation prompt.txt"):
+        path = root / filename
+        try:
+            value = path.read_text(encoding="utf-8")
+        except OSError:
+            continue
+        if value.strip():
+            return value
+    return DEFAULT_TICKET_SEGMENTATION_SYSTEM_PROMPT
 
 
 TICKET_SEGMENTATION_SYSTEM_PROMPT = _load_ticket_segmentation_system_prompt()
@@ -138,6 +234,7 @@ DEFAULT_TICKET_SEGMENTATION_OUTPUT_SCHEMA = """{
   "tickets": [
     {
       "ticket_id": "ticket_1",
+      "ticket_category": "issue|request|inquiry",
       "ticket_type": "short_snake_case",
       "customer_objective": "short description",
       "start_message_index": 1,
@@ -156,13 +253,23 @@ DEFAULT_TICKET_SEGMENTATION_OUTPUT_SCHEMA = """{
           "unresolved_reason": "short reason, or none"
         }
       ],
+            "conversation_summaries": [
+                {
+                    "source_conversation_id": "exact source id",
+                    "message_indexes": [1, 2, 3],
+                    "customer_intent": "short intent in this source conversation",
+                    "outcome": "short outcome or latest state",
+                    "status": "resolved|pending_unresolved|totally_unresolved",
+                    "ticket_signals": ["short_snake_case_signal"]
+                }
+            ],
       "segmentation_reason": "short reason"
     }
   ]
 }"""
 
 
-DEFAULT_TICKET_SEGMENTATION_USER_TEMPLATE = """Split this complete customer/contract timeline into ticket-style journeys.
+DEFAULT_TICKET_SEGMENTATION_USER_TEMPLATE = """Split this complete customer/contract timeline into ticket-style journeys. The input JSON groups messages under source_conversation_blocks.
 
 Return strict JSON only using the required schema.
 
@@ -191,6 +298,20 @@ def _default_ticket_segmentation_prompt() -> PromptTemplate:
             DEFAULT_TICKET_SEGMENTATION_USER_TEMPLATE,
         ),
     )
+
+
+TICKET_SEGMENTATION_MODE_SINGLE_PASS = "single_pass"
+TICKET_SEGMENTATION_MODE_CUMULATIVE_SOURCE = "cumulative_source_conversation"
+TICKET_SEGMENTATION_MODE_DEFAULT = TICKET_SEGMENTATION_MODE_CUMULATIVE_SOURCE
+TICKET_SEGMENTATION_MODES = {
+    TICKET_SEGMENTATION_MODE_SINGLE_PASS,
+    TICKET_SEGMENTATION_MODE_CUMULATIVE_SOURCE,
+}
+
+
+def clean_ticket_segmentation_mode(value: Any) -> str:
+    mode = str(value or "").strip().lower()
+    return mode if mode in TICKET_SEGMENTATION_MODES else TICKET_SEGMENTATION_MODE_DEFAULT
 
 
 def extract_json_object(text: str) -> dict:
@@ -906,7 +1027,6 @@ def _classification_from_parts(
     )
 
 
-
 def _score_number(value: Any, minimum: float, maximum: float) -> int | float:
     try:
         num = float(value)
@@ -1329,6 +1449,7 @@ class RunConfig:
     # precedence over ``max_conversations`` — used by the random sampler.
     selected_conversation_ids: Optional[list[str]] = None
     enable_ticket_segmentation: bool = False
+    ticket_segmentation_mode: str = TICKET_SEGMENTATION_MODE_DEFAULT
     # Editable prompts (defaults to the in-memory defaults; the app loads
     # the active prompts from the DB before each run).
     message_prompt: PromptTemplate = field(default_factory=lambda: DEFAULT_MESSAGE_LEVEL_PROMPT)
@@ -1404,7 +1525,13 @@ def _eval_message_level(
         raw = ""
         call_debug: dict[str, Any] = {}
         try:
-            raw, call_debug = chat_completion(client, api, system_prompt, user_prompt)
+            raw, call_debug = chat_completion(
+                client,
+                api,
+                system_prompt,
+                user_prompt,
+                context=f"message_level:{conversation_id}#{target_record.get('message_index')}",
+            )
             if save_raw:
                 record["raw_model_response"] = raw
             try:
@@ -1547,7 +1674,13 @@ def _eval_conversation_level(
         raw = ""
         call_debug: dict[str, Any] = {}
         try:
-            raw, call_debug = chat_completion(client, api, system_prompt, user_prompt)
+            raw, call_debug = chat_completion(
+                client,
+                api,
+                system_prompt,
+                user_prompt,
+                context=f"conversation_level:{conversation_id}",
+            )
             if save_raw:
                 record["raw_model_response"] = raw
             try:
@@ -1628,54 +1761,110 @@ def _eval_conversation_level(
     return record
 
 
+def _ticket_source_record_blocks(records: list[dict]) -> list[dict[str, Any]]:
+    blocks: list[dict[str, Any]] = []
+    current_block: dict[str, Any] | None = None
+    for record in records:
+        source_conversation_id = str(record.get("source_conversation_id") or "unknown").strip() or "unknown"
+        if current_block is None or current_block["source_conversation_id"] != source_conversation_id:
+            current_block = {
+                "source_conversation_id": source_conversation_id,
+                "records": [],
+            }
+            blocks.append(current_block)
+        current_block["records"].append(record)
+    return blocks
+
+
+def ticket_segmentation_call_count_for_records(
+    records: list[dict],
+    segmentation_mode: Any = TICKET_SEGMENTATION_MODE_DEFAULT,
+) -> int:
+    mode = clean_ticket_segmentation_mode(segmentation_mode)
+    if mode == TICKET_SEGMENTATION_MODE_CUMULATIVE_SOURCE:
+        return max(1, len(_ticket_source_record_blocks(records)))
+    return 1
+
+
 def _ticket_segmentation_payload(
     conversation_id: str,
     records: list[dict],
     conversation_metadata: dict,
     truncate_chars: Optional[int],
+    segmentation_context: dict | None = None,
 ) -> dict:
-    messages = []
-    for record in records:
-        text = str(record.get("message_text") or "")
-        if truncate_chars and len(text) > truncate_chars:
-            text = text[:truncate_chars] + "..."
-        messages.append(
+    source_conversation_blocks: list[dict] = []
+    for block in _ticket_source_record_blocks(records):
+        messages: list[dict] = []
+        for record in block.get("records") or []:
+            text = str(record.get("message_text") or "")
+            if truncate_chars and len(text) > truncate_chars:
+                text = text[:truncate_chars] + "..."
+            messages.append(
+                {
+                    "message_index": record.get("message_index"),
+                    "time": record.get("message_time"),
+                    "role": record.get("sender_role"),
+                    "text": text,
+                }
+            )
+        source_conversation_blocks.append(
             {
-                "message_index": record.get("message_index"),
-                "time": record.get("message_time"),
-                "role": record.get("sender_role"),
-                "source_conversation_id": record.get("source_conversation_id"),
-                "text": text,
+                "source_conversation_id": block.get("source_conversation_id") or "unknown",
+                "messages": messages,
             }
         )
-    return {
+    payload = {
         "conversation_id": conversation_id,
         "conversation_metadata": conversation_metadata,
-        "messages": messages,
+        "input_format": "Messages are grouped under source_conversation_blocks. The source_conversation_id is the block header for the messages inside it.",
+        "message_index_rule": "message_index is continuous across the full customer journey and does not reset inside source_conversation_blocks.",
+        "source_conversation_blocks": source_conversation_blocks,
     }
+    if segmentation_context:
+        payload["segmentation_context"] = segmentation_context
+    return payload
 
 
-def _fallback_ticket(records: list[dict], reason: str) -> dict:
-    indexes = [
-        int(record["message_index"])
-        for record in records
-        if record.get("message_index") is not None
-    ]
-    if not indexes:
-        indexes = [1]
-    return {
-        "ticket_id": "ticket_1",
-        "ticket_type": "general_inquiry",
-        "customer_objective": "Original unsplit customer journey",
-        "start_message_index": min(indexes),
-        "end_message_index": max(indexes),
-        "included_message_indexes": indexes,
-        "status": "pending_unresolved",
-        "should_append_future_conversations": True,
-        "previous_ticket_id": "",
-        "inquiries": [],
-        "segmentation_reason": reason,
-    }
+class TicketSegmentationError(RuntimeError):
+    """Ticket segmentation could not produce a real result.
+
+    Raised instead of inventing a ticket. A previous version of this module
+    answered every failure -- connection errors, context-window overflow, an
+    unparseable response -- with a synthetic ticket_category="inquiry",
+    ticket_type="general_inquiry", customer_objective="Original unsplit
+    customer journey" ticket. That is indistinguishable in the UI from a real
+    classification, so a dead API connection looked like a judgement the model
+    had made, and 51 of them accumulated in the logs unnoticed. A failure must
+    surface as a failure.
+    """
+
+
+_TICKET_STATUSES = {"resolved", "pending_unresolved", "totally_unresolved"}
+_TICKET_CATEGORIES = {"issue", "request", "inquiry"}
+_TICKET_REQUEST_ORIGINS = {"company", "customer"}
+
+
+def _clean_ticket_status(value: Any, default: str = "pending_unresolved") -> str:
+    status = str(value or "").strip().lower()
+    return status if status in _TICKET_STATUSES else default
+
+
+def _clean_ticket_category(value: Any, default: str = "") -> str:
+    category = str(value or "").strip().lower()
+    return category if category in _TICKET_CATEGORIES else default
+
+
+def _clean_ticket_request_origin(value: Any, default: str = "customer") -> str:
+    """Which side opened/triggered the ticket's underlying thread.
+
+    Independent of ticket_category: a company-sent reminder or broadcast that
+    the customer later disputes is request_origin=company with
+    ticket_category=issue, since the category still reflects the customer's
+    own objective (the dispute), not who spoke first.
+    """
+    origin = str(value or "").strip().lower()
+    return origin if origin in _TICKET_REQUEST_ORIGINS else default
 
 
 def _normalize_ticket_inquiries(ticket: dict, valid_indexes: set[int]) -> list[dict]:
@@ -1698,9 +1887,7 @@ def _normalize_ticket_inquiries(ticket: dict, valid_indexes: set[int]) -> list[d
                 if message_index in valid_indexes and message_index not in message_indexes:
                     message_indexes.append(message_index)
 
-        status = str(inquiry.get("status") or "").strip().lower()
-        if status not in {"resolved", "pending_unresolved", "totally_unresolved"}:
-            status = "pending_unresolved"
+        status = _clean_ticket_status(inquiry.get("status"))
 
         question = str(inquiry.get("question") or "").strip()
         if not question and not message_indexes:
@@ -1719,25 +1906,304 @@ def _normalize_ticket_inquiries(ticket: dict, valid_indexes: set[int]) -> list[d
     return normalized
 
 
+_TICKET_WORKER_NAME_CONTEXT_RE = re.compile(
+    r"\b([A-Z][A-Za-z'-]{1,}(?:\s+[A-Z][A-Za-z'-]{1,}){0,2})"
+    r"(?=(?:['\u2019]s)?\s+(?:visa|residency|medical|emirates\s+id|eid|passport|salary|contract|onboarding)\b)"
+)
+_TICKET_ROLE_NAME_RE = re.compile(
+    r"\b(?:maid|nanny|worker|helper)\s+"
+    r"([A-Z][A-Za-z'-]{1,}(?:\s+[A-Z][A-Za-z'-]{1,}){0,2})"
+    r"(?=\s*(?:$|[.,;:!?)]|(?:['\u2019]s)?\s+(?:visa|residency|medical|emirates\s+id|eid|passport|salary|contract|onboarding)\b))"
+)
+_TICKET_NAME_STOPWORDS = {
+    "customer",
+    "dear",
+    "domestic",
+    "eid",
+    "emirates",
+    "gdrfa",
+    "helper",
+    "icp",
+    "maid",
+    "medical",
+    "nanny",
+    "residency",
+    "uae",
+    "visa",
+    "worker",
+}
+
+
+def _ticket_worker_name_candidates(ticket: dict, records_by_idx: dict[int, dict]) -> list[str]:
+    texts = [str(ticket.get("customer_objective") or "")]
+    for record in _ticket_records(ticket, records_by_idx):
+        texts.append(str(record.get("message_text") or ""))
+    candidates: set[str] = set()
+    for text in texts:
+        for pattern in (_TICKET_WORKER_NAME_CONTEXT_RE, _TICKET_ROLE_NAME_RE):
+            for match in pattern.finditer(text):
+                candidate = re.sub(r"['\u2019]s$", "", match.group(1).strip(), flags=re.IGNORECASE)
+                words = [word.lower() for word in re.findall(r"[A-Za-z]+", candidate)]
+                if words and not all(word in _TICKET_NAME_STOPWORDS for word in words):
+                    candidates.add(candidate)
+    return sorted(candidates, key=len, reverse=True)
+
+
+_TICKET_ROLE_TOKEN_RUN_RE = re.compile(
+    r"\b(?:the\s+)?(?:maid|nanny|worker|helper)"
+    r"(?:\s+(?:the\s+)?(?:maid|nanny|worker|helper))+"
+    r"(['\u2019]s)?",
+    flags=re.IGNORECASE,
+)
+
+
+def _collapse_role_token_runs(text: str) -> str:
+    """Collapse ``the maid maid's`` / ``maid the maid`` runs into one role token.
+
+    These runs come from stacked name substitution here and from inconsistently
+    anonymized source transcripts, so normalize them regardless of origin.
+    """
+    return _TICKET_ROLE_TOKEN_RUN_RE.sub(
+        lambda match: "the maid's" if match.group(1) else "the maid",
+        text,
+    )
+
+
+def _sanitize_ticket_customer_objective(ticket: dict, records_by_idx: dict[int, dict]) -> str:
+    objective = re.sub(r"\s+", " ", str(ticket.get("customer_objective") or "")).strip()
+    for name in _ticket_worker_name_candidates(ticket, records_by_idx):
+        escaped = re.escape(name)
+        objective = re.sub(
+            rf"\s+for\s+(?:the\s+)?(?:maid|nanny|worker|helper)\s+{escaped}\b",
+            "",
+            objective,
+            flags=re.IGNORECASE,
+        )
+        objective = re.sub(rf"\b{escaped}['\u2019]s\b", "the maid's", objective, flags=re.IGNORECASE)
+        objective = re.sub(rf"\b{escaped}\b", "the maid", objective, flags=re.IGNORECASE)
+    objective = _collapse_role_token_runs(objective)
+    return re.sub(r"\s+", " ", objective).strip(" ,.;:-")
+
+
+def _sanitize_ticket_type_names(ticket: dict, records_by_idx: dict[int, dict]) -> str:
+    ticket_type = re.sub(r"[^a-z0-9_]+", "_", str(ticket.get("ticket_type") or "other").strip().lower())
+    for name in _ticket_worker_name_candidates(ticket, records_by_idx):
+        name_token = re.sub(r"[^a-z0-9]+", "_", name.lower()).strip("_")
+        if name_token:
+            ticket_type = re.sub(rf"(?:^|_){re.escape(name_token)}(?=_|$)", "_", ticket_type)
+    return re.sub(r"_+", "_", ticket_type).strip("_") or "other"
+
+
+def _ticket_records(ticket: dict, records_by_idx: dict[int, dict]) -> list[dict]:
+    records: list[dict] = []
+    for value in ticket.get("included_message_indexes") or []:
+        try:
+            record = records_by_idx.get(int(value))
+        except (TypeError, ValueError):
+            record = None
+        if record:
+            records.append(record)
+    return records
+
+
+def _records_by_message_index(records: list[dict]) -> dict[int, dict]:
+    return {
+        int(record["message_index"]): record
+        for record in records
+        if record.get("message_index") is not None
+    }
+
+
+def _ticket_index_list(ticket: dict) -> list[int]:
+    indexes: list[int] = []
+    for value in ticket.get("included_message_indexes") or []:
+        try:
+            index = int(value)
+        except (TypeError, ValueError):
+            continue
+        if index not in indexes:
+            indexes.append(index)
+    return sorted(indexes)
+
+
+def _ticket_append_future_for_status(status: str) -> bool:
+    return _clean_ticket_status(status) == "pending_unresolved"
+
+
+def _renumber_tickets(tickets: list[dict]) -> list[dict]:
+    id_map: dict[str, str] = {}
+    for idx, ticket in enumerate(tickets, start=1):
+        old_id = str(ticket.get("ticket_id") or "").strip()
+        new_id = f"ticket_{idx}"
+        if old_id:
+            id_map[old_id] = new_id
+        ticket["ticket_id"] = new_id
+    valid_ticket_ids = {str(ticket.get("ticket_id") or "") for ticket in tickets}
+    for ticket in tickets:
+        previous_id = str(ticket.get("previous_ticket_id") or "").strip()
+        if previous_id in id_map:
+            ticket["previous_ticket_id"] = id_map[previous_id]
+            previous_id = str(ticket.get("previous_ticket_id") or "").strip()
+        if previous_id == str(ticket.get("ticket_id") or "") or (
+            previous_id and previous_id not in valid_ticket_ids
+        ):
+            ticket["previous_ticket_id"] = ""
+    return tickets
+
+
+def _copy_inquiry_for_indexes(inquiry: dict, included_indexes: set[int], inquiry_number: int) -> dict | None:
+    message_indexes: list[int] = []
+    for value in inquiry.get("message_indexes") or []:
+        try:
+            message_index = int(value)
+        except (TypeError, ValueError):
+            continue
+        if message_index in included_indexes and message_index not in message_indexes:
+            message_indexes.append(message_index)
+    if not message_indexes:
+        return None
+    return {
+        **inquiry,
+        "inquiry_id": f"inquiry_{inquiry_number}",
+        "message_indexes": sorted(message_indexes),
+        "status": _clean_ticket_status(inquiry.get("status")),
+    }
+
+
+def _filter_inquiries_for_indexes(ticket: dict, included_indexes: list[int]) -> list[dict]:
+    included_set = {int(value) for value in included_indexes}
+    filtered: list[dict] = []
+    for inquiry in ticket.get("inquiries") or []:
+        if not isinstance(inquiry, dict):
+            continue
+        copied = _copy_inquiry_for_indexes(inquiry, included_set, len(filtered) + 1)
+        if copied is not None:
+            filtered.append(copied)
+    return filtered
+
+
+def _dedupe_ticket_conversation_summaries(summaries: list[dict]) -> list[dict]:
+    deduped: list[dict] = []
+    by_source: dict[str, dict] = {}
+    for summary in summaries:
+        if not isinstance(summary, dict):
+            continue
+        source_id = str(summary.get("source_conversation_id") or "").strip()
+        if not source_id:
+            continue
+        indexes = sorted(
+            {
+                int(value)
+                for value in summary.get("message_indexes") or []
+                if str(value).strip().lstrip("-").isdigit()
+            }
+        )
+        if not indexes:
+            continue
+        cleaned = {
+            "source_conversation_id": source_id,
+            "message_indexes": indexes,
+            "customer_intent": str(summary.get("customer_intent") or "").strip(),
+            "outcome": str(summary.get("outcome") or "").strip(),
+            "status": _clean_ticket_status(summary.get("status")),
+            "ticket_signals": list(
+                dict.fromkeys(
+                    str(value).strip().lower()
+                    for value in summary.get("ticket_signals") or []
+                    if str(value).strip()
+                )
+            ),
+        }
+        existing = by_source.get(source_id)
+        if existing is None:
+            by_source[source_id] = cleaned
+            deduped.append(cleaned)
+            continue
+        existing["message_indexes"] = sorted(set(existing["message_indexes"]) | set(indexes))
+        if cleaned["customer_intent"]:
+            existing["customer_intent"] = cleaned["customer_intent"]
+        if cleaned["outcome"]:
+            existing["outcome"] = cleaned["outcome"]
+        existing["status"] = cleaned["status"]
+        existing["ticket_signals"] = list(
+            dict.fromkeys([*existing.get("ticket_signals", []), *cleaned["ticket_signals"]])
+        )
+    return deduped
+
+
+def _normalize_ticket_conversation_summaries(
+    ticket: dict,
+    included_indexes: list[int],
+    records_by_idx: dict[int, dict],
+) -> list[dict]:
+    included_set = {int(value) for value in included_indexes}
+    normalized: list[dict] = []
+    for summary in ticket.get("conversation_summaries") or []:
+        if not isinstance(summary, dict):
+            continue
+        grouped_indexes: dict[str, list[int]] = {}
+        for value in summary.get("message_indexes") or []:
+            try:
+                message_index = int(value)
+            except (TypeError, ValueError):
+                continue
+            if message_index not in included_set:
+                continue
+            record = records_by_idx.get(message_index) or {}
+            source_id = str(record.get("source_conversation_id") or "").strip()
+            if not source_id:
+                source_id = str(summary.get("source_conversation_id") or "").strip()
+            if source_id:
+                grouped_indexes.setdefault(source_id, []).append(message_index)
+        for source_id, message_indexes in grouped_indexes.items():
+            normalized.append(
+                {
+                    **summary,
+                    "source_conversation_id": source_id,
+                    "message_indexes": sorted(set(message_indexes)),
+                }
+            )
+    return _dedupe_ticket_conversation_summaries(normalized)
+
+
+def _filter_conversation_summaries_for_indexes(ticket: dict, included_indexes: list[int]) -> list[dict]:
+    included_set = {int(value) for value in included_indexes}
+    filtered: list[dict] = []
+    for summary in ticket.get("conversation_summaries") or []:
+        if not isinstance(summary, dict):
+            continue
+        message_indexes = sorted(
+            {
+                int(value)
+                for value in summary.get("message_indexes") or []
+                if str(value).strip().lstrip("-").isdigit() and int(value) in included_set
+            }
+        )
+        if message_indexes:
+            filtered.append({**summary, "message_indexes": message_indexes})
+    return _dedupe_ticket_conversation_summaries(filtered)
+
+
 def _normalize_ticket_segments(obj: dict, records: list[dict]) -> list[dict]:
+    """Normalize raw LLM ticket JSON into the canonical ticket list.
+
+    ``records`` scopes index validity (``valid_indexes``) and lets a
+    message_index be resolved back to its source record; it must stay the full
+    cumulative history in cumulative-segmentation mode so carried-forward
+    tickets referencing older indexes remain resolvable.
+    """
     valid_indexes = {
         int(record["message_index"])
         for record in records
         if record.get("message_index") is not None
     }
     if not valid_indexes:
-        return [_fallback_ticket(records, "No usable message indexes were available.")]
-    material_indexes = {
-        int(record["message_index"])
-        for record in records
-        if record.get("message_index") is not None
-        and str(record.get("sender_role") or "").strip().lower() in {"customer", "agent"}
-        and str(record.get("message_text") or "").strip()
-    }
+        raise TicketSegmentationError("No usable message indexes were available.")
+    records_by_idx = _records_by_message_index(records)
 
     raw_tickets = obj.get("tickets") if isinstance(obj, dict) else None
     if not isinstance(raw_tickets, list) or not raw_tickets:
-        return [_fallback_ticket(records, "Ticket segmentation returned no tickets.")]
+        raise TicketSegmentationError("Ticket segmentation returned no tickets.")
 
     normalized: list[dict] = []
     for idx, ticket in enumerate(raw_tickets, start=1):
@@ -1765,52 +2231,367 @@ def _normalize_ticket_segments(obj: dict, records: list[dict]) -> list[dict]:
         if not included:
             continue
 
-        status = str(ticket.get("status") or "").strip().lower()
-        if status not in {"resolved", "pending_unresolved", "totally_unresolved"}:
-            status = "pending_unresolved"
+        status = _clean_ticket_status(ticket.get("status"))
 
         ticket_type = re.sub(r"[^a-z0-9_]+", "_", str(ticket.get("ticket_type") or "other").strip().lower())
         ticket_type = re.sub(r"_+", "_", ticket_type).strip("_") or "other"
         included = sorted(included)
-        normalized.append(
-            {
+        normalized_ticket = {
                 "ticket_id": str(ticket.get("ticket_id") or f"ticket_{idx}").strip() or f"ticket_{idx}",
+                "ticket_category": _clean_ticket_category(ticket.get("ticket_category")),
+                "model_ticket_category": _clean_ticket_category(ticket.get("ticket_category")),
+                "request_origin": _clean_ticket_request_origin(ticket.get("request_origin")),
                 "ticket_type": ticket_type,
                 "customer_objective": str(ticket.get("customer_objective") or "").strip(),
                 "start_message_index": min(included),
                 "end_message_index": max(included),
                 "included_message_indexes": included,
                 "status": status,
-                "should_append_future_conversations": bool(ticket.get("should_append_future_conversations", status != "resolved")),
+                "should_append_future_conversations": _ticket_append_future_for_status(status),
                 "previous_ticket_id": str(ticket.get("previous_ticket_id") or "").strip(),
                 "inquiries": _normalize_ticket_inquiries(ticket, valid_indexes),
+                "conversation_summaries": _normalize_ticket_conversation_summaries(
+                    ticket,
+                    included,
+                    records_by_idx,
+                ),
                 "segmentation_reason": str(ticket.get("segmentation_reason") or "").strip(),
+        }
+        normalized.append(normalized_ticket)
+
+    if not normalized:
+        raise TicketSegmentationError("Ticket segmentation produced only invalid tickets.")
+
+    # Segmentation decisions belong to the prompt, not to this module.
+    #
+    # This function used to run ~35 heuristic passes here (four splitters and
+    # roughly thirty merge calls) that re-decided which messages formed a
+    # ticket and overrode the model's ticket_category and status, plus a
+    # coverage-ratio check that threw away the model's entire ticket list when
+    # it covered less than 75% of the "material" messages. That gave the
+    # pipeline two competing sources of truth, and the heuristics silently won.
+    #
+    # They were keyed on generic vocabulary, so they collapsed correct output.
+    # Verified example: the model correctly returned a foot-x-ray insurance
+    # ticket and a separate maid-replacement inquiry. Both were classified as
+    # "visa lifecycle" tickets -- one because an agent's boilerplate mentioned
+    # a "discounted maid visa plan", the other on clinic/medical wording -- and
+    # merged into one ticket because a followup regex matched the word "fees"
+    # in a price list. The prompt said to keep them apart; the code did not.
+    #
+    # Everything below is plumbing only: assign sequential ids and order the
+    # list. It must not add, remove, merge, split, or re-label a ticket. If
+    # segmentation is wrong, fix the prompt.
+    # The one exception is redaction, which is a privacy control rather than a
+    # segmentation decision: a worker's real name must never reach a ticket_type
+    # or customer_objective. These strip names only; they never change which
+    # messages belong to a ticket, nor its category or status.
+    normalized = _renumber_tickets(
+        sorted(normalized, key=lambda ticket: int(ticket.get("start_message_index") or 0))
+    )
+    for ticket in normalized:
+        ticket["customer_objective"] = _sanitize_ticket_customer_objective(ticket, records_by_idx)
+        ticket["ticket_type"] = _sanitize_ticket_type_names(ticket, records_by_idx)
+        ticket["conversation_summaries"] = _filter_conversation_summaries_for_indexes(
+            ticket,
+            _ticket_index_list(ticket),
+        )
+    return normalized
+
+
+def _ticket_prompt_context(tickets: list[dict], records: list[dict] | None = None) -> dict:
+    compact_tickets: list[dict] = []
+    keep_keys = (
+        "ticket_id",
+        "ticket_category",
+        "request_origin",
+        "ticket_type",
+        "customer_objective",
+        "start_message_index",
+        "end_message_index",
+        "included_message_indexes",
+        "status",
+        "should_append_future_conversations",
+        "previous_ticket_id",
+        "inquiries",
+        "conversation_summaries",
+        "segmentation_reason",
+    )
+    records_by_idx = _records_by_message_index(records or [])
+    for ticket in tickets or []:
+        if not isinstance(ticket, dict):
+            continue
+        compact = {key: ticket.get(key) for key in keep_keys if key in ticket}
+        source_ids: list[str] = []
+        for value in ticket.get("included_message_indexes") or []:
+            try:
+                record = records_by_idx.get(int(value))
+            except (TypeError, ValueError):
+                record = None
+            source_id = str((record or {}).get("source_conversation_id") or "").strip()
+            if source_id and source_id not in source_ids:
+                source_ids.append(source_id)
+        if source_ids:
+            compact["source_conversation_ids"] = source_ids
+        compact_tickets.append(compact)
+    return {"tickets": compact_tickets}
+
+
+def _eval_ticket_segmentation_once(
+    client,
+    api: APIConfig,
+    conversation_id: str,
+    records: list[dict],
+    conversation_metadata: dict,
+    truncate_chars: Optional[int],
+    ticket_prompt: PromptTemplate | None = None,
+    segmentation_context: dict | None = None,
+    normalization_records: list[dict] | None = None,
+) -> tuple[list[dict], dict | None]:
+    payload = _ticket_segmentation_payload(
+        conversation_id,
+        records,
+        conversation_metadata,
+        truncate_chars,
+        segmentation_context,
+    )
+    tpl = ticket_prompt or _default_ticket_segmentation_prompt()
+    call_context = f"ticket_segmentation:{conversation_id}"
+    if segmentation_context:
+        pass_label = f"{segmentation_context.get('pass_index')}/{segmentation_context.get('total_passes')}"
+        source_label = segmentation_context.get("current_source_conversation_id")
+        call_context = f"{call_context}:pass{pass_label}:{source_label}"
+    raw, debug = chat_completion(
+        client,
+        api,
+        tpl.build_system(),
+        tpl.build_user(payload),
+        context=call_context,
+    )
+    obj = extract_json_object(raw)
+    return _normalize_ticket_segments(obj, normalization_records or records), {
+        "raw_model_response": raw,
+        "debug": debug,
+    }
+
+
+def _carry_forward_missing_previous_tickets(
+    previous_tickets: list[dict] | None,
+    current_tickets: list[dict],
+    records: list[dict],
+) -> list[dict]:
+    """Restore previous-ticket indexes the latest cumulative pass silently dropped.
+
+    Each cumulative pass is asked to re-emit the complete ticket list, but it
+    only sees a compact summary of earlier tickets, not their original text —
+    so it can drop indexes from an old ticket while otherwise faithfully
+    preserving it. The original version of this function only restored a
+    previous ticket when it disappeared *entirely*; a ticket that lost only
+    some of its indexes looked "handled" and the missing indexes were gone for
+    good. This restores exactly the missing remainder as a fragment when the
+    loss is partial, and the whole ticket when the loss is total.
+    """
+    if not previous_tickets:
+        return current_tickets
+    returned_indexes: set[int] = set()
+    for ticket in current_tickets or []:
+        for value in ticket.get("included_message_indexes") or []:
+            try:
+                returned_indexes.add(int(value))
+            except (TypeError, ValueError):
+                continue
+
+    carried: list[dict] = []
+    for ticket in previous_tickets:
+        ticket_indexes: set[int] = set()
+        for value in ticket.get("included_message_indexes") or []:
+            try:
+                ticket_indexes.add(int(value))
+            except (TypeError, ValueError):
+                continue
+        if not ticket_indexes:
+            continue
+        missing_indexes = sorted(ticket_indexes - returned_indexes)
+        if not missing_indexes:
+            continue
+        if len(missing_indexes) == len(ticket_indexes):
+            carried.append(dict(ticket))
+            continue
+        original_id = str(ticket.get("ticket_id") or "").strip()
+        fragment = {
+            **ticket,
+            "ticket_id": f"{original_id}::carried" if original_id else "ticket_carried_fragment",
+            "included_message_indexes": missing_indexes,
+            "start_message_index": min(missing_indexes),
+            "end_message_index": max(missing_indexes),
+            "inquiries": _filter_inquiries_for_indexes(ticket, missing_indexes),
+            "conversation_summaries": _filter_conversation_summaries_for_indexes(ticket, missing_indexes),
+            "previous_ticket_id": str(ticket.get("previous_ticket_id") or "").strip(),
+            "segmentation_reason": " ".join(
+                part
+                for part in [
+                    str(ticket.get("segmentation_reason") or "").strip(),
+                    "Carried forward: partially dropped from the previous cumulative pass's re-statement.",
+                ]
+                if part
+            ),
+        }
+        carried.append(fragment)
+
+    if not carried:
+        return current_tickets
+    return _normalize_ticket_segments({"tickets": [*carried, *current_tickets]}, records)
+
+
+def _carry_forward_previous_conversation_summaries(
+    previous_tickets: list[dict] | None,
+    current_tickets: list[dict],
+) -> list[dict]:
+    if not previous_tickets:
+        return current_tickets
+    for current in current_tickets:
+        current_indexes = set(_ticket_index_list(current))
+        if not current_indexes:
+            continue
+        prior_summaries: list[dict] = []
+        for previous in previous_tickets:
+            if not (current_indexes & set(_ticket_index_list(previous))):
+                continue
+            prior_summaries.extend(
+                _filter_conversation_summaries_for_indexes(previous, sorted(current_indexes))
+            )
+        current["conversation_summaries"] = _dedupe_ticket_conversation_summaries(
+            [*prior_summaries, *(current.get("conversation_summaries") or [])]
+        )
+    return current_tickets
+
+
+def _eval_ticket_segmentation_cumulative(
+    client,
+    api: APIConfig,
+    conversation_id: str,
+    records: list[dict],
+    conversation_metadata: dict,
+    truncate_chars: Optional[int],
+    ticket_prompt: PromptTemplate | None = None,
+    cancel_requested: Optional[Callable[[], bool]] = None,
+) -> tuple[list[dict], dict | None]:
+    blocks = _ticket_source_record_blocks(records)
+    if not blocks:
+        raise TicketSegmentationError("Ticket segmentation received no visible records.")
+
+    prefix_records: list[dict] = []
+    previous_tickets: list[dict] | None = None
+    last_debug: dict | None = None
+    pass_summaries: list[dict[str, Any]] = []
+    processed_source_ids: list[str] = []
+    pass_errors: list[dict[str, Any]] = []
+    total_passes = len(blocks)
+
+    for pass_index, block in enumerate(blocks, start=1):
+        if cancel_requested and cancel_requested():
+            final_debug = dict(last_debug or {})
+            final_debug["segmentation_mode"] = TICKET_SEGMENTATION_MODE_CUMULATIVE_SOURCE
+            final_debug["cumulative_pass_count"] = total_passes
+            final_debug["cumulative_passes"] = pass_summaries
+            final_debug["cancelled"] = True
+            final_debug["cancelled_before_pass"] = pass_index
+            final_debug["failed_passes"] = pass_errors
+            return previous_tickets or [], final_debug
+
+        previous_prefix_records = list(prefix_records)
+        block_records = list(block.get("records") or [])
+        prefix_records.extend(block_records)
+        source_id = str(block.get("source_conversation_id") or "unknown").strip() or "unknown"
+        context: dict[str, Any] = {
+            "segmentation_mode": TICKET_SEGMENTATION_MODE_CUMULATIVE_SOURCE,
+            "instruction": (
+                "This is a conversation-by-conversation cumulative pass. The payload contains only the "
+                "current source_conversation_id block, not the full prior transcript. Use "
+                "previous_cumulative_ticket_output as the summary/current ticket map from earlier source "
+                "conversations, then append, reopen, update, merge, or create tickets using the current "
+                "source conversation. Return the complete ticket list for all processed source conversations, "
+                "not only the current source conversation."
+            ),
+            "pass_index": pass_index,
+            "total_passes": total_passes,
+            "current_source_conversation_id": source_id,
+            "processed_previous_source_conversation_ids": list(processed_source_ids),
+            "previous_cumulative_ticket_output": (
+                _ticket_prompt_context(previous_tickets, previous_prefix_records)
+                if previous_tickets is not None else None
+            ),
+        }
+        try:
+            tickets, debug = _eval_ticket_segmentation_once(
+                client,
+                api,
+                conversation_id,
+                block_records,
+                conversation_metadata,
+                truncate_chars,
+                ticket_prompt,
+                context,
+                normalization_records=prefix_records,
+            )
+        except Exception as exc:
+            # This pass produced nothing. Never invent a ticket for the block:
+            # a synthetic ticket is indistinguishable from a real one in the UI,
+            # so a dead connection reads as a segmentation decision. Keep the
+            # tickets earlier passes really produced, record the failure, and
+            # leave this block's messages genuinely unsegmented.
+            pass_errors.append(
+                {
+                    "pass_index": pass_index,
+                    "source_conversation_id": source_id,
+                    "message_indexes": [
+                        record.get("message_index") for record in block_records
+                    ],
+                    "error": str(exc),
+                }
+            )
+            pass_summaries.append(
+                {
+                    "pass_index": pass_index,
+                    "total_passes": total_passes,
+                    "current_source_conversation_id": source_id,
+                    "current_message_count": len(block_records),
+                    "failed": True,
+                    "error": str(exc),
+                }
+            )
+            processed_source_ids.append(source_id)
+            last_debug = {"error": str(exc)}
+            continue
+        tickets = _carry_forward_previous_conversation_summaries(previous_tickets, tickets)
+        tickets = _carry_forward_missing_previous_tickets(previous_tickets, tickets, prefix_records)
+        previous_tickets = tickets
+        last_debug = debug
+        processed_source_ids.append(source_id)
+        pass_summaries.append(
+            {
+                "pass_index": pass_index,
+                "total_passes": total_passes,
+                "current_source_conversation_id": source_id,
+                "processed_previous_source_conversation_ids": list(processed_source_ids[:-1]),
+                "current_message_count": len(block_records),
+                "cumulative_message_count": len(prefix_records),
+                "ticket_count": len(tickets),
+                "raw_response_chars": len(str((debug or {}).get("raw_model_response") or "")),
             }
         )
 
-    if not normalized:
-        return [_fallback_ticket(records, "Ticket segmentation produced only invalid tickets.")]
-
-    if material_indexes:
-        covered_indexes: set[int] = set()
-        for ticket in normalized:
-            covered_indexes.update(int(value) for value in ticket["included_message_indexes"])
-        covered_material = covered_indexes & material_indexes
-        coverage_ratio = len(covered_material) / max(len(material_indexes), 1)
-        if len(material_indexes) >= 10 and coverage_ratio < 0.75:
-            missing_count = len(material_indexes) - len(covered_material)
-            return [
-                _fallback_ticket(
-                    records,
-                    (
-                        "Ticket segmentation omitted too much of the visible journey "
-                        f"({missing_count} of {len(material_indexes)} material messages), "
-                        "so the original journey was kept intact."
-                    ),
-                )
-            ]
-
-    return normalized
+    final_debug = dict(last_debug or {})
+    final_debug["segmentation_mode"] = TICKET_SEGMENTATION_MODE_CUMULATIVE_SOURCE
+    final_debug["cumulative_pass_count"] = total_passes
+    final_debug["cumulative_passes"] = pass_summaries
+    final_debug["failed_passes"] = pass_errors
+    if not previous_tickets:
+        raise TicketSegmentationError(
+            "Cumulative ticket segmentation produced no tickets"
+            + (f"; {len(pass_errors)} of {total_passes} passes failed: {pass_errors[0]['error']}" if pass_errors else ".")
+        )
+    return previous_tickets, final_debug
 
 
 def _eval_ticket_segmentation(
@@ -1821,20 +2602,35 @@ def _eval_ticket_segmentation(
     conversation_metadata: dict,
     truncate_chars: Optional[int],
     ticket_prompt: PromptTemplate | None = None,
+    segmentation_mode: Any = TICKET_SEGMENTATION_MODE_DEFAULT,
+    cancel_requested: Optional[Callable[[], bool]] = None,
 ) -> tuple[list[dict], dict | None]:
-    payload = _ticket_segmentation_payload(
+    mode = clean_ticket_segmentation_mode(segmentation_mode)
+    if mode == TICKET_SEGMENTATION_MODE_CUMULATIVE_SOURCE:
+        return _eval_ticket_segmentation_cumulative(
+            client,
+            api,
+            conversation_id,
+            records,
+            conversation_metadata,
+            truncate_chars,
+            ticket_prompt,
+            cancel_requested=cancel_requested,
+        )
+    if cancel_requested and cancel_requested():
+        return [], {
+            "cancelled": True,
+            "segmentation_mode": TICKET_SEGMENTATION_MODE_SINGLE_PASS,
+        }
+    return _eval_ticket_segmentation_once(
+        client,
+        api,
         conversation_id,
         records,
         conversation_metadata,
         truncate_chars,
+        ticket_prompt,
     )
-    tpl = ticket_prompt or _default_ticket_segmentation_prompt()
-    raw, debug = chat_completion(client, api, tpl.build_system(), tpl.build_user(payload))
-    obj = extract_json_object(raw)
-    return _normalize_ticket_segments(obj, records), {
-        "raw_model_response": raw,
-        "debug": debug,
-    }
 
 
 def preview_ticket_segmentation(
@@ -1845,6 +2641,8 @@ def preview_ticket_segmentation(
     conversation_metadata: dict,
     truncate_chars: Optional[int] = None,
     ticket_prompt: PromptTemplate | None = None,
+    segmentation_mode: Any = TICKET_SEGMENTATION_MODE_DEFAULT,
+    cancel_requested: Optional[Callable[[], bool]] = None,
 ) -> dict:
     """Run only the ticket segmentation prompt and return normalized preview data."""
     tickets, debug = _eval_ticket_segmentation(
@@ -1855,6 +2653,8 @@ def preview_ticket_segmentation(
         conversation_metadata,
         truncate_chars,
         ticket_prompt,
+        segmentation_mode,
+        cancel_requested=cancel_requested,
     )
     return {
         "conversation_id": conversation_id,
@@ -1882,6 +2682,7 @@ def segment_dataframe_into_ticket_journeys(
     client,
     config: RunConfig,
     on_progress: Optional[Callable[[dict], None]] = None,
+    cancel_requested: Optional[Callable[[], bool]] = None,
 ) -> pd.DataFrame:
     """Split customer timelines into virtual ticket journeys using AI."""
     if df.empty:
@@ -1895,30 +2696,158 @@ def segment_dataframe_into_ticket_journeys(
     out_frames: list[pd.DataFrame] = []
     truncate_chars = config.max_chars_per_message if config.truncate_messages else None
     api = config.ticket_api_config()
+    workers = min(max(1, int(getattr(api, "concurrency", 1) or 1)), len(groups))
+    segmentation_mode = clean_ticket_segmentation_mode(config.ticket_segmentation_mode)
 
-    if on_progress:
-        on_progress({"phase": "ticket_segmentation_start", "total_conversations": len(groups)})
-
+    segmentation_tasks: list[dict[str, Any]] = []
     for group_index, (parent_id, group) in enumerate(groups, start=1):
         parent_id = str(parent_id)
-        records = message_records_from_group(group, parent_id)
-        metadata = conversation_metadata_from_group(group)
+        segmentation_tasks.append(
+            {
+                "group_index": group_index,
+                "parent_id": parent_id,
+                "group": group,
+                "records": message_records_from_group(group, parent_id),
+                "metadata": conversation_metadata_from_group(group),
+            }
+        )
+    planned_ticket_calls = sum(
+        ticket_segmentation_call_count_for_records(task["records"], segmentation_mode)
+        for task in segmentation_tasks
+    )
+
+    if on_progress:
+        on_progress(
+            {
+                "phase": "ticket_segmentation_start",
+                "total_conversations": len(groups),
+                "workers": workers,
+                "segmentation_mode": segmentation_mode,
+                "planned_ticket_calls": planned_ticket_calls,
+            }
+        )
+
+    def run_segmentation_task(task: dict[str, Any]) -> dict[str, Any]:
+        records = task["records"]
+        ticket_calls_used = ticket_segmentation_call_count_for_records(records, segmentation_mode)
+        if cancel_requested and cancel_requested():
+            return {
+                "group_index": task["group_index"],
+                "parent_id": task["parent_id"],
+                "tickets": [],
+                "debug": {"cancelled": True},
+                "failed_reason": "Ticket segmentation cancelled before this customer timeline started.",
+                "ticket_calls_used": 0,
+                "cancelled": True,
+            }
         try:
             tickets, debug = _eval_ticket_segmentation(
                 client,
                 api,
-                parent_id,
+                task["parent_id"],
                 records,
-                metadata,
+                task["metadata"],
                 truncate_chars,
                 config.ticket_prompt,
+                segmentation_mode,
+                cancel_requested=cancel_requested,
             )
             failed_reason = ""
+            # A conversation whose passes partly failed keeps the tickets that
+            # really were produced, but must still report as failed.
+            failed_passes = (debug or {}).get("failed_passes") or []
+            if failed_passes:
+                failed_reason = (
+                    f"{len(failed_passes)} of {(debug or {}).get('cumulative_pass_count') or '?'} "
+                    f"segmentation passes failed: {failed_passes[0].get('error')}"
+                )
         except Exception as exc:
-            tickets = [_fallback_ticket(records, f"Ticket segmentation failed: {exc}")]
+            # No ticket is invented here. The conversation contributes no rows
+            # and is reported as failed.
+            tickets = []
             debug = None
             failed_reason = str(exc)
+        return {
+            "group_index": task["group_index"],
+            "parent_id": task["parent_id"],
+            "tickets": tickets,
+            "debug": debug,
+            "failed_reason": failed_reason,
+            "ticket_calls_used": ticket_calls_used,
+            "cancelled": bool((debug or {}).get("cancelled")),
+        }
 
+    segmentation_results: dict[int, dict[str, Any]] = {}
+    with cf.ThreadPoolExecutor(max_workers=workers) as ex:
+        future_to_task = {
+            ex.submit(run_segmentation_task, task): task
+            for task in segmentation_tasks
+        }
+        completed_count = 0
+        cancellation_seen = False
+        for future in cf.as_completed(future_to_task):
+            task = future_to_task[future]
+            if future.cancelled():
+                continue
+            try:
+                result = future.result()
+            except Exception as exc:  # noqa: BLE001
+                result = {
+                    "group_index": task["group_index"],
+                    "parent_id": task["parent_id"],
+                    "tickets": [],
+                    "debug": None,
+                    "failed_reason": str(exc),
+                    "ticket_calls_used": ticket_segmentation_call_count_for_records(
+                        task["records"],
+                        segmentation_mode,
+                    ),
+                }
+            segmentation_results[int(result["group_index"])] = result
+            if not result.get("cancelled"):
+                completed_count += 1
+            if on_progress:
+                on_progress(
+                    {
+                        "phase": "ticket_segmentation_done",
+                        "conversation_index": result["group_index"],
+                        "completed_conversations": completed_count,
+                        "total_conversations": len(segmentation_tasks),
+                        "conversation_id": result["parent_id"],
+                        "tickets_created": len(result["tickets"]),
+                        "error": result["failed_reason"],
+                        "workers": workers,
+                        "segmentation_mode": segmentation_mode,
+                        "planned_ticket_calls": planned_ticket_calls,
+                        "ticket_calls_used": result.get("ticket_calls_used") or 1,
+                    }
+                )
+            if result.get("cancelled") or (cancel_requested and cancel_requested()):
+                cancellation_seen = True
+                for pending_future in future_to_task:
+                    if pending_future is not future and not pending_future.done():
+                        pending_future.cancel()
+                if on_progress:
+                    on_progress(
+                        {
+                            "phase": "cancelled",
+                            "scope": "ticket_segmentation",
+                            "completed_conversations": completed_count,
+                            "total_conversations": len(segmentation_tasks),
+                        }
+                    )
+
+    for task in segmentation_tasks:
+        if cancellation_seen and int(task["group_index"]) not in segmentation_results:
+            continue
+        group = task["group"]
+        parent_id = task["parent_id"]
+        result = segmentation_results.get(int(task["group_index"]))
+        if not result:
+            continue
+        tickets = result["tickets"]
+        debug = result["debug"]
+        failed_reason = result["failed_reason"]
         group_index_values = pd.to_numeric(group[index_col], errors="coerce")
         for ticket_number, ticket in enumerate(tickets, start=1):
             included = {int(value) for value in ticket["included_message_indexes"]}
@@ -1930,6 +2859,14 @@ def segment_dataframe_into_ticket_journeys(
             ticket_rows[TICKET_JOURNEY_ID_COLUMN] = ticket_journey_id
             ticket_rows["PARENT_JOURNEY_ID"] = parent_id
             ticket_rows["TICKET_ID"] = ticket.get("ticket_id") or f"ticket_{ticket_number}"
+            ticket_rows["TICKET_CATEGORY"] = ticket.get("ticket_category") or "inquiry"
+            ticket_rows["TICKET_MODEL_CATEGORY"] = ticket.get("model_ticket_category") or ""
+            ticket_rows["TICKET_REQUEST_ORIGIN"] = ticket.get("request_origin") or "customer"
+            ticket_rows["TICKET_CATEGORY_DEBUG_JSON"] = json.dumps(
+                ticket.get("ticket_category_debug") or {},
+                ensure_ascii=False,
+                default=str,
+            )
             ticket_rows["TICKET_TYPE"] = ticket.get("ticket_type") or "other"
             ticket_rows["TICKET_STATUS"] = ticket.get("status") or "pending_unresolved"
             ticket_rows["TICKET_OBJECTIVE"] = ticket.get("customer_objective") or ""
@@ -1940,18 +2877,6 @@ def segment_dataframe_into_ticket_journeys(
             if debug and config.save_raw_responses:
                 ticket_rows["TICKET_SEGMENTATION_RAW"] = str(debug.get("raw_model_response") or "")
             out_frames.append(ticket_rows)
-
-        if on_progress:
-            on_progress(
-                {
-                    "phase": "ticket_segmentation_done",
-                    "conversation_index": group_index,
-                    "total_conversations": len(groups),
-                    "conversation_id": parent_id,
-                    "tickets_created": len(tickets),
-                    "error": failed_reason,
-                }
-            )
 
     if not out_frames:
         return df.iloc[0:0].copy()
@@ -1980,6 +2905,10 @@ def _saved_conversations_to_dataframe(existing_conversation_results: list[dict] 
         "ticket_journey_id": "TICKET_JOURNEY_ID",
         "parent_journey_id": "PARENT_JOURNEY_ID",
         "ticket_id": "TICKET_ID",
+        "ticket_category": "TICKET_CATEGORY",
+        "model_ticket_category": "TICKET_MODEL_CATEGORY",
+        "request_origin": "TICKET_REQUEST_ORIGIN",
+        "ticket_category_debug_json": "TICKET_CATEGORY_DEBUG_JSON",
         "ticket_type": "TICKET_TYPE",
         "ticket_status": "TICKET_STATUS",
         "ticket_objective": "TICKET_OBJECTIVE",
@@ -2131,6 +3060,7 @@ def run_evaluation(
             client,
             config,
             on_progress=on_progress,
+            cancel_requested=cancel_requested,
         )
         segmented_input = True
     elif (
@@ -2145,9 +3075,23 @@ def run_evaluation(
                 client,
                 config,
                 on_progress=on_progress,
+                cancel_requested=cancel_requested,
             )
             source_existing_conversation_results = None
             segmented_input = True
+
+    if cancel_requested and cancel_requested():
+        results.finished_at = time.time()
+        if on_progress:
+            on_progress(
+                {
+                    "phase": "cancelled",
+                    "scope": "evaluation",
+                    "total_conversations": 0,
+                }
+            )
+            on_progress({"phase": "done", "total_conversations": 0})
+        return results
 
     sources = _evaluation_sources(source_df, source_existing_conversation_results)
     # Selection precedence: explicit IDs (random sampler) > max_conversations slice.
@@ -2196,7 +3140,12 @@ def run_evaluation(
 
     conv_state: dict[str, dict[str, Any]] = {}
     conv_order: list[str] = []
-    ml_tasks: list[tuple[str, dict, list[dict]]] = []  # (conversation_id, target_record, history)
+    # Keep queued tasks small. Building and retaining one cumulative history
+    # list per target message makes long journeys quadratic in memory (a
+    # 500-message journey holds hundreds of overlapping transcript copies).
+    # Histories are constructed only when a task enters an available worker
+    # slot below, so at most ``workers`` temporary history lists exist.
+    ml_tasks: list[tuple[str, dict]] = []  # (conversation_id, target_record)
     no_target_convs: list[str] = []
 
     for ci, (conversation_id, records, conversation_metadata) in enumerate(sources, start=1):
@@ -2238,8 +3187,7 @@ def run_evaluation(
             continue
 
         for target in targets:
-            history = visible_history_of(records, target["message_index"])
-            ml_tasks.append((conversation_id, target, history))
+            ml_tasks.append((conversation_id, target))
 
     # ---- One shared pool drives everything ---------------------------------
 
@@ -2355,7 +3303,11 @@ def run_evaluation(
                     }
                     continue
 
-                conversation_id, target, history = unscheduled_ml.popleft()
+                conversation_id, target = unscheduled_ml.popleft()
+                history = visible_history_of(
+                    conv_state[conversation_id]["records"],
+                    target["message_index"],
+                )
                 fut = ex.submit(
                     _eval_message_level,
                     client=client,
@@ -2707,7 +3659,7 @@ def run_message_level_repair(
                     conversation_id,
                     ci,
                     target,
-                    visible_history_of(records, target["message_index"]),
+                    records,
                     metadata,
                 )
             )
@@ -2738,19 +3690,33 @@ def run_message_level_repair(
 
     fut_info: dict[cf.Future, dict] = {}
     pending: set[cf.Future] = set()
+
+    def evaluate_repair_target(
+        conversation_id: str,
+        target: dict,
+        records: list[dict],
+        metadata: dict,
+    ) -> dict:
+        return _eval_message_level(
+            client=client,
+            api=config.api,
+            conversation_id=conversation_id,
+            target_record=target,
+            history_records=visible_history_of(records, target["message_index"]),
+            conversation_metadata=metadata,
+            save_raw=config.save_raw_responses,
+            truncate_chars=truncate_chars,
+            prompt=config.message_prompt,
+        )
+
     with cf.ThreadPoolExecutor(max_workers=workers) as ex:
-        for conversation_id, ci, target, history, metadata in tasks:
+        for conversation_id, ci, target, records, metadata in tasks:
             fut = ex.submit(
-                _eval_message_level,
-                client=client,
-                api=config.api,
-                conversation_id=conversation_id,
-                target_record=target,
-                history_records=history,
-                conversation_metadata=metadata,
-                save_raw=config.save_raw_responses,
-                truncate_chars=truncate_chars,
-                prompt=config.message_prompt,
+                evaluate_repair_target,
+                conversation_id,
+                target,
+                records,
+                metadata,
             )
             pending.add(fut)
             fut_info[fut] = {

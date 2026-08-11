@@ -65,6 +65,8 @@ If internal tool names, raw JSON, or system output are visible to the customer, 
 
 If conversation_metadata contains ticket fields, evaluate this payload as one ticket journey, not as the original full customer timeline. Use ticket_objective as the scoped customer objective unless the visible ticket transcript clearly contradicts it. Use ticket_status as segmentation context, not automatic truth: the final handled_status and unhandled_resolution_subtype must still be justified by the ticket transcript and message-level evidence.
 
+For a ticket_type of general_inquiry with ticket_inquiries_json, evaluate each listed material inquiry by its final state in the visible ticket transcript. A grouped inquiry ticket is handled only when every material inquiry is resolved or directly answered. If an earlier inquiry is marked pending_unresolved but a later message in the same ticket clearly answers or resolves that same inquiry, treat it as resolved. If any material inquiry remains pending_unresolved or totally_unresolved at the end, set handled_status to unhandled for the whole ticket and use the matching unhandled_resolution_subtype.
+
 ---
 
 # 2. Identify the Customer Objective First

@@ -51,9 +51,12 @@ def _load_prompt_file(filename: str, fallback: str = "") -> str:
 
 def _default_ticket_segmentation_prompt() -> PromptTemplate:
     return PromptTemplate(
-        system_prompt=_load_prompt_file(
-            "ticket segmentation prompt",
-            "You split a complete customer/contract conversation timeline into ticket-style customer journeys.\n\nRequired schema:\n{output_schema}",
+        system_prompt=(
+            _load_prompt_file("second ticket segmenation prompt", "")
+            or _load_prompt_file(
+                "ticket segmentation prompt",
+                "You split a complete customer/contract conversation timeline into ticket-style customer journeys.\n\nRequired schema:\n{output_schema}",
+            )
         ),
         output_schema=_load_prompt_file("ticket segmentation scheme", '{"tickets":[]}'),
         user_prompt_template=_load_prompt_file(

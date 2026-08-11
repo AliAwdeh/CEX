@@ -2,6 +2,8 @@
   "tickets": [
     {
       "ticket_id": "ticket_1",
+      "ticket_category": "issue|request|inquiry",
+      "request_origin": "company|customer",
       "ticket_type": "short_snake_case",
       "customer_objective": "short description",
       "start_message_index": 1,
@@ -18,6 +20,16 @@
           "status": "resolved|pending_unresolved|totally_unresolved",
           "answer_summary": "short answer or current state",
           "unresolved_reason": "short reason, or none"
+        }
+      ],
+      "conversation_summaries": [
+        {
+          "source_conversation_id": "exact source id",
+          "message_indexes": [1, 2, 3],
+          "customer_intent": "short intent in this source conversation",
+          "outcome": "short outcome or latest state",
+          "status": "resolved|pending_unresolved|totally_unresolved",
+          "ticket_signals": ["short_snake_case_signal"]
         }
       ],
       "segmentation_reason": "short reason"

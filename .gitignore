@@ -29,6 +29,16 @@ htmlcov/
 # Streamlit / local app state
 .streamlit/secrets.toml
 
+# LLM call debug log (may contain real customer data from prompts/responses)
+logs/
+*.jsonl
+
+# Recovered run outputs (contain real customer names/ticket content)
+recovered_runs/
+
+# Local pre-change snapshots of source files (git history is the real backup)
+saved_changes/
+
 # Local SQLite databases and runtime sidecars
 *.db
 *.sqlite

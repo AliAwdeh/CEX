@@ -1,4 +1,4 @@
-Split this complete customer/contract timeline into ticket-style journeys.
+Split this complete customer/contract timeline into ticket-style journeys. The input JSON groups messages under source_conversation_blocks.
 
 Return strict JSON only using the required schema.
 

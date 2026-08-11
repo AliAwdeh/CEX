@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import concurrent.futures as cf
 import json
 import html as html_lib
 import gc
@@ -13,6 +14,7 @@ import re
 import secrets as secrets_lib
 import sqlite3
 import textwrap
+import threading
 import time
 from collections import Counter
 from dataclasses import asdict
@@ -29,8 +31,11 @@ from api_client import APIConfig, DEFAULT_BASE_URL, MAX_CONCURRENCY, build_clien
 from cost_estimator import estimate_run_tokens_and_cost
 from data_loader import (
     JOURNEY_ID_COLUMN,
+    LEGACY_MESSAGE_ORDER_COLUMN,
+    MESSAGE_ORDER_COLUMN,
     METADATA_COLUMNS,
     REQUIRED_COLUMNS,
+    TICKET_JOURNEY_ID_COLUMN,
     conversation_metadata_from_group,
     estimate_call_counts,
     get_conversation_groups,
@@ -42,7 +47,7 @@ from data_loader import (
     summarize_dataframe,
     validate_csv,
 )
-from db import DEFAULT_DB_PATH, Database
+from db import DEFAULT_DB_PATH, SCHEMA, Database
 import evaluator as evaluator_module
 from prompts import (
     DEFAULT_CONVERSATION_LEVEL_PROMPT,
@@ -64,7 +69,6 @@ from exports import (
     build_message_csv_bytes,
 )
 
-evaluator_module = importlib.reload(evaluator_module)
 RunConfig = evaluator_module.RunConfig
 RunResults = evaluator_module.RunResults
 extract_json_object = evaluator_module.extract_json_object
@@ -73,6 +77,26 @@ run_message_level_repair = evaluator_module.run_message_level_repair
 run_conversation_level_only = evaluator_module.run_conversation_level_only
 run_evaluation = evaluator_module.run_evaluation
 validate_conversation_level_result = evaluator_module.validate_conversation_level_result
+TICKET_SEGMENTATION_MODE_SINGLE_PASS = getattr(
+    evaluator_module,
+    "TICKET_SEGMENTATION_MODE_SINGLE_PASS",
+    "single_pass",
+)
+TICKET_SEGMENTATION_MODE_CUMULATIVE_SOURCE = getattr(
+    evaluator_module,
+    "TICKET_SEGMENTATION_MODE_CUMULATIVE_SOURCE",
+    "cumulative_source_conversation",
+)
+TICKET_SEGMENTATION_MODE_DEFAULT = getattr(
+    evaluator_module,
+    "TICKET_SEGMENTATION_MODE_DEFAULT",
+    TICKET_SEGMENTATION_MODE_CUMULATIVE_SOURCE,
+)
+TICKET_SEGMENTATION_MODE_LABELS = {
+    TICKET_SEGMENTATION_MODE_SINGLE_PASS: "Single pass - whole journey once",
+    TICKET_SEGMENTATION_MODE_CUMULATIVE_SOURCE: "Cumulative - current conversation + previous ticket summary",
+}
+LLM_CALL_LOG_PATH = Path(__file__).resolve().parent / "logs" / "llm_calls.jsonl"
 from ui_components import (
     apply_conversation_filters,
     conversation_filters,
@@ -136,8 +160,14 @@ DEFAULT_RUN_SETTINGS = {
     "stop_on_error": False,
     "save_raw_responses": True,
     "enable_ticket_segmentation": False,
+    "ticket_segmentation_mode": TICKET_SEGMENTATION_MODE_DEFAULT,
+    # Off by default: appends every LLM call (system/user prompt, raw
+    # response, reasoning) to logs/llm_calls.jsonl for debugging. Prompts and
+    # responses can contain real customer data, so this must stay an
+    # explicit opt-in, never an always-on default.
+    "debug_log_llm_calls": False,
 }
-DEFAULT_CHOICES_VERSION = 9
+DEFAULT_CHOICES_VERSION = 10
 DEFAULT_DB_SELECTION_VERSION = 3
 ROLE_MASTER = "master"
 ROLE_ACTIVE = "active"
@@ -300,6 +330,9 @@ def _clear_run_derived_caches() -> None:
         "_stats_detail_tables_cache",
         "_conversation_id_map_cache",
         "_selected_conversation_detail_cache",
+        "_ticket_preview_loaded_options_cache",
+        "_ticket_eval_loaded_filter_cache",
+        "_ticket_eval_selected_payload_cache",
     ):
         st.session_state.pop(key, None)
 
@@ -313,6 +346,7 @@ def _init_state() -> None:
         "df_norm": None,
         "csv_summary": None,
         "csv_name": None,
+        "_uploaded_csv_signature": None,
         "run_name": "",
         "available_models": [],
         "models_loaded_at": None,
@@ -341,6 +375,7 @@ def _init_state() -> None:
         "stop_on_error": DEFAULT_RUN_SETTINGS["stop_on_error"],
         "save_raw_responses": DEFAULT_RUN_SETTINGS["save_raw_responses"],
         "enable_ticket_segmentation": DEFAULT_RUN_SETTINGS["enable_ticket_segmentation"],
+        "debug_log_llm_calls": DEFAULT_RUN_SETTINGS["debug_log_llm_calls"],
         # Which side the message-level judge inspects per turn.
         "message_target_role": DEFAULT_EVALUATION_SETTINGS["message_target_role"],
         # When set, the run evaluates ONLY these IDs (random sampler).
@@ -427,13 +462,54 @@ def _init_state() -> None:
         st.session_state["_separate_thinking_effort_version"] = 4
 
 
+def _request_cancel_run() -> None:
+    st.session_state.cancel_flag = True
+    cancel_event = st.session_state.get("_run_cancel_event")
+    if hasattr(cancel_event, "set"):
+        cancel_event.set()
+
+
+def _cancel_requested() -> bool:
+    """Read cancellation safely across Streamlit hot-reload session upgrades."""
+    cancel_event = st.session_state.get("_run_cancel_event")
+    if hasattr(cancel_event, "is_set") and cancel_event.is_set():
+        return True
+    return bool(st.session_state.get("cancel_flag", False))
+
+
+def _new_run_cancel_event() -> threading.Event:
+    cancel_event = threading.Event()
+    st.session_state["_run_cancel_event"] = cancel_event
+    st.session_state.cancel_flag = False
+    return cancel_event
+
+
+def _clear_run_cancel_event(cancel_event: threading.Event | None = None) -> None:
+    current = st.session_state.get("_run_cancel_event")
+    if cancel_event is None or current is cancel_event:
+        st.session_state.pop("_run_cancel_event", None)
+    st.session_state.cancel_flag = False
+
+
 _init_state()
 
 
 # --------- Database singleton ---------
 
 
-DB_CACHE_VERSION = 2
+DB_CACHE_VERSION = 4
+_REQUIRED_RUNTIME_TABLES = {
+    "ticket_preview_runs",
+    "ticket_preview_results",
+    "broadcast_clusters",
+    "broadcast_occurrences",
+    "broadcast_ai_analyses",
+    "bot_issue_clusters",
+    "bot_issue_occurrences",
+    "bot_issue_ai_analyses",
+    "analysis_runs",
+    "analysis_run_items",
+}
 
 
 @st.cache_resource(show_spinner=False)
@@ -454,10 +530,34 @@ def _active_db_path() -> str:
 
 def get_active_db() -> Database:
     db = get_db(_active_db_path(), DB_CACHE_VERSION)
-    if not hasattr(db, "list_ticket_preview_runs"):
+    if not hasattr(db, "list_ticket_preview_runs") or not _db_has_required_runtime_tables(db):
         get_db.clear()
         db = get_db(_active_db_path(), DB_CACHE_VERSION)
+    _ensure_required_runtime_tables(db)
     return db
+
+
+def _db_has_required_runtime_tables(db: Database) -> bool:
+    placeholders = ", ".join("?" for _ in _REQUIRED_RUNTIME_TABLES)
+    try:
+        rows = db._fetchall(
+            f"SELECT name FROM sqlite_master WHERE type='table' AND name IN ({placeholders})",
+            tuple(_REQUIRED_RUNTIME_TABLES),
+        )
+    except sqlite3.Error:
+        return False
+    found = {str(row["name"]) for row in rows}
+    return _REQUIRED_RUNTIME_TABLES.issubset(found)
+
+
+def _ensure_required_runtime_tables(db: Database) -> None:
+    missing_runtime_tables = not _db_has_required_runtime_tables(db)
+    if missing_runtime_tables:
+        with db._lock:
+            db._conn.executescript(SCHEMA)
+        ensure_columns = getattr(db, "_ensure_runtime_columns", None)
+        if callable(ensure_columns):
+            ensure_columns()
 
 
 def _clear_auth_state(*, clear_sensitive_data: bool = False) -> None:
@@ -471,6 +571,8 @@ def _clear_auth_state(*, clear_sensitive_data: bool = False) -> None:
         st.session_state.df_norm = None
         st.session_state.csv_summary = None
         st.session_state.csv_name = None
+        st.session_state._uploaded_csv_signature = None
+        st.session_state.pop("_journey_selector_cache", None)
         st.session_state.run_results = None
         st.session_state.current_run_id = None
         st.session_state.loaded_run_label = None
@@ -853,6 +955,51 @@ def _database_paths_for_reviewer_key_migration() -> list[Path]:
         paths.append(path)
         seen.add(resolved)
     return paths
+
+
+def _database_paths_for_runtime_schema_refresh() -> list[Path]:
+    paths: list[Path] = []
+    seen: set[Path] = set()
+    candidates = [
+        _resolve_db_path(DEFAULT_DB_PATH),
+        _resolve_db_path(REVIEW_DB_PATH),
+        _resolve_db_path(_active_db_path()),
+        *[_resolve_db_path(entry.get("path") or "") for entry in _read_saved_db_paths()],
+        *sorted(Path.cwd().glob("*.db")),
+    ]
+    for path in candidates:
+        try:
+            resolved = path.resolve()
+        except OSError:
+            continue
+        if resolved in seen or not resolved.exists() or resolved.suffix.lower() != ".db":
+            continue
+        paths.append(path)
+        seen.add(resolved)
+    return paths
+
+
+def _refresh_runtime_schema_for_known_databases() -> dict[str, Any]:
+    """Create additive runtime tables on every known local DB file."""
+    refreshed = skipped = errors = 0
+    details: list[dict[str, str]] = []
+    for db_path in _database_paths_for_runtime_schema_refresh():
+        try:
+            db = Database(db_path)
+            _ensure_required_runtime_tables(db)
+            db.close()
+            refreshed += 1
+            details.append({"database": db_path.name, "status": "refreshed"})
+        except Exception as exc:
+            errors += 1
+            details.append({"database": db_path.name, "status": f"error: {exc}"})
+            continue
+    return {
+        "refreshed": refreshed,
+        "skipped": skipped,
+        "errors": errors,
+        "details": details,
+    }
 
 
 def _migrate_reviewer_keys_from_databases_to_local_secrets() -> dict[str, Any]:
@@ -1427,10 +1574,38 @@ def _read_prompt_file(filename: str) -> str:
     return ""
 
 
+def _default_prompt_files_signature() -> tuple[tuple[str, int, int], ...]:
+    """Track prompt-file changes without rewriting default DB rows every rerun."""
+    root = Path(__file__).resolve().parent / "correct_prompt_files"
+    names = (
+        "message prompt",
+        "Message scheme",
+        "message user input",
+        "conversational prompt",
+        "conversational output scheme",
+        "conversational user input",
+        "second ticket segmenation prompt",
+        "ticket segmentation scheme",
+        "ticket segmentation user input",
+    )
+    signature: list[tuple[str, int, int]] = []
+    for name in names:
+        for candidate in (name, f"{name}.txt"):
+            path = root / candidate
+            try:
+                stat = path.stat()
+            except OSError:
+                continue
+            signature.append((candidate, int(stat.st_mtime_ns), int(stat.st_size)))
+            break
+    return tuple(signature)
+
+
 def _default_ticket_segmentation_prompt() -> PromptTemplate:
     return PromptTemplate(
         system_prompt=(
-            _read_prompt_file("ticket segmentation prompt")
+            _read_prompt_file("second ticket segmenation prompt")
+            or _read_prompt_file("ticket segmentation prompt")
             or "You split a complete customer/contract conversation timeline into ticket-style customer journeys.\n\nRequired schema:\n{output_schema}"
         ),
         output_schema=(
@@ -1458,7 +1633,7 @@ def _refresh_default_prompts(db: Database) -> None:
             "conversational user input",
         ),
         "ticket_segmentation": (
-            "ticket segmentation prompt",
+            "second ticket segmenation prompt",
             "ticket segmentation scheme",
             "ticket segmentation user input",
         ),
@@ -1493,11 +1668,60 @@ def _refresh_default_prompts(db: Database) -> None:
 
             if kind == "conversation_level":
                 active = con.execute(
-                    "SELECT id, output_schema FROM prompt_templates WHERE kind=? AND is_active=1 LIMIT 1",
+                    "SELECT id, output_schema, system_prompt FROM prompt_templates WHERE kind=? AND is_active=1 LIMIT 1",
                     (kind,),
                 ).fetchone()
                 active_schema = str(active[1] if active else "")
-                stale_active = "customer_experience" not in active_schema and "cx_issue_severity" in active_schema
+                active_prompt = str(active[2] if active else "")
+                required_conversation_markers = (
+                    "evaluate each listed material inquiry by its final state",
+                )
+                stale_active = (
+                    "customer_experience" not in active_schema and "cx_issue_severity" in active_schema
+                ) or any(marker not in active_prompt for marker in required_conversation_markers)
+                if stale_active:
+                    con.execute("UPDATE prompt_templates SET is_active=0 WHERE kind=?", (kind,))
+                    con.execute(
+                        "UPDATE prompt_templates SET is_active=1, updated_at=? WHERE id=?",
+                        (now, default_id),
+                    )
+            elif kind == "ticket_segmentation":
+                active = con.execute(
+                    "SELECT id, system_prompt, output_schema FROM prompt_templates WHERE kind=? AND is_active=1 LIMIT 1",
+                    (kind,),
+                ).fetchone()
+                active_prompt = str(active[1] if active else "")
+                active_schema = str(active[2] if active else "")
+                required_ticket_markers = (
+                    "CORE PRINCIPLE",
+                    "TICKET CATEGORIES",
+                    "CATEGORY PRIORITY",
+                    "REQUEST ORIGIN",
+                    "TICKET STATUS",
+                    "INQUIRIES",
+                    "MESSAGE ASSIGNMENT",
+                    "ticket_category",
+                    "request_origin",
+                    "source_conversation_blocks",
+                    "message_index is continuous",
+                    "NO OVERLAPPING TICKETS",
+                    "CUMULATIVE SEGMENTATION",
+                    "SERVICE LIFECYCLE RULES",
+                    "LIFECYCLE CLOSURE AND FOLLOW-UP PATTERNS",
+                    "VISA / RESIDENCY LIFECYCLE",
+                    "DOCUMENT / ADMIN REQUESTS",
+                    "REFUNDS",
+                    "PAYMENTS",
+                    "SALARY",
+                    "EMPLOYMENT ONBOARDING",
+                    "STATUS QUESTIONS",
+                    "BROADCASTS",
+                    "OUTPUT FORMAT",
+                )
+                stale_active = (
+                    any(marker not in active_prompt for marker in required_ticket_markers)
+                    or "ticket_category" not in active_schema
+                )
                 if stale_active:
                     con.execute("UPDATE prompt_templates SET is_active=0 WHERE kind=?", (kind,))
                     con.execute(
@@ -1625,6 +1849,7 @@ def _build_api_config() -> APIConfig:
         timeout=float(st.session_state.timeout),
         retries=int(st.session_state.retries),
         concurrency=concurrency,
+        debug_log_calls=bool(st.session_state.get("debug_log_llm_calls", False)),
     )
 
 
@@ -1645,6 +1870,7 @@ def _build_conversation_api_config() -> APIConfig:
         timeout=api.timeout,
         retries=api.retries,
         concurrency=api.concurrency,
+        debug_log_calls=api.debug_log_calls,
     )
 
 
@@ -1669,8 +1895,74 @@ def _build_ticket_api_config() -> APIConfig:
         max_tokens=api.max_tokens,
         timeout=api.timeout,
         retries=api.retries,
+        debug_log_calls=api.debug_log_calls,
         concurrency=api.concurrency,
     )
+
+
+def _ticket_segmentation_mode_options() -> list[str]:
+    return [
+        TICKET_SEGMENTATION_MODE_SINGLE_PASS,
+        TICKET_SEGMENTATION_MODE_CUMULATIVE_SOURCE,
+    ]
+
+
+def _ticket_segmentation_mode_label(mode: str) -> str:
+    return TICKET_SEGMENTATION_MODE_LABELS.get(str(mode), humanize_label(mode))
+
+
+def _clean_ticket_segmentation_mode(mode: Any) -> str:
+    cleaner = getattr(evaluator_module, "clean_ticket_segmentation_mode", None)
+    if callable(cleaner):
+        return str(cleaner(mode))
+    mode = str(mode or "").strip().lower()
+    return mode if mode in _ticket_segmentation_mode_options() else TICKET_SEGMENTATION_MODE_DEFAULT
+
+
+def _ticket_segmentation_call_count_for_records(records: list[dict], mode: Any) -> int:
+    counter = getattr(evaluator_module, "ticket_segmentation_call_count_for_records", None)
+    if callable(counter):
+        return max(1, int(counter(records, mode)))
+    return 1
+
+
+def _estimate_ticket_segmentation_calls_for_df(
+    df: pd.DataFrame,
+    *,
+    max_conversations: int | None,
+    selected_conversation_ids: list[str] | None,
+    mode: Any,
+) -> int:
+    groups = get_conversation_groups(df)
+    if selected_conversation_ids:
+        wanted = {str(value) for value in selected_conversation_ids}
+        groups = [group for group in groups if str(group[0]) in wanted]
+    elif max_conversations is not None:
+        groups = groups[: max(0, int(max_conversations))]
+    total = 0
+    for conversation_id, group in groups:
+        records = message_records_from_group(group, str(conversation_id))
+        total += _ticket_segmentation_call_count_for_records(records, mode)
+    return int(total)
+
+
+def _estimate_ticket_segmentation_calls_for_saved_conversations(
+    conversation_results: list[dict],
+    *,
+    max_conversations: int | None,
+    selected_conversation_ids: list[str] | None,
+    mode: Any,
+) -> int:
+    scoped = _scoped_saved_conversation_results(
+        conversation_results,
+        selected_conversation_ids=selected_conversation_ids,
+        max_conversations=max_conversations,
+    )
+    total = 0
+    for result in scoped:
+        records = _ticket_preview_records_from_transcript(result.get("transcript") or [])
+        total += _ticket_segmentation_call_count_for_records(records, mode)
+    return int(total)
 
 
 def _build_run_config() -> tuple[RunConfig, int | None, int | None]:
@@ -1709,6 +2001,9 @@ def _build_run_config() -> tuple[RunConfig, int | None, int | None]:
             else None
         ),
         enable_ticket_segmentation=bool(st.session_state.enable_ticket_segmentation),
+        ticket_segmentation_mode=_clean_ticket_segmentation_mode(
+            st.session_state.get("ticket_segmentation_mode")
+        ),
         message_prompt=ml_tpl,
         conversation_prompt=cl_tpl,
         ticket_prompt=ticket_tpl,
@@ -2097,7 +2392,7 @@ def _execute_conversation_only_run(
         return
 
     st.session_state.run_in_progress = True
-    st.session_state.cancel_flag = False
+    cancel_event = _new_run_cancel_event()
     st.session_state.progress_log = []
 
     config, _, cl_prompt_id = _build_run_config()
@@ -2134,6 +2429,7 @@ def _execute_conversation_only_run(
         "stop_on_error": config.stop_on_error,
         "save_raw_responses": config.save_raw_responses,
         "enable_ticket_segmentation": config.enable_ticket_segmentation,
+        "ticket_segmentation_mode": config.ticket_segmentation_mode,
         "message_target_role": config.message_target_role,
         "selected_conversation_ids": config.selected_conversation_ids,
         "selected_conversation_count": len(config.selected_conversation_ids or []),
@@ -2202,6 +2498,8 @@ def _execute_conversation_only_run(
                 progress_state["successes"] += 1
             else:
                 progress_state["failures"] += 1
+        elif phase == "cancelled":
+            current_box.warning("Cancellation requested. Saving completed results.")
 
         frac = min(progress_state["calls_done"] / max(total_calls, 1), 1.0) if total_calls > 0 else 0.0
         bar.progress(
@@ -2214,7 +2512,7 @@ def _execute_conversation_only_run(
         st.session_state.progress_log.append(evt)
 
     def cancel_requested() -> bool:
-        return bool(st.session_state.cancel_flag)
+        return cancel_event.is_set()
 
     persistence_errors: list[str] = []
 
@@ -2270,12 +2568,17 @@ def _execute_conversation_only_run(
         st.session_state.run_results = results
         _clear_run_derived_caches()
         persist_completed_results()
+        cancelled = cancel_event.is_set() or _cancel_requested()
         completion_message = (
-            f"Conversation-only evaluation finished. {len(results.conversation_results)} customer journeys processed, "
+            f"Conversation-only evaluation "
+            f"{'cancelled' if cancelled else 'finished'}. "
+            f"{len(results.conversation_results)} customer journeys processed, "
             f"{len(results.message_level_results)} reused message results, "
             f"{len(results.errors)} errors. Saved as run #{run_id}."
         )
-        if results.errors:
+        if cancelled:
+            progress_box.warning(completion_message)
+        elif results.errors:
             progress_box.warning(completion_message)
         else:
             progress_box.success(completion_message)
@@ -2289,7 +2592,7 @@ def _execute_conversation_only_run(
     finally:
         try:
             status = "completed"
-            if st.session_state.cancel_flag:
+            if cancel_event.is_set() or _cancel_requested():
                 status = "cancelled"
             elif results is None:
                 status = "failed"
@@ -2300,7 +2603,7 @@ def _execute_conversation_only_run(
         except Exception:
             pass
         st.session_state.run_in_progress = False
-        st.session_state.cancel_flag = False
+        _clear_run_cancel_event(cancel_event)
 
 
 def _execute_db_source_full_run(
@@ -2335,7 +2638,16 @@ def _execute_db_source_full_run(
         selected_conversation_ids=config.selected_conversation_ids,
         target_role=config.message_target_role,
     )
-    ticket_segmentation_calls = int(estimate["conversations"]) if config.enable_ticket_segmentation else 0
+    ticket_segmentation_calls = (
+        _estimate_ticket_segmentation_calls_for_saved_conversations(
+            source_conversation_results,
+            max_conversations=config.max_conversations,
+            selected_conversation_ids=config.selected_conversation_ids,
+            mode=config.ticket_segmentation_mode,
+        )
+        if config.enable_ticket_segmentation
+        else 0
+    )
     estimate["ticket_segmentation_calls"] = ticket_segmentation_calls
     estimate["total_calls"] = int(estimate["total_calls"]) + ticket_segmentation_calls
     if int(estimate["conversations"] or 0) <= 0:
@@ -2343,7 +2655,7 @@ def _execute_db_source_full_run(
         return
 
     st.session_state.run_in_progress = True
-    st.session_state.cancel_flag = False
+    cancel_event = _new_run_cancel_event()
     st.session_state.progress_log = []
 
     run_config_serializable = {
@@ -2371,6 +2683,7 @@ def _execute_db_source_full_run(
         "stop_on_error": config.stop_on_error,
         "save_raw_responses": config.save_raw_responses,
         "enable_ticket_segmentation": config.enable_ticket_segmentation,
+        "ticket_segmentation_mode": config.ticket_segmentation_mode,
         "message_target_role": config.message_target_role,
         "selected_conversation_ids": config.selected_conversation_ids,
         "selected_conversation_count": len(config.selected_conversation_ids or []),
@@ -2412,11 +2725,15 @@ def _execute_db_source_full_run(
         nonlocal total_conv, total_calls
         phase = evt.get("phase")
         if phase == "ticket_segmentation_start":
+            mode_label = _ticket_segmentation_mode_label(str(evt.get("segmentation_mode") or ""))
+            planned_ticket_calls = int(evt.get("planned_ticket_calls") or evt.get("total_conversations") or 0)
             current_box.info(
-                f"Splitting {evt.get('total_conversations', 0):,} saved DB timelines into ticket journeys..."
+                f"Splitting {evt.get('total_conversations', 0):,} saved DB timelines into ticket journeys "
+                f"with {evt.get('workers', 1):,} concurrent worker(s). "
+                f"Mode: {mode_label}. Planned ticket calls: {planned_ticket_calls:,}."
             )
         elif phase == "ticket_segmentation_done":
-            progress_state["calls_done"] += 1
+            progress_state["calls_done"] += max(1, int(evt.get("ticket_calls_used") or 1))
             if evt.get("error"):
                 progress_state["failures"] += 1
             else:
@@ -2424,7 +2741,8 @@ def _execute_db_source_full_run(
             current_box.info(
                 f"Ticket split {evt.get('conversation_index')}/{evt.get('total_conversations')} - "
                 f"Customer `{evt.get('conversation_id')}` - "
-                f"{evt.get('tickets_created', 0)} ticket(s)"
+                f"{evt.get('tickets_created', 0)} ticket(s) - "
+                f"{int(evt.get('ticket_calls_used') or 1):,} ticket call(s)"
             )
         elif phase == "start":
             total_conv = int(evt.get("total_conversations") or total_conv or 0)
@@ -2463,6 +2781,8 @@ def _execute_db_source_full_run(
                 if evt.get("recovered_after_rerun"):
                     progress_state["recovered"] += 1
                 _show_live_message_rerun(rerun_box, live_reruns, evt)
+        elif phase == "cancelled":
+            current_box.warning("Cancellation requested. Saving completed results.")
 
         frac = min(progress_state["calls_done"] / max(total_calls, 1), 1.0) if total_calls > 0 else 0.0
         bar.progress(
@@ -2478,7 +2798,7 @@ def _execute_db_source_full_run(
         st.session_state.progress_log.append(evt)
 
     def cancel_requested() -> bool:
-        return bool(st.session_state.cancel_flag)
+        return cancel_event.is_set()
 
     persistence_errors: list[str] = []
 
@@ -2534,12 +2854,16 @@ def _execute_db_source_full_run(
         st.session_state._run_results_db_path = _active_db_path()
         _clear_run_derived_caches()
         persist_completed_results()
+        cancelled = cancel_event.is_set() or _cancel_requested()
         completion_message = (
-            f"DB-sourced evaluation finished. {len(results.conversation_results)} customer journeys processed, "
+            f"DB-sourced evaluation {'cancelled' if cancelled else 'finished'}. "
+            f"{len(results.conversation_results)} customer journeys processed, "
             f"{len(results.message_level_results)} message-level calls, "
             f"{len(results.errors)} errors. Saved as run #{run_id}."
         )
-        if results.errors:
+        if cancelled:
+            progress_box.warning(completion_message)
+        elif results.errors:
             progress_box.warning(completion_message)
         else:
             progress_box.success(completion_message)
@@ -2553,7 +2877,7 @@ def _execute_db_source_full_run(
     finally:
         try:
             status = "completed"
-            if st.session_state.cancel_flag:
+            if cancel_event.is_set() or _cancel_requested():
                 status = "cancelled"
             elif results is None:
                 status = "failed"
@@ -2564,7 +2888,7 @@ def _execute_db_source_full_run(
         except Exception:
             pass
         st.session_state.run_in_progress = False
-        st.session_state.cancel_flag = False
+        _clear_run_cancel_event(cancel_event)
 
 
 def _conversation_rerun_filter_ids(
@@ -2796,7 +3120,7 @@ def _execute_full_batch_into_run(
     client = build_client(config.api.base_url, config.api.api_key)
 
     st.session_state.run_in_progress = True
-    st.session_state.cancel_flag = False
+    cancel_event = _new_run_cancel_event()
     st.session_state.progress_log = []
 
     db.mark_run_running(run_id)
@@ -2867,6 +3191,8 @@ def _execute_full_batch_into_run(
                 if event.get("recovered_after_rerun"):
                     progress_state["recovered"] += 1
                 _show_live_message_rerun(rerun_box, live_reruns, event)
+        elif phase == "cancelled":
+            current_box.warning("Cancellation requested. Saving completed results.")
         fraction = min(progress_state["calls"] / max(total_calls, 1), 1.0)
         bar.progress(
             fraction,
@@ -2920,7 +3246,7 @@ def _execute_full_batch_into_run(
             client=client,
             config=config,
             on_progress=on_progress,
-            cancel_requested=lambda: bool(st.session_state.cancel_flag),
+            cancel_requested=cancel_event.is_set,
             on_message_result=save_message,
             on_conversation_result=save_conversation,
             on_error=save_error,
@@ -2930,15 +3256,19 @@ def _execute_full_batch_into_run(
             conversation_ids,
             results.errors,
         )
-        status = "completed" if not results.errors else "completed_with_errors"
+        cancelled = cancel_event.is_set() or _cancel_requested()
+        status = "cancelled" if cancelled else ("completed" if not results.errors else "completed_with_errors")
         counts = db.finish_run_from_saved_results(run_id, status=status)
         _load_saved_run_into_session(db, run_id)
         completion_message = (
-            f"Saved into run #{run_id}. This batch processed "
+            f"Saved into run #{run_id}. This batch "
+            f"{'was cancelled after processing' if cancelled else 'processed'} "
             f"{len(results.conversation_results):,} journeys. The run now contains "
             f"{counts['conversations']:,} journeys and {counts['errors']:,} recorded errors."
         )
-        if results.errors:
+        if cancelled:
+            progress_box.warning(completion_message)
+        elif results.errors:
             progress_box.warning(completion_message)
         else:
             progress_box.success(completion_message)
@@ -2953,7 +3283,7 @@ def _execute_full_batch_into_run(
         )
     finally:
         st.session_state.run_in_progress = False
-        st.session_state.cancel_flag = False
+        _clear_run_cancel_event(cancel_event)
 
 
 def _execute_smart_failed_repair(
@@ -2985,7 +3315,7 @@ def _execute_smart_failed_repair(
     client = build_client(config.api.base_url, config.api.api_key)
 
     st.session_state.run_in_progress = True
-    st.session_state.cancel_flag = False
+    cancel_event = _new_run_cancel_event()
     st.session_state.progress_log = []
 
     total_message_calls = sum(len(indices) for indices in failed_messages.values())
@@ -3076,7 +3406,7 @@ def _execute_smart_failed_repair(
         _show_live_run_failure(failure_box, live_failures, error)
 
     def cancel_requested() -> bool:
-        return bool(st.session_state.cancel_flag)
+        return cancel_event.is_set()
 
     db.mark_run_running(run_id)
     db.append_run_event(
@@ -3169,7 +3499,7 @@ def _execute_smart_failed_repair(
         )
     finally:
         st.session_state.run_in_progress = False
-        st.session_state.cancel_flag = False
+        _clear_run_cancel_event(cancel_event)
 
 
 def _render_db_source_run(
@@ -3438,7 +3768,17 @@ def _render_db_source_run(
         selected_conversation_ids=active_selected_db_ids,
         target_role=target_role,
     )
-    ticket_segmentation_calls = int(estimate["conversations"]) if st.session_state.enable_ticket_segmentation else 0
+    ticket_mode = _clean_ticket_segmentation_mode(st.session_state.get("ticket_segmentation_mode"))
+    ticket_segmentation_calls = (
+        _estimate_ticket_segmentation_calls_for_saved_conversations(
+            source_conversation_results,
+            max_conversations=None if active_selected_db_ids else max_conversations,
+            selected_conversation_ids=active_selected_db_ids,
+            mode=ticket_mode,
+        )
+        if st.session_state.enable_ticket_segmentation
+        else 0
+    )
     estimate["ticket_segmentation_calls"] = ticket_segmentation_calls
     estimate["total_calls"] = int(estimate["total_calls"]) + ticket_segmentation_calls
     st.markdown("### Evaluation estimate")
@@ -3460,6 +3800,7 @@ def _render_db_source_run(
             "Ticket mode is enabled for this loaded DB run. The selected saved journeys are split first, "
             "then the resulting ticket journeys are scored. The estimate is based on the selected saved "
             "journeys before AI splitting; progress updates to the actual ticket count after splitting. "
+            f"Ticket splitting mode: `{_ticket_segmentation_mode_label(ticket_mode)}`. "
             f"Ticket model: `{st.session_state.get('ticket_selected_model') or st.session_state.get('conversation_selected_model') or st.session_state.selected_model}`."
         )
     st.caption(
@@ -3541,7 +3882,7 @@ def _render_db_source_run(
     with cancel_col:
         if st.session_state.run_in_progress:
             if st.button("Cancel run", use_container_width=True):
-                st.session_state.cancel_flag = True
+                _request_cancel_run()
                 st.toast("Cancelling after current call finishes...")
 
     progress_box = st.empty()
@@ -4127,6 +4468,8 @@ def _display_column_name(column: str) -> str:
         "parent_journey_id": "Parent journey ID",
         "ticket_id": "Ticket ID",
         "ticket_label": "Ticket",
+        "ticket_category": "Ticket category",
+        "ticket_request_origin": "Request origin",
         "ticket_type": "Ticket type",
         "ticket_status": "Ticket status",
         "ticket_objective": "Ticket objective",
@@ -4228,6 +4571,8 @@ def _ticket_overview_dataframe(df: pd.DataFrame) -> pd.DataFrame:
             "customer_phone": out.get("customer_phone", pd.Series("", index=out.index)).fillna("").astype(str),
             "customer_name": out.get("customer_name", pd.Series("", index=out.index)).fillna("").astype(str),
             "ticket_label": out.get("ticket_label", pd.Series("", index=out.index)).fillna("").astype(str),
+            "ticket_category": out.get("ticket_category", pd.Series("", index=out.index)).fillna("").astype(str).map(humanize_label),
+            "ticket_request_origin": out.get("ticket_request_origin", pd.Series("", index=out.index)).fillna("").astype(str).map(humanize_label),
             "ticket_type": out.get("ticket_type", pd.Series("", index=out.index)).fillna("").astype(str).map(humanize_label),
             "ticket_status": out.get("ticket_status", pd.Series("", index=out.index)).fillna("").astype(str).map(humanize_label),
             "ticket_previous_ticket_id": out.get("ticket_previous_ticket_id", pd.Series("", index=out.index)).fillna("").astype(str),
@@ -5404,7 +5749,8 @@ def render_sidebar() -> None:
             key="concurrency",
             help=(
                 f"Default: {DEFAULT_EVALUATION_SETTINGS['concurrency']}. "
-                "Number of message-level API calls dispatched in parallel. "
+                "Number of API calls dispatched in parallel, including ticket segmentation, "
+                "message-level evaluation, and conversation-level evaluation. "
                 "Lower this if the API returns 503s, rate limits, or timeouts."
             ),
         )
@@ -5452,11 +5798,26 @@ def render_sidebar() -> None:
             key="enable_ticket_segmentation",
             help=(
                 "Optional. Before scoring, ask AI to split each selected CSV or saved-DB timeline "
-                "into ticket-style journeys by issue/request span. This adds one extra AI call per "
-                "selected original timeline and may produce more final journeys than the original count."
+                "into ticket-style journeys by issue/request span. Single pass adds one ticket call per "
+                "selected original timeline; cumulative mode adds one ticket call per source conversation. "
+                "Ticket splitting may produce more final journeys than the original count."
             ),
         )
         if st.session_state.enable_ticket_segmentation:
+            ticket_mode_options = _ticket_segmentation_mode_options()
+            if st.session_state.get("ticket_segmentation_mode") not in ticket_mode_options:
+                st.session_state.ticket_segmentation_mode = TICKET_SEGMENTATION_MODE_DEFAULT
+            st.selectbox(
+                "Ticket splitting mode",
+                ticket_mode_options,
+                key="ticket_segmentation_mode",
+                format_func=_ticket_segmentation_mode_label,
+                help=(
+                    "Single pass sends the full customer journey once. Cumulative mode sends each source "
+                    "conversation separately, passing only the previous ticket summary forward. "
+                    "Cumulative mode is slower and uses more ticket-segmentation calls."
+                ),
+            )
             st.caption(
                 "Ticket mode: the run scope selects original timelines first; "
                 "AI then splits those timelines into resolved/pending/unresolved tickets for scoring."
@@ -5511,6 +5872,16 @@ def render_sidebar() -> None:
             "Save raw model responses",
             key="save_raw_responses",
             help=f"Default: {'On' if DEFAULT_RUN_SETTINGS['save_raw_responses'] else 'Off'}",
+        )
+        st.toggle(
+            "Log LLM requests/responses for debugging",
+            key="debug_log_llm_calls",
+            help=(
+                "Appends every LLM call (system/user prompt, raw response, reasoning, usage) to "
+                "logs/llm_calls.jsonl on disk. Off by default -- prompts and responses can contain "
+                "real customer data, so only enable this while actively debugging. "
+                f"Default: {'On' if DEFAULT_RUN_SETTINGS['debug_log_llm_calls'] else 'Off'}."
+            ),
         )
 
         st.markdown("---")
@@ -5673,6 +6044,15 @@ def tab_reviewer_admin() -> None:
 # --------- Tab: Upload & Settings ---------
 
 
+def _uploaded_file_signature(uploaded: Any) -> tuple[str, int, str]:
+    """Return a stable, cheap identity for a Streamlit UploadedFile."""
+    return (
+        str(getattr(uploaded, "name", "") or ""),
+        int(getattr(uploaded, "size", 0) or 0),
+        str(getattr(uploaded, "file_id", "") or ""),
+    )
+
+
 def tab_upload() -> None:
     if not _can_run_evaluations():
         st.warning("Only active users and master admins can upload customer journey CSVs.")
@@ -5685,7 +6065,15 @@ def tab_upload() -> None:
     )
 
     uploaded = st.file_uploader("Choose a CSV file", type=["csv"], accept_multiple_files=False)
-    if uploaded is not None:
+    uploaded_signature = _uploaded_file_signature(uploaded) if uploaded is not None else None
+    should_prepare_upload = bool(
+        uploaded is not None
+        and (
+            uploaded_signature != st.session_state.get("_uploaded_csv_signature")
+            or st.session_state.get("df_norm") is None
+        )
+    )
+    if should_prepare_upload:
         try:
             df = load_csv(uploaded)
         except Exception as e:
@@ -5698,7 +6086,7 @@ def tab_upload() -> None:
             st.session_state.journey_selection_visible_labels = []
 
         st.session_state.csv_name = uploaded.name
-        st.session_state.df_raw = df
+        st.session_state.pop("_journey_selector_cache", None)
 
         is_valid, missing, msg = validate_csv(df)
         if not is_valid:
@@ -5710,6 +6098,7 @@ def tab_upload() -> None:
         df_norm = normalize_dataframe(df)
         st.session_state.df_norm = df_norm
         st.session_state.csv_summary = summarize_dataframe(df_norm)
+        st.session_state._uploaded_csv_signature = uploaded_signature
 
     df_norm = st.session_state.df_norm
     if df_norm is None or df_norm.empty:
@@ -5923,8 +6312,24 @@ def _render_saved_runs_loader(key_prefix: str, *, expanded: bool = False) -> Non
     db = get_active_db()
     with st.expander("Past runs (saved in the database)", expanded=expanded):
         if st.button("Refresh saved runs", key=f"{key_prefix}_refresh_saved_runs", use_container_width=True):
+            st.session_state.pop(f"_{key_prefix}_saved_runs_cache", None)
             st.rerun()
-        runs = db.list_runs()
+        runs_cache_key = (_active_db_path(),)
+        runs_cache_state_key = f"_{key_prefix}_saved_runs_cache"
+        runs_cache = st.session_state.get(runs_cache_state_key)
+        if (
+            isinstance(runs_cache, dict)
+            and runs_cache.get("key") == runs_cache_key
+            and (time.time() - float(runs_cache.get("loaded_at") or 0.0)) < 10.0
+        ):
+            runs = [dict(row) for row in runs_cache.get("rows") or []]
+        else:
+            runs = db.list_runs()
+            st.session_state[runs_cache_state_key] = {
+                "key": runs_cache_key,
+                "loaded_at": time.time(),
+                "rows": [dict(row) for row in runs],
+            }
         if not runs:
             st.caption("No saved runs yet.")
             return
@@ -6007,6 +6412,8 @@ def _render_saved_runs_loader(key_prefix: str, *, expanded: bool = False) -> Non
                     if key_prefix == "run":
                         st.session_state.run_evaluation_source_mode = "Loaded DB run"
                         st.session_state.db_source_rerun_source_run_id = int(sel_id)
+                    elif key_prefix == "ticket_eval":
+                        st.session_state.ticket_eval_source = "Loaded run"
                     st.success(f"Loaded run #{sel_id}.")
                     st.rerun()
                 except Exception as e:
@@ -6016,6 +6423,7 @@ def _render_saved_runs_loader(key_prefix: str, *, expanded: bool = False) -> Non
                 if st.button("Save name", key=f"{key_prefix}_save_run_name", use_container_width=True, type="secondary"):
                     try:
                         db.rename_run(sel_id, (st.session_state.get(rename_key) or "").strip())
+                        st.session_state.pop(runs_cache_state_key, None)
                         st.success(f"Renamed run #{sel_id}.")
                         st.rerun()
                     except Exception as e:
@@ -6024,6 +6432,7 @@ def _render_saved_runs_loader(key_prefix: str, *, expanded: bool = False) -> Non
                 if st.button("Delete this run", key=f"{key_prefix}_delete_run", use_container_width=True, type="secondary"):
                     try:
                         db.delete_run(sel_id)
+                        st.session_state.pop(runs_cache_state_key, None)
                         if st.session_state.current_run_id == sel_id:
                             st.session_state.current_run_id = None
                             st.session_state.run_results = None
@@ -6048,33 +6457,114 @@ def _ticket_preview_unique_label(base: str, existing: set[str], suffix: str) -> 
     return label
 
 
-def _ticket_preview_uploaded_options() -> tuple[list[str], dict[str, tuple[str, pd.DataFrame, dict]]]:
+def _ticket_preview_uploaded_id_column(df: pd.DataFrame) -> str:
+    if TICKET_JOURNEY_ID_COLUMN in df.columns:
+        return TICKET_JOURNEY_ID_COLUMN
+    if JOURNEY_ID_COLUMN in df.columns:
+        return JOURNEY_ID_COLUMN
+    return "THREAD_ID"
+
+
+def _ticket_preview_uploaded_group(conversation_id: str) -> pd.DataFrame:
+    df = st.session_state.get("df_norm")
+    if df is None or df.empty:
+        return pd.DataFrame()
+    id_col = _ticket_preview_uploaded_id_column(df)
+    if id_col not in df.columns:
+        return pd.DataFrame()
+    group = df[df[id_col].astype(str) == str(conversation_id)]
+    if group.empty:
+        return pd.DataFrame()
+    sort_cols = [
+        col
+        for col in (MESSAGE_ORDER_COLUMN, LEGACY_MESSAGE_ORDER_COLUMN, "MESSAGE_TIME")
+        if col in group.columns
+    ]
+    if sort_cols:
+        return group.sort_values(sort_cols, kind="stable").reset_index(drop=True)
+    return group.reset_index(drop=True)
+
+
+def _ticket_preview_uploaded_options() -> tuple[list[str], dict[str, dict]]:
     df = st.session_state.get("df_norm")
     if df is None or df.empty:
         return [], {}
 
+    cache_key = (
+        str(st.session_state.get("csv_name") or ""),
+        id(df),
+        int(len(df)),
+        tuple(str(col) for col in df.columns),
+    )
+    cached = st.session_state.get("_ticket_preview_uploaded_options_cache")
+    if isinstance(cached, dict) and cached.get("key") == cache_key:
+        return cached.get("labels") or [], cached.get("lookup") or {}
+
+    id_col = _ticket_preview_uploaded_id_column(df)
+    if id_col not in df.columns:
+        return [], {}
+
     labels: list[str] = []
-    lookup: dict[str, tuple[str, pd.DataFrame, dict]] = {}
+    lookup: dict[str, dict] = {}
     existing: set[str] = set()
-    for conversation_id, group in get_conversation_groups(df):
-        metadata = conversation_metadata_from_group(group)
+    for conversation_id, row_indexes in df.groupby(id_col, sort=False).groups.items():
+        index_list = list(row_indexes)
+        if not index_list:
+            continue
+        first = df.loc[index_list[0]]
+        conversation_id = str(conversation_id)
+        customer_name = str(first.get("CUSTOMER_NAME") or "").strip() if "CUSTOMER_NAME" in df.columns else ""
+        customer_phone = str(first.get(JOURNEY_ID_COLUMN) or "").strip() if JOURNEY_ID_COLUMN in df.columns else ""
+        source_conversation_count = 0
+        if "CONVERSATION_ID" in df.columns:
+            source_conversation_count = int(
+                df.loc[index_list, "CONVERSATION_ID"]
+                .dropna()
+                .astype(str)
+                .str.strip()
+                .replace("", pd.NA)
+                .dropna()
+                .nunique()
+            )
         customer = (
-            metadata.get("customer_name")
-            or metadata.get("customer_phone")
+            customer_name
+            or customer_phone
             or conversation_id
         )
-        base = f"{customer} - {len(group):,} messages"
+        base = f"{customer} - {len(index_list):,} messages"
         label = _ticket_preview_unique_label(base, existing, str(conversation_id)[:12])
         labels.append(label)
-        lookup[label] = (str(conversation_id), group, metadata)
+        lookup[label] = {
+            "conversation_id": conversation_id,
+            "message_count": int(len(index_list)),
+            "source_conversation_count": source_conversation_count,
+            "customer_name": customer_name,
+            "customer_phone": customer_phone,
+        }
+    st.session_state["_ticket_preview_uploaded_options_cache"] = {
+        "key": cache_key,
+        "labels": labels,
+        "lookup": lookup,
+    }
     return labels, lookup
 
 
 def _ticket_preview_loaded_run_options() -> tuple[list[str], dict[str, dict]]:
     rr = st.session_state.get("run_results")
-    results = list(getattr(rr, "conversation_results", []) or [])
+    results = getattr(rr, "conversation_results", []) or []
     if not results:
         return [], {}
+
+    cache_key = (
+        _active_db_path(),
+        st.session_state.get("current_run_id"),
+        st.session_state.get("loaded_run_label"),
+        id(results),
+        int(len(results)),
+    )
+    cached = st.session_state.get("_ticket_preview_loaded_options_cache")
+    if isinstance(cached, dict) and cached.get("key") == cache_key:
+        return cached.get("labels") or [], cached.get("lookup") or {}
 
     labels: list[str] = []
     lookup: dict[str, dict] = {}
@@ -6095,7 +6585,438 @@ def _ticket_preview_loaded_run_options() -> tuple[list[str], dict[str, dict]]:
         label = _ticket_preview_unique_label(base, existing, conversation_id[:12])
         labels.append(label)
         lookup[label] = result
+    st.session_state["_ticket_preview_loaded_options_cache"] = {
+        "key": cache_key,
+        "labels": labels,
+        "lookup": lookup,
+    }
     return labels, lookup
+
+
+def _ticket_eval_option_label(
+    position: int,
+    conversation_id: str,
+    customer: str,
+    message_count: int | None = None,
+) -> str:
+    count_part = f" - {int(message_count):,} messages" if int(message_count or 0) > 0 else ""
+    cid_part = f" - {str(conversation_id)[:12]}" if conversation_id else ""
+    return f"#{int(position):,} - {customer or conversation_id or 'Unknown journey'}{count_part}{cid_part}"
+
+
+def _ticket_eval_loaded_option_from_result(result: dict, position: int) -> tuple[str, dict]:
+    conversation_id = str(result.get("conversation_id") or "")
+    metadata = result.get("conversation_metadata") or {}
+    customer = (
+        metadata.get("customer_name")
+        or metadata.get("customer_phone")
+        or conversation_id
+    )
+    transcript_count = len(result.get("transcript") or [])
+    try:
+        metadata_count = int(metadata.get("total_visible_messages") or 0)
+    except (TypeError, ValueError):
+        metadata_count = 0
+    try:
+        source_count = int(metadata.get("source_conversation_count") or 0)
+    except (TypeError, ValueError):
+        source_count = 0
+    label = _ticket_eval_option_label(position, conversation_id, str(customer), transcript_count or metadata_count)
+    return label, {
+        "label": label,
+        "position": int(position),
+        "conversation_id": conversation_id,
+        "message_count": int(transcript_count or metadata_count or 0),
+        "source_conversation_count": int(source_count or 0),
+        "summary_result": result,
+    }
+
+
+def _ticket_eval_loaded_window_options(
+    results: list[dict],
+    *,
+    start: int,
+    limit: int,
+    search: str = "",
+    filtered_items: list[tuple[int, dict]] | None = None,
+) -> tuple[list[str], dict[str, dict], int]:
+    terms = [term for term in str(search or "").strip().lower().split() if term]
+    labels: list[str] = []
+    lookup: dict[str, dict] = {}
+    source_items = filtered_items
+    total = len(source_items) if source_items is not None else len(results or [])
+
+    if terms:
+        iterator = source_items if source_items is not None else enumerate(results or [], start=1)
+        for position, result in iterator:
+            label, option = _ticket_eval_loaded_option_from_result(result, int(position))
+            searchable = label.lower()
+            if all(term in searchable for term in terms):
+                labels.append(label)
+                lookup[label] = option
+                if len(labels) >= max(1, int(limit)):
+                    break
+        return labels, lookup, total
+
+    start = min(max(int(start), 0), max(total - 1, 0))
+    end = min(total, start + max(1, int(limit)))
+    if source_items is not None:
+        window = source_items[start:end]
+    else:
+        window = [
+            (idx, result)
+            for idx, result in enumerate((results or [])[start:end], start=start + 1)
+        ]
+    for position, result in window:
+        label, option = _ticket_eval_loaded_option_from_result(result, int(position))
+        labels.append(label)
+        lookup[label] = option
+    return labels, lookup, total
+
+
+def _ticket_eval_loaded_options_for_ids(
+    results: list[dict],
+    ids: list[str],
+    *,
+    filtered_items: list[tuple[int, dict]] | None = None,
+) -> tuple[list[str], dict[str, dict]]:
+    if not ids:
+        return [], {}
+    wanted = [str(value) for value in ids if str(value).strip()]
+    wanted_set = set(wanted)
+    source_items = filtered_items if filtered_items is not None else enumerate(results or [], start=1)
+    options_by_id: dict[str, tuple[str, dict]] = {}
+    for position, result in source_items:
+        conversation_id = _conversation_result_id(result)
+        if conversation_id in wanted_set and conversation_id not in options_by_id:
+            options_by_id[conversation_id] = _ticket_eval_loaded_option_from_result(result, int(position))
+    labels: list[str] = []
+    lookup: dict[str, dict] = {}
+    for conversation_id in wanted:
+        item = options_by_id.get(conversation_id)
+        if not item:
+            continue
+        label, option = item
+        labels.append(label)
+        lookup[label] = option
+    return labels, lookup
+
+
+def _ticket_eval_uploaded_unique_ids() -> list[str]:
+    df = st.session_state.get("df_norm")
+    if df is None or df.empty:
+        return []
+    id_col = _ticket_preview_uploaded_id_column(df)
+    if id_col not in df.columns:
+        return []
+    cache_key = (
+        str(st.session_state.get("csv_name") or ""),
+        id(df),
+        int(len(df)),
+        id_col,
+    )
+    cached = st.session_state.get("_ticket_eval_uploaded_unique_ids_cache")
+    if isinstance(cached, dict) and cached.get("key") == cache_key:
+        return cached.get("ids") or []
+    ids = df[id_col].dropna().astype(str).drop_duplicates().tolist()
+    st.session_state["_ticket_eval_uploaded_unique_ids_cache"] = {
+        "key": cache_key,
+        "ids": ids,
+    }
+    return ids
+
+
+def _ticket_eval_uploaded_search_ids(search: str, limit: int) -> tuple[list[str], int]:
+    df = st.session_state.get("df_norm")
+    if df is None or df.empty:
+        return [], 0
+    id_col = _ticket_preview_uploaded_id_column(df)
+    if id_col not in df.columns:
+        return [], 0
+    terms = [term for term in str(search or "").strip().lower().split() if term]
+    if not terms:
+        ids = _ticket_eval_uploaded_unique_ids()
+        return ids[: max(1, int(limit))], len(ids)
+
+    search_cols = [
+        col
+        for col in (id_col, JOURNEY_ID_COLUMN, "CUSTOMER_NAME", "CONVERSATION_ID")
+        if col in df.columns
+    ]
+    slim = df[search_cols].copy()
+    slim[id_col] = slim[id_col].astype(str)
+    slim = slim.drop_duplicates(subset=[id_col], keep="first")
+    searchable = slim[search_cols].fillna("").astype(str).agg(" ".join, axis=1).str.lower()
+    mask = pd.Series(True, index=slim.index)
+    for term in terms:
+        mask &= searchable.str.contains(re.escape(term), regex=True, na=False)
+    matched_ids = slim.loc[mask, id_col].astype(str).tolist()
+    return matched_ids[: max(1, int(limit))], len(matched_ids)
+
+
+def _ticket_eval_uploaded_options_for_ids(ids: list[str], *, start_position: int = 1) -> tuple[list[str], dict[str, dict]]:
+    df = st.session_state.get("df_norm")
+    if df is None or df.empty or not ids:
+        return [], {}
+    id_col = _ticket_preview_uploaded_id_column(df)
+    if id_col not in df.columns:
+        return [], {}
+    wanted = {str(value) for value in ids}
+    id_series = df[id_col].astype(str)
+    page_df = df[id_series.isin(wanted)]
+    grouped = {
+        str(conversation_id): group
+        for conversation_id, group in page_df.groupby(id_col, sort=False)
+    }
+    labels: list[str] = []
+    lookup: dict[str, dict] = {}
+    for offset, conversation_id in enumerate(ids):
+        conversation_id = str(conversation_id)
+        group = grouped.get(conversation_id)
+        if group is None or group.empty:
+            continue
+        first = group.iloc[0]
+        customer_name = str(first.get("CUSTOMER_NAME") or "").strip() if "CUSTOMER_NAME" in group.columns else ""
+        customer_phone = str(first.get(JOURNEY_ID_COLUMN) or "").strip() if JOURNEY_ID_COLUMN in group.columns else ""
+        source_count = 0
+        if "CONVERSATION_ID" in group.columns:
+            source_count = int(group["CONVERSATION_ID"].dropna().astype(str).str.strip().replace("", pd.NA).dropna().nunique())
+        customer = customer_name or customer_phone or conversation_id
+        label = _ticket_eval_option_label(
+            int(start_position) + int(offset),
+            conversation_id,
+            customer,
+            int(len(group)),
+        )
+        labels.append(label)
+        lookup[label] = {
+            "label": label,
+            "position": int(start_position) + int(offset),
+            "conversation_id": conversation_id,
+            "message_count": int(len(group)),
+            "source_conversation_count": int(source_count or 0),
+            "customer_name": customer_name,
+            "customer_phone": customer_phone,
+        }
+    return labels, lookup
+
+
+def _ticket_eval_uploaded_window_options(
+    *,
+    start: int,
+    limit: int,
+    search: str = "",
+) -> tuple[list[str], dict[str, dict], int]:
+    terms = str(search or "").strip()
+    if terms:
+        ids, total = _ticket_eval_uploaded_search_ids(terms, limit)
+        labels, lookup = _ticket_eval_uploaded_options_for_ids(ids, start_position=1)
+        return labels, lookup, total
+    ids_all = _ticket_eval_uploaded_unique_ids()
+    total = len(ids_all)
+    start = min(max(int(start), 0), max(total - 1, 0))
+    ids = ids_all[start : start + max(1, int(limit))]
+    labels, lookup = _ticket_eval_uploaded_options_for_ids(ids, start_position=start + 1)
+    return labels, lookup, total
+
+
+def _ticket_eval_split_source_ids(value: Any) -> list[str]:
+    values = value if isinstance(value, (list, tuple, set)) else [value]
+    out: list[str] = []
+    for raw in values:
+        text = str(raw or "").strip()
+        if not text or text.lower() in {"none", "nan"}:
+            continue
+        for part in re.split(r"\s*[,|]\s*", text):
+            item = part.strip()
+            if item and item not in out:
+                out.append(item)
+    return out
+
+
+def _ticket_eval_source_conversation_id(
+    metadata: dict | None,
+    records: list[dict] | None = None,
+    fallback_conversation_id: str = "",
+) -> str:
+    values: list[str] = []
+
+    def add(raw: Any) -> None:
+        for item in _ticket_eval_split_source_ids(raw):
+            if item not in values:
+                values.append(item)
+
+    metadata = metadata or {}
+    for key in ("source_conversation_ids", "source_conversation_id", "conversation_ids"):
+        add(metadata.get(key))
+    for record in records or []:
+        if isinstance(record, dict):
+            add(record.get("source_conversation_id"))
+    if not values:
+        add(fallback_conversation_id)
+    return ", ".join(values)
+
+
+def _ticket_eval_preview_export_dataframe(previews: list[dict]) -> pd.DataFrame:
+    columns = [
+        "source_conversation_id",
+        "customer_name",
+        "conversation_id",
+        "preview_label",
+        "ticket_number",
+        "ticket_id",
+        "model_ticket_category",
+        "ticket_category",
+        "request_origin",
+        "ticket_category_rule",
+        "request_type_matches",
+        "customer_request_matches",
+        "status_inquiry_matches",
+        "visa_lifecycle_request_signal",
+        "strong_customer_issue_matches",
+        "ignored_non_customer_issue_words",
+        "ticket_type",
+        "ticket_status",
+        "customer_objective",
+        "start_message_index",
+        "end_message_index",
+        "included_message_indexes",
+        "should_append_future_conversations",
+        "previous_ticket_id",
+        "inquiries_json",
+        "segmentation_reason",
+        "error",
+    ]
+    rows: list[dict[str, str]] = []
+    for preview in previews:
+        conversation_id = str(preview.get("conversation_id") or "")
+        metadata = preview.get("conversation_metadata") or {}
+        if not isinstance(metadata, dict):
+            metadata = {}
+        records = list(preview.get("records") or [])
+        base = {
+            "source_conversation_id": _ticket_eval_source_conversation_id(
+                metadata,
+                records,
+                conversation_id,
+            ),
+            "customer_name": str(
+                metadata.get("customer_name")
+                or metadata.get("customer_phone")
+                or conversation_id
+                or ""
+            ),
+            "conversation_id": conversation_id,
+            "preview_label": str(preview.get("label") or ""),
+            "error": str(preview.get("error") or ""),
+        }
+        tickets = list(preview.get("tickets") or [])
+        if not tickets:
+            rows.append(
+                {
+                    **base,
+                    "ticket_number": "",
+                    "ticket_id": "",
+                    "model_ticket_category": "",
+                    "ticket_category": "",
+                    "request_origin": "",
+                    "ticket_category_rule": "",
+                    "request_type_matches": "",
+                    "customer_request_matches": "",
+                    "status_inquiry_matches": "",
+                    "visa_lifecycle_request_signal": "",
+                    "strong_customer_issue_matches": "",
+                    "ignored_non_customer_issue_words": "",
+                    "ticket_type": "",
+                    "ticket_status": "",
+                    "customer_objective": "",
+                    "start_message_index": "",
+                    "end_message_index": "",
+                    "included_message_indexes": "",
+                    "should_append_future_conversations": "",
+                    "previous_ticket_id": "",
+                    "inquiries_json": "",
+                    "segmentation_reason": "",
+                }
+            )
+            continue
+        for ticket_number, ticket in enumerate(tickets, start=1):
+            if not isinstance(ticket, dict):
+                continue
+            export_ticket = _ticket_preview_display_ticket(ticket, records)
+            category_debug = export_ticket.get("ticket_category_debug") or {}
+            if not isinstance(category_debug, dict):
+                category_debug = {}
+            rows.append(
+                {
+                    **base,
+                    "ticket_number": str(ticket_number),
+                    "ticket_id": str(export_ticket.get("ticket_id") or ""),
+                    "model_ticket_category": str(export_ticket.get("model_ticket_category") or ""),
+                    "ticket_category": str(export_ticket.get("ticket_category") or ""),
+                    "request_origin": str(export_ticket.get("request_origin") or ""),
+                    "ticket_category_rule": str(category_debug.get("rule_applied") or ""),
+                    "request_type_matches": ", ".join(
+                        str(value) for value in category_debug.get("request_type_matches") or []
+                    ),
+                    "customer_request_matches": ", ".join(
+                        str(value) for value in category_debug.get("request_signal_matches") or []
+                    ),
+                    "status_inquiry_matches": ", ".join(
+                        str(value) for value in category_debug.get("status_inquiry_matches") or []
+                    ),
+                    "visa_lifecycle_request_signal": str(
+                        bool(category_debug.get("visa_lifecycle_request_signal"))
+                    ),
+                    "strong_customer_issue_matches": ", ".join(
+                        str(value) for value in category_debug.get("strong_customer_issue_matches") or []
+                    ),
+                    "ignored_non_customer_issue_words": ", ".join(
+                        str(value) for value in category_debug.get("ignored_non_customer_issue_matches") or []
+                    ),
+                    "ticket_type": str(export_ticket.get("ticket_type") or ""),
+                    "ticket_status": str(export_ticket.get("status") or ""),
+                    "customer_objective": str(export_ticket.get("customer_objective") or ""),
+                    "start_message_index": str(export_ticket.get("start_message_index") or ""),
+                    "end_message_index": str(export_ticket.get("end_message_index") or ""),
+                    "included_message_indexes": ", ".join(
+                        str(value) for value in export_ticket.get("included_message_indexes") or []
+                    ),
+                    "should_append_future_conversations": str(
+                        bool(export_ticket.get("should_append_future_conversations"))
+                    ),
+                    "previous_ticket_id": str(export_ticket.get("previous_ticket_id") or ""),
+                    "inquiries_json": json.dumps(
+                        export_ticket.get("inquiries") or [],
+                        ensure_ascii=False,
+                        default=str,
+                    ),
+                    "segmentation_reason": str(export_ticket.get("segmentation_reason") or ""),
+                }
+            )
+    return pd.DataFrame(rows, columns=columns)
+
+
+def _ticket_eval_source_scope_key(source: str, labels: list[str] | None = None) -> str:
+    if source == "Loaded run":
+        return f"loaded_run_{st.session_state.get('current_run_id') or 'none'}"
+    df = st.session_state.get("df_norm")
+    if df is not None:
+        digest = hashlib.sha1(
+            "|".join(
+                [
+                    str(st.session_state.get("csv_name") or "uploaded_csv"),
+                    str(id(df)),
+                    str(len(df)),
+                ]
+            ).encode("utf-8", errors="ignore")
+        ).hexdigest()[:12]
+        return f"uploaded_csv_{digest}"
+    digest = hashlib.sha1(
+        "\n".join([str(st.session_state.get("csv_name") or "uploaded_csv"), *(labels or [])])
+        .encode("utf-8", errors="ignore")
+    ).hexdigest()[:12]
+    return f"uploaded_csv_{digest}"
 
 
 def _ticket_eval_marker(result: dict, key: str, default: str = "") -> str:
@@ -6186,6 +7107,21 @@ def _ticket_eval_saved_preview_customer_keys(saved: dict | None) -> set[str]:
     return keys
 
 
+def _ticket_eval_saved_preview_customer_keys_for_run(preview_run_id: int) -> set[str]:
+    key = (_active_db_path(), int(preview_run_id))
+    cached = st.session_state.get("_ticket_eval_saved_preview_key_cache")
+    if isinstance(cached, dict) and cached.get("key") == key:
+        return set(cached.get("keys") or [])
+
+    saved_preview = _ticket_preview_load_run(get_active_db(), int(preview_run_id))
+    keys = _ticket_eval_saved_preview_customer_keys(saved_preview)
+    st.session_state["_ticket_eval_saved_preview_key_cache"] = {
+        "key": key,
+        "keys": sorted(keys),
+    }
+    return keys
+
+
 def _ticket_preview_records_from_transcript(transcript: list[dict]) -> list[dict]:
     records: list[dict] = []
     for fallback_index, message in enumerate(transcript or [], start=1):
@@ -6225,6 +7161,10 @@ def _ticket_preview_records_from_transcript(transcript: list[dict]) -> list[dict
     return records
 
 
+_TICKET_EVAL_SELECTOR_PAGE_SIZE = 100
+_TICKET_EVAL_SEARCH_LIMIT = 100
+
+
 def _ticket_preview_records_for_indexes(records: list[dict], indexes: list[Any]) -> list[dict]:
     wanted: set[int] = set()
     for value in indexes or []:
@@ -6245,9 +7185,384 @@ def _ticket_preview_records_for_indexes(records: list[dict], indexes: list[Any])
     return out
 
 
+_INITIAL_JOURNEY_SECTION_COLORS = [
+    {"accent": "#0891b2", "soft": "rgba(8, 145, 178, 0.16)", "border": "rgba(34, 211, 238, 0.44)"},
+    {"accent": "#16a34a", "soft": "rgba(22, 163, 74, 0.14)", "border": "rgba(74, 222, 128, 0.42)"},
+    {"accent": "#d97706", "soft": "rgba(217, 119, 6, 0.15)", "border": "rgba(251, 191, 36, 0.42)"},
+    {"accent": "#e11d48", "soft": "rgba(225, 29, 72, 0.14)", "border": "rgba(251, 113, 133, 0.40)"},
+    {"accent": "#2563eb", "soft": "rgba(37, 99, 235, 0.14)", "border": "rgba(96, 165, 250, 0.40)"},
+]
+
+
+def _ticket_preview_message_display(record: dict) -> tuple[str, str, str]:
+    role = str(record.get("sender_role") or "unknown").strip().lower()
+    raw_role = str(record.get("raw_sender_role") or "").strip()
+    raw_role_norm = raw_role.lower()
+
+    if raw_role_norm == "system":
+        return "Broadcast", "left", "broadcast"
+    if raw_role_norm == "bot":
+        return "Assistant", "right", "assistant"
+    if raw_role_norm == "agent":
+        return str(record.get("agent_full_name") or "").strip() or "Agent", "right", "assistant"
+    if role in {"customer", "consumer", "user"}:
+        return raw_role or "Customer", "left", "customer"
+    if role in {"agent", "assistant", "bot"}:
+        return str(record.get("agent_full_name") or "").strip() or "Assistant", "right", "assistant"
+    return raw_role or humanize_label(role) or "Unknown", "left", "unknown"
+
+
+def _ticket_preview_index_set(values: list[Any]) -> set[int]:
+    indexes: set[int] = set()
+    for value in values or []:
+        try:
+            indexes.add(int(value))
+        except (TypeError, ValueError):
+            continue
+    return indexes
+
+
+def _ticket_preview_records_by_index(records: list[dict]) -> dict[int, dict]:
+    out: dict[int, dict] = {}
+    for record in records:
+        try:
+            out[int(record.get("message_index"))] = record
+        except (TypeError, ValueError):
+            continue
+    return out
+
+
+def _ticket_preview_display_ticket(ticket: dict, records: list[dict]) -> dict:
+    # ticket_category is the model's decision and is displayed as-is. This used
+    # to run a regex category deriver at render time -- first overwriting what
+    # was displayed, later only to fill a "Category debug" panel. Both the
+    # deriver and that panel are gone; there is no second opinion to show.
+    display_ticket = dict(ticket)
+    display_ticket["model_ticket_category"] = display_ticket.get("ticket_category") or ""
+    return display_ticket
+
+
+_INITIAL_JOURNEY_UNASSIGNED_COLOR = {
+    "accent": "#525252",
+    "soft": "rgba(82, 82, 82, 0.16)",
+    "border": "rgba(163, 163, 163, 0.38)",
+}
+
+
+def _ticket_preview_initial_journey_html(records: list[dict], tickets: list[dict]) -> str:
+    """Render the full journey in true chronological order, colored by ticket.
+
+    Tickets are NOT regrouped -- a ticket whose messages resume later in the
+    conversation (e.g. ticket 1 covers #1-4, ticket 2 covers #5-8, then the
+    customer returns to ticket 1's topic at #20-21) appears as separate
+    regions at their real chronological position, each colored the same as
+    that ticket's other region(s), rather than pulled together into one block
+    out of order.
+    """
+    section_parts: list[str] = []
+
+    # Resolve each ticket's identity/title/color once, keyed by ticket_index
+    # (1-based, in the order tickets were given). This is what makes the
+    # color stable across multiple non-adjacent appearances of the same
+    # ticket -- color is assigned by ticket identity, not by render position.
+    ticket_meta: dict[int, dict[str, Any]] = {}
+    index_to_ticket: dict[int, int] = {}
+    for ticket_index, ticket in enumerate(tickets, start=1):
+        ticket = _ticket_preview_display_ticket(ticket, records)
+        included = sorted(_ticket_preview_index_set(ticket.get("included_message_indexes") or []))
+        if not included:
+            continue
+        title_parts = [
+            humanize_label(ticket.get("ticket_category")),
+            humanize_label(ticket.get("ticket_type")),
+        ]
+        ticket_meta[ticket_index] = {
+            "title": f"Ticket {ticket_index}: {' / '.join(part for part in title_parts if part) or ticket.get('ticket_id') or 'Ticket'}",
+            "status": humanize_label(ticket.get("status")) or "Unknown status",
+            "objective": str(ticket.get("customer_objective") or "").strip(),
+            "palette": _INITIAL_JOURNEY_SECTION_COLORS[(ticket_index - 1) % len(_INITIAL_JOURNEY_SECTION_COLORS)],
+        }
+        for idx in included:
+            # Keep the first (lowest ticket_index) assignment if a message
+            # somehow lands in more than one ticket, rather than silently
+            # letting a later ticket overwrite it -- overlap should already
+            # be resolved upstream, but this keeps rendering deterministic
+            # if it ever isn't.
+            index_to_ticket.setdefault(idx, ticket_index)
+
+    # Walk every record in its natural (chronological) order and start a new
+    # run each time the owning ticket changes.
+    runs: list[dict[str, Any]] = []
+    current_run: dict[str, Any] | None = None
+    for record in records:
+        try:
+            idx = int(record.get("message_index"))
+        except (TypeError, ValueError):
+            idx = None
+        owner = index_to_ticket.get(idx) if idx is not None else None
+        if current_run is None or current_run["ticket_index"] != owner:
+            current_run = {"ticket_index": owner, "records": []}
+            runs.append(current_run)
+        current_run["records"].append(record)
+
+    # Number each ticket's chronological appearances so a resumed run reads
+    # as "continued" rather than looking like an unrelated second Ticket 1.
+    occurrence_counts: dict[int, int] = {}
+    sections: list[dict[str, Any]] = []
+    for run in runs:
+        section_records = run["records"]
+        if not section_records:
+            continue
+        ticket_index = run["ticket_index"]
+        if ticket_index is None:
+            sections.append(
+                {
+                    "kicker": "Unassigned",
+                    "title": "Messages not included in a ticket",
+                    "objective": "",
+                    "records": section_records,
+                    "palette": _INITIAL_JOURNEY_UNASSIGNED_COLOR,
+                }
+            )
+            continue
+        meta = ticket_meta.get(ticket_index) or {}
+        occurrence_counts[ticket_index] = occurrence_counts.get(ticket_index, 0) + 1
+        occurrence = occurrence_counts[ticket_index]
+        status = meta.get("status") or "Unknown status"
+        kicker = (
+            f"Ticket section {ticket_index} - {status}"
+            if occurrence == 1
+            else f"Ticket {ticket_index} continued - {status}"
+        )
+        sections.append(
+            {
+                "kicker": kicker,
+                "title": meta.get("title") or f"Ticket {ticket_index}",
+                "objective": meta.get("objective") or "",
+                "records": section_records,
+                "palette": meta.get("palette") or _INITIAL_JOURNEY_SECTION_COLORS[0],
+            }
+        )
+
+    for section in sections:
+        section_records = list(section.get("records") or [])
+        palette = section["palette"]
+        indexes = [
+            int(record.get("message_index"))
+            for record in section_records
+            if str(record.get("message_index") or "").strip().isdigit()
+        ]
+        span = f"#{min(indexes)}-#{max(indexes)}" if indexes else "No indexes"
+        message_word = "message" if len(section_records) == 1 else "messages"
+        message_parts: list[str] = []
+        last_source_id: str | None = None
+        for record in section_records:
+            source_id = str(record.get("source_conversation_id") or "").strip()
+            source_label = source_id or "Unknown"
+            if source_label != last_source_id:
+                message_parts.append(
+                    "<div class=\"cx-initial-source-divider\">"
+                    "<span></span>"
+                    f"<strong>{html_lib.escape('Source conversation ' + source_label)}</strong>"
+                    "<span></span>"
+                    "</div>"
+                )
+                last_source_id = source_label
+            display_role, align, tone = _ticket_preview_message_display(record)
+            idx = record.get("message_index")
+            when = str(record.get("message_time") or "").strip()
+            text = str(record.get("message_text") or "").strip()
+            meta_bits = [display_role]
+            if idx is not None:
+                meta_bits.append(f"#{idx}")
+            if when:
+                meta_bits.append(when)
+            row_justify = "flex-end" if align == "right" else "flex-start"
+            radius = "16px 16px 4px 16px" if align == "right" else "16px 16px 16px 4px"
+            if tone == "assistant":
+                bubble_bg = "#075985"
+                bubble_border = "#38bdf8"
+                meta_color = "#bae6fd"
+            elif tone == "broadcast":
+                bubble_bg = "#3f3f46"
+                bubble_border = "#a1a1aa"
+                meta_color = "#e4e4e7"
+            elif tone == "customer":
+                bubble_bg = "#1e293b"
+                bubble_border = "#64748b"
+                meta_color = "#cbd5e1"
+            else:
+                bubble_bg = "#312e81"
+                bubble_border = "#818cf8"
+                meta_color = "#c7d2fe"
+            message_parts.append(
+                "<div class=\"cx-initial-message-row\" style=\"justify-content:"
+                f"{row_justify};\">"
+                "<div class=\"cx-initial-message\" style=\""
+                f"background:{bubble_bg};border-color:{bubble_border};border-radius:{radius};\">"
+                f"<div class=\"cx-initial-message-meta\" style=\"color:{meta_color};\">"
+                f"{html_lib.escape(' - '.join(str(bit) for bit in meta_bits if str(bit).strip()))}"
+                "</div>"
+                "<div class=\"cx-initial-message-text\">"
+                f"{html_lib.escape(text) if text else '<em>(empty message)</em>'}"
+                "</div></div></div>"
+            )
+
+        section_parts.append(
+            "<section class=\"cx-initial-section\" style=\""
+            f"--section-accent:{palette['accent']};"
+            f"--section-soft:{palette['soft']};"
+            f"--section-border:{palette['border']};\">"
+            "<div class=\"cx-initial-section-header\">"
+            "<div>"
+            f"<div class=\"cx-initial-section-kicker\">{html_lib.escape(str(section.get('kicker') or 'Ticket section'))}</div>"
+            f"<div class=\"cx-initial-section-title\">{html_lib.escape(str(section.get('title') or 'Ticket'))}</div>"
+            f"<div class=\"cx-initial-section-objective\">{html_lib.escape(str(section.get('objective') or ''))}</div>"
+            "</div>"
+            "<div class=\"cx-initial-section-pill\">"
+            f"{html_lib.escape(span)} - {len(section_records)} {message_word}"
+            "</div>"
+            "</div>"
+            f"{''.join(message_parts)}"
+            "</section>"
+        )
+
+    styles = textwrap.dedent(
+        """
+        <style>
+        .cx-initial-journey {
+          display: flex;
+          flex-direction: column;
+          gap: 16px;
+          margin-top: 8px;
+        }
+        .cx-initial-section {
+          background: linear-gradient(90deg, var(--section-soft), rgba(15, 23, 42, 0.30));
+          border: 1px solid var(--section-border);
+          border-left: 7px solid var(--section-accent);
+          border-radius: 8px;
+          padding: 12px 14px 14px 14px;
+          box-shadow: 0 16px 30px rgba(0, 0, 0, 0.22);
+        }
+        .cx-initial-section-header {
+          display: flex;
+          align-items: flex-start;
+          justify-content: space-between;
+          gap: 12px;
+          margin-bottom: 10px;
+        }
+        .cx-initial-section-kicker {
+          color: #cbd5e1;
+          font-size: 0.76rem;
+          font-weight: 800;
+          text-transform: uppercase;
+        }
+        .cx-initial-section-title {
+          color: #f8fafc;
+          font-size: 0.94rem;
+          font-weight: 900;
+          word-break: break-word;
+        }
+        .cx-initial-section-objective {
+          color: #e2e8f0;
+          font-size: 0.84rem;
+          line-height: 1.35;
+          margin-top: 3px;
+          max-width: 980px;
+          word-break: break-word;
+        }
+        .cx-initial-section-pill {
+          flex: 0 0 auto;
+          background: var(--section-accent);
+          color: #ffffff;
+          border-radius: 999px;
+          padding: 5px 10px;
+          font-size: 0.76rem;
+          font-weight: 900;
+          white-space: nowrap;
+        }
+        .cx-initial-message-row {
+          display: flex;
+          margin: 7px 0;
+        }
+        .cx-initial-source-divider {
+          display: grid;
+          grid-template-columns: minmax(28px, 1fr) auto minmax(28px, 1fr);
+          align-items: center;
+          gap: 10px;
+          margin: 12px 0 10px 0;
+        }
+        .cx-initial-source-divider span {
+          height: 1px;
+          background: rgba(148, 163, 184, 0.38);
+        }
+        .cx-initial-source-divider strong {
+          border: 1px solid rgba(148, 163, 184, 0.48);
+          background: rgba(15, 23, 42, 0.72);
+          color: #e2e8f0;
+          border-radius: 999px;
+          padding: 5px 10px;
+          font-size: 0.72rem;
+          font-weight: 900;
+          max-width: min(680px, 70vw);
+          overflow-wrap: anywhere;
+          text-align: center;
+        }
+        .cx-initial-message {
+          max-width: 980px;
+          width: fit-content;
+          padding: 11px 14px;
+          border: 1px solid;
+          color: #f8fafc !important;
+          box-shadow: 0 10px 22px rgba(0, 0, 0, 0.20);
+        }
+        .cx-initial-message-meta {
+          margin-bottom: 5px;
+          font-size: 0.76rem;
+          font-weight: 900;
+        }
+        .cx-initial-message-text {
+          color: #f8fafc !important;
+          white-space: pre-wrap;
+          word-break: break-word;
+          line-height: 1.5;
+          font-size: 0.96rem;
+        }
+        @media (max-width: 700px) {
+          .cx-initial-section-header {
+            flex-direction: column;
+          }
+          .cx-initial-section-pill {
+            white-space: normal;
+          }
+          .cx-initial-message {
+            max-width: 100%;
+          }
+        }
+        </style>
+        """
+    ).strip()
+    return f"{styles}<div class=\"cx-initial-journey\">{''.join(section_parts)}</div>"
+
+
+def _render_initial_journey_sections(records: list[dict], tickets: list[dict] | None = None) -> None:
+    if not records:
+        st.info("No messages to display.")
+        return
+    tickets = [ticket for ticket in (tickets or []) if isinstance(ticket, dict)]
+    if not tickets:
+        st.caption("Ticket sections appear here after running ticket evaluation preview.")
+        render_conversation_transcript_with_evals(records, [])
+        return
+    st.caption(f"{len(records):,} messages grouped into {len(tickets):,} ticket section(s).")
+    st.markdown(_ticket_preview_initial_journey_html(records, tickets), unsafe_allow_html=True)
+
+
 def _render_ticket_preview_info(ticket: dict) -> None:
     rows = [
         ("Ticket ID", ticket.get("ticket_id") or "-"),
+        ("Category", humanize_label(ticket.get("ticket_category")) or "-"),
+        ("Request origin", humanize_label(ticket.get("request_origin")) or "-"),
         ("Type", humanize_label(ticket.get("ticket_type")) or "-"),
         ("Status", humanize_label(ticket.get("status")) or "-"),
         ("Objective", ticket.get("customer_objective") or "-"),
@@ -6300,6 +7615,38 @@ def _ticket_preview_run_label(row: dict) -> str:
         f"#{int(row.get('id'))} - {name} - {source} - "
         f"{n_previews:,} customers - {n_tickets:,} tickets - {created}"
     )
+
+
+def _ticket_preview_default_result_index(previews: list[dict]) -> int:
+    for idx, preview in enumerate(previews or []):
+        if not preview.get("error") and (preview.get("tickets") or preview.get("records")):
+            return idx
+    for idx, preview in enumerate(previews or []):
+        if preview.get("tickets") or preview.get("records"):
+            return idx
+    return 0
+
+
+def _ticket_preview_message_count(preview: dict) -> int:
+    records = preview.get("records") or []
+    if records:
+        return int(len(records))
+    metadata = preview.get("conversation_metadata") or {}
+    if isinstance(metadata, dict):
+        for key in ("total_visible_messages", "message_count"):
+            try:
+                count = int(metadata.get(key) or 0)
+            except (TypeError, ValueError):
+                count = 0
+            if count > 0:
+                return count
+    match = re.search(r"\b([\d,]+)\s+messages\b", str(preview.get("label") or ""), flags=re.IGNORECASE)
+    if match:
+        try:
+            return int(match.group(1).replace(",", ""))
+        except ValueError:
+            return 0
+    return 0
 
 
 _TICKET_PREVIEW_SCHEMA_SQL = """
@@ -6356,22 +7703,68 @@ def _ensure_ticket_preview_tables(db: Database) -> None:
 
 def _ticket_preview_list_runs(db: Database) -> list[dict]:
     _ensure_ticket_preview_tables(db)
+    cache_key = (_active_db_path(),)
+    cached = st.session_state.get("_ticket_preview_runs_cache")
+    if (
+        isinstance(cached, dict)
+        and cached.get("key") == cache_key
+        and (time.time() - float(cached.get("loaded_at") or 0.0)) < 10.0
+    ):
+        return [dict(row) for row in cached.get("rows") or []]
+
     method = getattr(db, "list_ticket_preview_runs", None)
     if callable(method):
-        return method()
-    rows = db._fetchall(
-        "SELECT id, name, source, source_run_id, source_label, created_at, model, "
-        "thinking_effort, n_previews, n_tickets "
-        "FROM ticket_preview_runs ORDER BY created_at DESC"
-    )
-    return [dict(row) for row in rows]
+        rows = method()
+    else:
+        rows = db._fetchall(
+            "SELECT id, name, source, source_run_id, source_label, created_at, model, "
+            "thinking_effort, n_previews, n_tickets "
+            "FROM ticket_preview_runs ORDER BY created_at DESC"
+        )
+    out = [dict(row) for row in rows]
+    st.session_state["_ticket_preview_runs_cache"] = {
+        "key": cache_key,
+        "loaded_at": time.time(),
+        "rows": out,
+    }
+    return out
+
+
+def _ticket_preview_apply_current_normalization(preview: dict) -> dict:
+    out = dict(preview or {})
+    records = list(out.get("records") or [])
+    debug = out.get("debug") or {}
+    raw = debug.get("raw_model_response") if isinstance(debug, dict) else ""
+    normalizer = getattr(evaluator_module, "_normalize_ticket_segments", None)
+    if not (records and raw and callable(normalizer)):
+        return out
+    try:
+        obj = extract_json_object(str(raw))
+        tickets = normalizer(obj, records)
+    except Exception:
+        return out
+    if tickets:
+        out["tickets"] = tickets
+        out["normalized_with_current_rules"] = True
+    return out
+
+
+def _ticket_preview_apply_current_normalization_to_run(saved: dict | None) -> dict | None:
+    if not saved:
+        return saved
+    out = dict(saved)
+    out["previews"] = [
+        _ticket_preview_apply_current_normalization(preview)
+        for preview in (out.get("previews") or [])
+    ]
+    return out
 
 
 def _ticket_preview_load_run(db: Database, preview_run_id: int) -> dict | None:
     _ensure_ticket_preview_tables(db)
     method = getattr(db, "load_ticket_preview_run", None)
     if callable(method):
-        return method(preview_run_id)
+        return _ticket_preview_apply_current_normalization_to_run(method(preview_run_id))
     run = db._fetchone(
         "SELECT * FROM ticket_preview_runs WHERE id=?",
         (int(preview_run_id),),
@@ -6401,7 +7794,7 @@ def _ticket_preview_load_run(db: Database, preview_run_id: int) -> dict | None:
     out = dict(run)
     out["config"] = json.loads(out.pop("config_json") or "{}")
     out["previews"] = previews
-    return out
+    return _ticket_preview_apply_current_normalization_to_run(out)
 
 
 def _ticket_preview_delete_run(db: Database, preview_run_id: int) -> None:
@@ -6489,6 +7882,8 @@ def _render_saved_ticket_preview_loader() -> None:
     db = get_active_db()
     with st.expander("Saved ticket previews", expanded=False):
         if st.button("Refresh saved ticket previews", key="ticket_preview_refresh", use_container_width=True):
+            st.session_state.pop("_ticket_preview_runs_cache", None)
+            st.session_state.pop("_ticket_eval_saved_preview_key_cache", None)
             st.rerun()
         try:
             rows = _ticket_preview_list_runs(db)
@@ -6535,7 +7930,7 @@ def _render_saved_ticket_preview_loader() -> None:
                         preview["run_key"] = saved.get("config") or {}
                     st.session_state.ticket_eval_previews = previews
                     st.session_state.ticket_eval_loaded_preview_run_id = selected_id
-                    st.session_state.ticket_eval_preview_result_index = 0
+                    st.session_state.ticket_eval_preview_result_index = _ticket_preview_default_result_index(previews)
                     st.success(f"Loaded ticket preview #{selected_id}.")
                     st.rerun()
                 except Exception as exc:
@@ -6545,6 +7940,8 @@ def _render_saved_ticket_preview_loader() -> None:
                 if st.button("Delete ticket preview", key="ticket_preview_delete_saved", use_container_width=True):
                     try:
                         _ticket_preview_delete_run(db, selected_id)
+                        st.session_state.pop("_ticket_preview_runs_cache", None)
+                        st.session_state.pop("_ticket_eval_saved_preview_key_cache", None)
                         if st.session_state.get("ticket_eval_loaded_preview_run_id") == selected_id:
                             st.session_state.pop("ticket_eval_previews", None)
                             st.session_state.pop("ticket_eval_loaded_preview_run_id", None)
@@ -6554,29 +7951,406 @@ def _render_saved_ticket_preview_loader() -> None:
                         st.error(f"Could not delete ticket preview: {exc}")
 
 
+def _ticket_eval_log_key(preview: dict) -> str:
+    seed = "|".join(
+        [
+            str(preview.get("conversation_id") or ""),
+            str(preview.get("label") or ""),
+            json.dumps(preview.get("run_key") or {}, ensure_ascii=False, default=str),
+        ]
+    )
+    return hashlib.sha1(seed.encode("utf-8", errors="ignore")).hexdigest()[:12]
+
+
+def _split_identifier_values(value: Any) -> list[str]:
+    if value is None:
+        return []
+    if isinstance(value, (list, tuple, set)):
+        out: list[str] = []
+        for item in value:
+            out.extend(_split_identifier_values(item))
+        return out
+    text = str(value or "").strip()
+    if not text:
+        return []
+    return [part.strip() for part in re.split(r"[\n,;|]+", text) if part.strip()]
+
+
+def _ticket_eval_log_candidate_ids(preview: dict) -> tuple[set[str], set[str]]:
+    conversation_ids: set[str] = set()
+    source_ids: set[str] = set()
+    metadata = preview.get("conversation_metadata") or {}
+
+    def add_conversation_id(value: Any) -> None:
+        for item in _split_identifier_values(value):
+            conversation_ids.add(item)
+            if "::ticket_" in item:
+                conversation_ids.add(item.split("::ticket_", 1)[0])
+
+    add_conversation_id(preview.get("conversation_id"))
+    add_conversation_id(metadata.get("conversation_id"))
+    add_conversation_id(metadata.get("parent_journey_id"))
+    add_conversation_id(metadata.get("ticket_journey_id"))
+    add_conversation_id(metadata.get("customer_journey_id"))
+
+    for key in ("source_conversation_ids", "conversation_ids"):
+        for source_id in _split_identifier_values(metadata.get(key)):
+            source_ids.add(source_id)
+
+    return conversation_ids, source_ids
+
+
+def _parse_llm_log_context(context: Any) -> dict[str, Any]:
+    text = str(context or "").strip()
+    parsed: dict[str, Any] = {
+        "kind": "",
+        "conversation_id": "",
+        "message_index": "",
+        "pass_index": 0,
+        "total_passes": 0,
+        "source_conversation_id": "",
+    }
+    if not text:
+        return parsed
+    if ":" not in text:
+        parsed["kind"] = text
+        return parsed
+
+    kind, body = text.split(":", 1)
+    parsed["kind"] = kind
+
+    if kind == "ticket_segmentation":
+        conversation_id = body
+        if ":pass" in body:
+            before_pass, pass_tail = body.rsplit(":pass", 1)
+            match = re.match(r"(?P<pass>\d+)/(?P<total>\d+):(?P<source>.*)$", pass_tail)
+            if match:
+                conversation_id = before_pass
+                parsed["pass_index"] = int(match.group("pass"))
+                parsed["total_passes"] = int(match.group("total"))
+                parsed["source_conversation_id"] = match.group("source")
+        parsed["conversation_id"] = conversation_id
+        return parsed
+
+    if kind == "message_level":
+        conversation_id, separator, message_index = body.rpartition("#")
+        parsed["conversation_id"] = conversation_id if separator else body
+        parsed["message_index"] = message_index if separator else ""
+        return parsed
+
+    if kind == "conversation_level":
+        parsed["conversation_id"] = body
+        return parsed
+
+    parsed["conversation_id"] = body
+    return parsed
+
+
+def _llm_usage_int(usage: Any, key: str) -> int:
+    if not isinstance(usage, dict):
+        return 0
+    try:
+        return int(usage.get(key) or 0)
+    except Exception:
+        return 0
+
+
+@st.cache_data(show_spinner=False)
+def _llm_call_log_index(path_str: str, size: int, mtime: float) -> list[dict]:
+    entries: list[dict] = []
+    offset = 0
+    with open(path_str, "rb") as handle:
+        for raw in handle:
+            start = offset
+            offset += len(raw)
+            line = raw.strip()
+            if not line:
+                continue
+            try:
+                record = json.loads(line.decode("utf-8", "replace"))
+            except Exception:
+                continue
+            context = str(record.get("context") or "")
+            context_meta = _parse_llm_log_context(context)
+            usage = record.get("usage") or {}
+            prompt_details = usage.get("prompt_tokens_details") if isinstance(usage, dict) else {}
+            if not isinstance(prompt_details, dict):
+                prompt_details = {}
+            try:
+                cached_tokens = int(prompt_details.get("cached_tokens") or 0)
+            except Exception:
+                cached_tokens = 0
+            entries.append(
+                {
+                    "offset": start,
+                    "length": len(raw),
+                    "timestamp": str(record.get("timestamp") or "")[:19],
+                    "context": context,
+                    "kind": context_meta.get("kind") or "",
+                    "conversation_id": context_meta.get("conversation_id") or "",
+                    "message_index": context_meta.get("message_index") or "",
+                    "pass_index": int(context_meta.get("pass_index") or 0),
+                    "total_passes": int(context_meta.get("total_passes") or 0),
+                    "source_conversation_id": context_meta.get("source_conversation_id") or "",
+                    "model": record.get("model") or "",
+                    "thinking_effort": record.get("thinking_effort") or "",
+                    "prompt_tokens": _llm_usage_int(usage, "prompt_tokens"),
+                    "completion_tokens": _llm_usage_int(usage, "completion_tokens"),
+                    "total_tokens": _llm_usage_int(usage, "total_tokens"),
+                    "cached_tokens": cached_tokens,
+                    "elapsed_seconds": round(float(record.get("elapsed_seconds") or 0.0), 2),
+                    "success": bool(record.get("success")),
+                    "system_prompt_chars": len(str(record.get("system_prompt") or "")),
+                    "user_prompt_chars": len(str(record.get("user_prompt") or "")),
+                    "response_chars": len(str(record.get("response_text") or "")),
+                }
+            )
+    return entries
+
+
+def _load_llm_call_log_record(path: Path, offset: int, length: int) -> dict:
+    with path.open("rb") as handle:
+        handle.seek(int(offset))
+        return json.loads(handle.read(int(length)).decode("utf-8", "replace"))
+
+
+def _ticket_eval_response_ticket_rows(response_text: Any) -> list[dict]:
+    try:
+        payload = extract_json_object(str(response_text or ""))
+    except Exception:
+        return []
+    tickets = payload.get("tickets") if isinstance(payload, dict) else None
+    rows: list[dict] = []
+    for ticket in tickets or []:
+        if not isinstance(ticket, dict):
+            continue
+        indexes = [
+            int(value)
+            for value in (ticket.get("included_message_indexes") or [])
+            if str(value).strip().lstrip("-").isdigit()
+        ]
+        rows.append(
+            {
+                "ticket_id": ticket.get("ticket_id"),
+                "category": ticket.get("ticket_category"),
+                "type": ticket.get("ticket_type"),
+                "status": ticket.get("status"),
+                "messages": f"{min(indexes)}-{max(indexes)}" if indexes else "",
+                "n_messages": len(indexes),
+                "objective": ticket.get("customer_objective"),
+            }
+        )
+    return rows
+
+
+def _pretty_ticket_json_text(value: Any) -> str:
+    if isinstance(value, (dict, list)):
+        return json.dumps(value, ensure_ascii=False, indent=2, default=str)
+    text = str(value or "")
+    if not text.strip():
+        return ""
+    try:
+        parsed = extract_json_object(text)
+        return json.dumps(parsed, ensure_ascii=False, indent=2, default=str)
+    except Exception:
+        return text
+
+
+def _render_ticket_eval_preview_logs(preview: dict) -> None:
+    key_suffix = _ticket_eval_log_key(preview)
+    with st.expander("Ticket evaluation logs for this preview", expanded=False):
+        st.caption(
+            "Logs below are scoped to the selected Ticket Evaluation preview customer/journey."
+        )
+        saved_tab, call_tab = st.tabs(["Saved preview debug", "LLM call log"])
+
+        with saved_tab:
+            debug = preview.get("debug") or {}
+            if not debug:
+                st.info("This preview does not have saved debug data.")
+            else:
+                pass_rows = debug.get("cumulative_passes") or []
+                if pass_rows:
+                    st.markdown("**Cumulative passes**")
+                    st.dataframe(pd.DataFrame(pass_rows), use_container_width=True, hide_index=True)
+                raw_response = str(debug.get("raw_model_response") or "")
+                st.markdown("**Saved raw ticket response**")
+                if raw_response:
+                    st.code(_pretty_ticket_json_text(raw_response), language="json")
+                else:
+                    st.caption("No raw ticket response was saved for this preview.")
+                with st.expander("Saved debug JSON", expanded=False):
+                    st.json(debug, expanded=False)
+
+        with call_tab:
+            st.caption(
+                "This reads `logs/llm_calls.jsonl`, which is written only when Ticket Evaluation "
+                "LLM request/response logging is enabled before running the preview."
+            )
+            load_logs = st.checkbox(
+                "Load disk LLM calls for this preview",
+                key=f"ticket_eval_load_llm_logs_{key_suffix}",
+                help="Loads the indexed debug log and filters it to this selected Ticket Evaluation preview.",
+            )
+            if not load_logs:
+                st.info("Enable this checkbox to read the stored prompt/response calls for this preview.")
+                return
+
+            if not LLM_CALL_LOG_PATH.exists():
+                st.warning(
+                    f"No LLM call log found at `{LLM_CALL_LOG_PATH}`. "
+                    "Enable Ticket Evaluation request/response logging, then run the preview again."
+                )
+                return
+
+            stat = LLM_CALL_LOG_PATH.stat()
+            try:
+                index = _llm_call_log_index(str(LLM_CALL_LOG_PATH), stat.st_size, stat.st_mtime)
+            except Exception as exc:
+                st.error(f"Could not read LLM call log: {exc}")
+                return
+
+            conversation_ids, source_ids = _ticket_eval_log_candidate_ids(preview)
+            matching = [
+                row
+                for row in index
+                if row.get("kind") == "ticket_segmentation"
+                and (
+                    row.get("conversation_id") in conversation_ids
+                    or (
+                        source_ids
+                        and row.get("source_conversation_id") in source_ids
+                    )
+                )
+            ]
+            matching = sorted(
+                matching,
+                key=lambda row: (str(row.get("timestamp") or ""), int(row.get("pass_index") or 0)),
+                reverse=True,
+            )
+            if not matching:
+                st.warning(
+                    "No ticket-segmentation LLM calls matched this preview. "
+                    "If this preview was created before logging was enabled, run it again with logging on."
+                )
+                st.caption(
+                    "Matched IDs: "
+                    + ", ".join(sorted(conversation_ids | source_ids)[:12])
+                )
+                return
+
+            st.dataframe(
+                pd.DataFrame(matching)[
+                    [
+                        "timestamp",
+                        "conversation_id",
+                        "pass_index",
+                        "total_passes",
+                        "source_conversation_id",
+                        "model",
+                        "thinking_effort",
+                        "prompt_tokens",
+                        "completion_tokens",
+                        "cached_tokens",
+                        "elapsed_seconds",
+                        "success",
+                    ]
+                ],
+                use_container_width=True,
+                hide_index=True,
+                height=min(360, 88 + len(matching) * 36),
+            )
+
+            labels = [
+                (
+                    f"{idx + 1}. {row.get('timestamp') or 'unknown time'} - "
+                    f"pass {row.get('pass_index') or 1}/{row.get('total_passes') or 1} - "
+                    f"{row.get('source_conversation_id') or row.get('conversation_id')}"
+                )
+                for idx, row in enumerate(matching)
+            ]
+            selected_label = st.selectbox(
+                "Open logged ticket call",
+                labels,
+                key=f"ticket_eval_llm_log_call_{key_suffix}",
+            )
+            selected_row = matching[labels.index(selected_label)]
+            try:
+                record = _load_llm_call_log_record(
+                    LLM_CALL_LOG_PATH,
+                    int(selected_row["offset"]),
+                    int(selected_row["length"]),
+                )
+            except Exception as exc:
+                st.error(f"Could not load selected log record: {exc}")
+                return
+
+            parsed_ticket_rows = _ticket_eval_response_ticket_rows(record.get("response_text"))
+            if parsed_ticket_rows:
+                st.markdown("**Tickets in this logged response**")
+                st.dataframe(pd.DataFrame(parsed_ticket_rows), use_container_width=True, hide_index=True)
+
+            prompt_tab, response_tab, system_tab, meta_tab = st.tabs(
+                ["User prompt", "Response", "System prompt", "Usage/debug"]
+            )
+            with prompt_tab:
+                st.text(str(record.get("user_prompt") or ""))
+            with response_tab:
+                st.code(_pretty_ticket_json_text(record.get("response_text")), language="json")
+            with system_tab:
+                st.text(str(record.get("system_prompt") or ""))
+            with meta_tab:
+                st.json(
+                    {
+                        "context": record.get("context"),
+                        "model": record.get("model"),
+                        "thinking_effort": record.get("thinking_effort"),
+                        "usage": record.get("usage"),
+                        "attempts": record.get("attempts"),
+                        "errors": record.get("errors"),
+                        "reasoning": record.get("reasoning"),
+                    },
+                    expanded=False,
+                )
+
+
 def _render_ticket_preview_result(preview: dict, fallback_records: list[dict] | None = None) -> None:
     preview_records = list(preview.get("records") or fallback_records or [])
     tickets = list(preview.get("tickets") or [])
-    if preview.get("error"):
-        st.error(str(preview.get("error")))
+    error_message = str(preview.get("error") or "").strip()
+    if error_message:
+        st.error(error_message)
+        if preview_records:
+            st.caption("Ticket segmentation failed for this selected journey; showing the initial transcript below.")
+        elif not tickets:
+            return
+
+    if not tickets and not preview_records:
+        st.info("This ticket preview has no ticket output or transcript records to show.")
         return
 
-    tab_labels = ["Initial convo"] + [
+    tab_labels = ["Initial journey"] + [
         f"Ticket {idx}" for idx, _ticket in enumerate(tickets, start=1)
     ]
     ticket_tabs = st.tabs(tab_labels)
     with ticket_tabs[0]:
-        st.markdown("### Initial Conversation")
-        render_conversation_transcript_with_evals(preview_records, [])
-        with st.expander("Conversation metadata"):
+        st.markdown("### Initial Journey")
+        _render_initial_journey_sections(preview_records, tickets)
+        with st.expander("Journey metadata"):
             st.json(preview.get("conversation_metadata") or {}, expanded=False)
 
     for idx, ticket in enumerate(tickets, start=1):
         with ticket_tabs[idx]:
+            display_ticket = _ticket_preview_display_ticket(ticket, preview_records)
+            ticket_title_parts = [
+                humanize_label(display_ticket.get("ticket_category")),
+                humanize_label(display_ticket.get("ticket_type")),
+            ]
             st.markdown(
-                f"### Ticket {idx}: {humanize_label(ticket.get('ticket_type')) or ticket.get('ticket_id') or 'Ticket'}"
+                f"### Ticket {idx}: "
+                f"{' / '.join(part for part in ticket_title_parts if part) or display_ticket.get('ticket_id') or 'Ticket'}"
             )
-            _render_ticket_preview_info(ticket)
+            _render_ticket_preview_info(display_ticket)
             ticket_records = _ticket_preview_records_for_indexes(
                 preview_records,
                 ticket.get("included_message_indexes") or [],
@@ -6586,12 +8360,163 @@ def _render_ticket_preview_result(preview: dict, fallback_records: list[dict] | 
     with st.expander("Raw ticket output"):
         st.json(
             {
-                "tickets": tickets,
-                "raw_model_response": ((preview.get("debug") or {}).get("raw_model_response")),
-                "debug": ((preview.get("debug") or {}).get("debug")),
-            },
+                    "tickets": tickets,
+                    "error": error_message,
+                    "raw_model_response": ((preview.get("debug") or {}).get("raw_model_response")),
+                    "debug": ((preview.get("debug") or {}).get("debug")),
+                },
             expanded=False,
         )
+    _render_ticket_eval_preview_logs(preview)
+
+
+def _render_ticket_preview_collection(previews: list[dict], run_key: dict | None = None) -> None:
+    previews = [
+        _ticket_preview_apply_current_normalization(preview)
+        for preview in list(previews or [])
+    ]
+    if not previews:
+        st.info("No ticket preview is loaded.")
+        return
+
+    if run_key is not None and any(preview.get("run_key") != run_key for preview in previews):
+        st.info("The preview below is from a different selected journey or model. Run again to refresh it.")
+
+    show_multi_ticket_only = st.checkbox(
+        "Only show customers with 2+ tickets",
+        key="ticket_eval_min_two_tickets",
+        help="Filters the generated preview results after ticket segmentation finishes.",
+    )
+    shown_previews = [
+        preview
+        for preview in previews
+        if not show_multi_ticket_only or len(preview.get("tickets") or []) >= 2
+    ]
+    if show_multi_ticket_only and not shown_previews:
+        st.info("No previewed customer/journey has 2 or more tickets.")
+        return
+
+    # on_change="rerun" makes .open a real, queryable bool instead of None,
+    # which is what actually lets us skip _ticket_eval_preview_export_dataframe
+    # (per-ticket category re-derivation for every shown preview) unless the
+    # user has this section open. A plain `with st.expander(...):` here would
+    # NOT gate anything: Streamlit computes and sends expander content on
+    # every rerun regardless of collapsed/expanded state.
+    export_expander = st.expander(
+        "Ticket evaluation CSV",
+        expanded=False,
+        on_change="rerun",
+        key="ticket_eval_csv_export_expander",
+    )
+    if export_expander.open:
+        with export_expander:
+            st.caption("Exports the currently shown ticket evaluation previews, one row per detected ticket.")
+            export_df = _ticket_eval_preview_export_dataframe(shown_previews)
+            st.download_button(
+                "Download ticket_evaluation.csv",
+                data=export_df.to_csv(index=False).encode("utf-8-sig"),
+                file_name="ticket_evaluation.csv",
+                mime="text/csv",
+                disabled=export_df.empty,
+                use_container_width=True,
+            )
+            if not export_df.empty:
+                st.dataframe(export_df.head(50), use_container_width=True, hide_index=True)
+
+    index_key = "ticket_eval_preview_result_index"
+    if index_key not in st.session_state:
+        st.session_state[index_key] = 0
+    sort_by_messages_key = "ticket_eval_preview_sort_by_messages"
+    sort_by_messages = bool(st.session_state.get(sort_by_messages_key, False))
+    if sort_by_messages:
+        shown_previews = [
+            preview
+            for _original_index, preview in sorted(
+                enumerate(shown_previews),
+                key=lambda item: (-_ticket_preview_message_count(item[1]), item[0]),
+            )
+        ]
+
+    preview_labels = []
+    for idx, preview in enumerate(shown_previews, start=1):
+        ticket_count = len(preview.get("tickets") or [])
+        status = "error" if preview.get("error") else f"{ticket_count} ticket(s)"
+        preview_labels.append(
+            f"{idx}. {preview.get('label') or preview.get('conversation_id')} - {status}"
+        )
+    max_preview_index = max(len(preview_labels) - 1, 0)
+    if int(st.session_state[index_key]) > max_preview_index:
+        st.session_state[index_key] = max_preview_index
+    if int(st.session_state[index_key]) < 0:
+        st.session_state[index_key] = 0
+
+    nav_cols = st.columns([1, 1, 1.4, 3.6])
+    current_index = int(st.session_state[index_key])
+    with nav_cols[0]:
+        if st.button(
+            "Previous",
+            key="ticket_eval_prev_customer",
+            use_container_width=True,
+            disabled=current_index <= 0,
+        ):
+            st.session_state[index_key] = max(0, current_index - 1)
+            st.rerun()
+    with nav_cols[1]:
+        if st.button(
+            "Next",
+            key="ticket_eval_next_customer",
+            use_container_width=True,
+            disabled=current_index >= max_preview_index,
+        ):
+            st.session_state[index_key] = min(max_preview_index, current_index + 1)
+            st.rerun()
+    with nav_cols[2]:
+        if st.button(
+            "Loaded order" if sort_by_messages else "Sort by messages",
+            key="ticket_eval_sort_preview_messages",
+            help="When active, Previous/Next and the dropdown browse previews from most messages to fewest.",
+            use_container_width=True,
+        ):
+            st.session_state[sort_by_messages_key] = not sort_by_messages
+            st.session_state[index_key] = 0
+            st.rerun()
+
+    selected_preview_label = preview_labels[current_index]
+    if len(preview_labels) > 1:
+        with nav_cols[3]:
+            # Keyed by current_index so a Previous/Next click (which changes
+            # current_index and reruns) always creates a fresh widget
+            # instance. Streamlit ignores the `index=` argument below on any
+            # rerun where the key already exists in session_state, so a
+            # stable key here would let a stale selectbox selection silently
+            # overwrite the button's index change on the very next line. The
+            # sort mode is part of the key for the same reason when switching
+            # between loaded order and message-count order.
+            sort_key_suffix = "messages" if sort_by_messages else "loaded"
+            select_key = f"ticket_eval_preview_result_{sort_key_suffix}_{current_index}"
+            select_index = (
+                preview_labels.index(st.session_state[select_key])
+                if st.session_state.get(select_key) in preview_labels
+                else current_index
+            )
+            selected_preview_label = st.selectbox(
+                "Customer/journey preview result",
+                preview_labels,
+                index=select_index,
+                key=select_key,
+            )
+    selected_index = preview_labels.index(selected_preview_label)
+    if selected_index != int(st.session_state[index_key]):
+        st.session_state[index_key] = selected_index
+    selected_preview = shown_previews[selected_index]
+    ticket_count = len(selected_preview.get("tickets") or [])
+    st.caption(
+        f"Showing {selected_index + 1} of {len(shown_previews)}: "
+        f"`{selected_preview.get('conversation_id')}` - {ticket_count} ticket(s)."
+    )
+    if sort_by_messages:
+        st.caption("Browse order: most messages first.")
+    _render_ticket_preview_result(selected_preview)
 
 
 def tab_ticket_evaluation() -> None:
@@ -6604,19 +8529,44 @@ def tab_ticket_evaluation() -> None:
         "Run only the ticket-splitting prompt for selected journeys. "
         "Ticket preview runs are saved separately from full CX evaluation runs."
     )
-    _render_saved_ticket_preview_loader()
-    _render_saved_runs_loader("ticket_eval", expanded=False)
+    load_cols = st.columns(2)
+    with load_cols[0]:
+        show_saved_previews = st.checkbox(
+            "Show saved ticket previews",
+            value=False,
+            key="ticket_eval_show_saved_previews",
+            help="Loads the saved ticket-preview list only when you need to load or delete a previous preview.",
+        )
+    with load_cols[1]:
+        show_saved_runs = st.checkbox(
+            "Show saved DB run loader",
+            value=False,
+            key="ticket_eval_show_saved_runs",
+            help="Loads the saved full-run list only when you need to switch the Ticket Evaluation source run.",
+        )
+    if show_saved_previews:
+        _render_saved_ticket_preview_loader()
+    if show_saved_runs:
+        _render_saved_runs_loader("ticket_eval", expanded=False)
 
     source_options: list[str] = []
-    uploaded_labels, uploaded_lookup = _ticket_preview_uploaded_options()
-    loaded_labels, loaded_lookup = _ticket_preview_loaded_run_options()
-    if uploaded_labels:
+    uploaded_labels: list[str] = []
+    loaded_labels: list[str] = []
+    uploaded_lookup: dict[str, dict] = {}
+    loaded_lookup: dict[str, dict] = {}
+    df_uploaded = st.session_state.get("df_norm")
+    if df_uploaded is not None and not df_uploaded.empty:
         source_options.append("Uploaded CSV")
-    if loaded_labels:
+    if _has_results():
         source_options.append("Loaded run")
 
     if not source_options:
-        st.info("Upload a CSV or load a saved run with transcripts first.")
+        previews = list(st.session_state.get("ticket_eval_previews") or [])
+        if previews:
+            st.info("Showing the loaded saved ticket preview. Upload a CSV or load a saved run to create a new preview.")
+            _render_ticket_preview_collection(previews)
+        else:
+            st.info("Upload a CSV or load a saved run with transcripts first.")
         return
 
     if st.session_state.get("ticket_eval_source") not in source_options:
@@ -6628,7 +8578,9 @@ def tab_ticket_evaluation() -> None:
         key="ticket_eval_source",
     )
 
-    labels = uploaded_labels if source == "Uploaded CSV" else loaded_labels
+    loaded_results = getattr(st.session_state.get("run_results"), "conversation_results", []) or []
+    loaded_filtered_items: list[tuple[int, dict]] | None = None
+    total_available = 0
     if source == "Loaded run":
         with st.expander("Loaded-run customer filters", expanded=True):
             category_options = {
@@ -6676,6 +8628,7 @@ def tab_ticket_evaluation() -> None:
             )
 
             saved_preview_keys: set[str] = set()
+            selected_saved_id: int | None = None
             if preview_filter_mode != preview_filter_modes[0]:
                 try:
                     saved_preview_rows = _ticket_preview_list_runs(get_active_db())
@@ -6697,39 +8650,106 @@ def tab_ticket_evaluation() -> None:
                     selected_saved_id = int(
                         saved_preview_rows[saved_preview_labels.index(selected_saved_label)]["id"]
                     )
-                    saved_preview = _ticket_preview_load_run(get_active_db(), selected_saved_id)
-                    saved_preview_keys = _ticket_eval_saved_preview_customer_keys(saved_preview)
+                    saved_preview_keys = _ticket_eval_saved_preview_customer_keys_for_run(selected_saved_id)
                     st.caption(
                         f"Saved ticket-preview filter has {len(saved_preview_keys):,} comparable customer/journey key(s)."
                     )
 
-            filtered_labels: list[str] = []
-            for label in labels:
-                result = loaded_lookup[label]
-                if not _ticket_eval_category_matches(result, selected_category):
-                    continue
-                if saved_preview_keys:
-                    has_customer_match = bool(_ticket_eval_result_customer_keys(result) & saved_preview_keys)
-                    if (
-                        preview_filter_mode == "Include only customers from saved ticket preview"
-                        and not has_customer_match
-                    ):
-                        continue
-                    if (
-                        preview_filter_mode == "Exclude customers from saved ticket preview"
-                        and has_customer_match
-                    ):
-                        continue
-                filtered_labels.append(label)
+            filters_are_default = selected_category == "all" and not saved_preview_keys
+            if filters_are_default:
+                loaded_filtered_items = None
+            else:
+                filter_key = (
+                    _active_db_path(),
+                    st.session_state.get("current_run_id"),
+                    id(loaded_results),
+                    int(len(loaded_results)),
+                    selected_category,
+                    preview_filter_mode,
+                    selected_saved_id,
+                )
+                filter_cache = st.session_state.get("_ticket_eval_loaded_filter_cache")
+                if isinstance(filter_cache, dict) and filter_cache.get("key") == filter_key:
+                    loaded_filtered_items = filter_cache.get("items") or []
+                else:
+                    loaded_filtered_items = []
+                    for position, result in enumerate(loaded_results, start=1):
+                        if not _ticket_eval_category_matches(result, selected_category):
+                            continue
+                        if saved_preview_keys:
+                            has_customer_match = bool(_ticket_eval_result_customer_keys(result) & saved_preview_keys)
+                            if (
+                                preview_filter_mode == "Include only customers from saved ticket preview"
+                                and not has_customer_match
+                            ):
+                                continue
+                            if (
+                                preview_filter_mode == "Exclude customers from saved ticket preview"
+                                and has_customer_match
+                            ):
+                                continue
+                        loaded_filtered_items.append((position, result))
+                    st.session_state["_ticket_eval_loaded_filter_cache"] = {
+                        "key": filter_key,
+                        "items": loaded_filtered_items,
+                    }
             st.caption(
-                f"Loaded-run filters show {len(filtered_labels):,} of {len(labels):,} saved journey(s)."
+                f"Loaded-run filters show "
+                f"{len(loaded_filtered_items) if loaded_filtered_items is not None else len(loaded_results):,} "
+                f"of {len(loaded_results):,} saved journey(s)."
             )
-            labels = filtered_labels
 
-    if not labels:
+            sort_options = ["Loaded order", "Most messages first", "Fewest messages first"]
+            sort_key_name = "ticket_eval_loaded_sort_mode"
+            if st.session_state.get(sort_key_name) not in sort_options:
+                st.session_state[sort_key_name] = sort_options[0]
+            sort_mode = st.selectbox(
+                "Sort journeys by",
+                sort_options,
+                key=sort_key_name,
+                help=(
+                    "Applies to journey position browsing below and to 'First matching journeys' batch "
+                    "selection. Useful for jumping straight to the most (or least) message-heavy journeys."
+                ),
+            )
+            if sort_mode != sort_options[0]:
+                items_to_sort = (
+                    loaded_filtered_items
+                    if loaded_filtered_items is not None
+                    else list(enumerate(loaded_results, start=1))
+                )
+
+                def _ticket_eval_result_message_count(result: dict) -> int:
+                    transcript_count = len(result.get("transcript") or [])
+                    if transcript_count:
+                        return transcript_count
+                    metadata = result.get("conversation_metadata") or {}
+                    try:
+                        return int(metadata.get("total_visible_messages") or 0)
+                    except (TypeError, ValueError):
+                        return 0
+
+                loaded_filtered_items = sorted(
+                    items_to_sort,
+                    key=lambda item: _ticket_eval_result_message_count(item[1]),
+                    reverse=(sort_mode == "Most messages first"),
+                )
+        total_available = len(loaded_filtered_items) if loaded_filtered_items is not None else len(loaded_results)
+    else:
+        total_available = int((st.session_state.get("csv_summary") or {}).get("journeys") or 0)
+        if total_available <= 0:
+            total_available = len(_ticket_eval_uploaded_unique_ids())
+
+    if total_available <= 0:
         st.warning("No journeys match the current Ticket Evaluation filters.")
         return
-    total_available = len(labels)
+
+    ticket_eval_scope_key = _ticket_eval_source_scope_key(source)
+    if source == "Loaded run":
+        st.caption(
+            f"Ticket evaluation source: loaded run #{st.session_state.get('current_run_id') or 'unknown'}."
+        )
+
     mode_options = ["Single customer", "Batch by count"]
     if st.session_state.get("ticket_eval_mode") not in mode_options:
         st.session_state.ticket_eval_mode = mode_options[0]
@@ -6739,13 +8759,260 @@ def tab_ticket_evaluation() -> None:
         horizontal=True,
         key="ticket_eval_mode",
     )
+    active_lookup: dict[str, dict] = {}
+
+    def source_window_options(
+        *,
+        start: int,
+        limit: int,
+        search: str = "",
+    ) -> tuple[list[str], dict[str, dict], int]:
+        if source == "Uploaded CSV":
+            return _ticket_eval_uploaded_window_options(start=start, limit=limit, search=search)
+        return _ticket_eval_loaded_window_options(
+            loaded_results,
+            start=start,
+            limit=limit,
+            search=search,
+            filtered_items=loaded_filtered_items,
+        )
+
+    def source_options_for_ids(ids: list[str]) -> tuple[list[str], dict[str, dict]]:
+        if source == "Uploaded CSV":
+            return _ticket_eval_uploaded_options_for_ids(ids)
+        return _ticket_eval_loaded_options_for_ids(
+            loaded_results,
+            ids,
+            filtered_items=loaded_filtered_items,
+        )
+
+    if source == "Uploaded CSV":
+        all_ticket_eval_ids = _ticket_eval_uploaded_unique_ids()
+        ticket_eval_selector_df = _journey_selector_rows(df_uploaded)
+    else:
+        loaded_source_items = (
+            loaded_filtered_items
+            if loaded_filtered_items is not None
+            else list(enumerate(loaded_results or [], start=1))
+        )
+        all_ticket_eval_ids = [
+            _conversation_result_id(result)
+            for _, result in loaded_source_items
+            if _conversation_result_id(result)
+        ]
+        ticket_eval_selector_df = _saved_conversation_selector_rows(
+            [result for _, result in loaded_source_items]
+        )
+
+    pinned_key = f"ticket_eval_pinned_preview_ids_{ticket_eval_scope_key}"
+    pinned_ids = _ordered_selected_ids(
+        all_ticket_eval_ids,
+        list(st.session_state.get(pinned_key) or []),
+    )
+    if pinned_ids != list(st.session_state.get(pinned_key) or []):
+        st.session_state[pinned_key] = pinned_ids
+
+    st.markdown("### Customer preview selection")
+    st.caption(
+        "Add customers here to control exactly which journeys the Ticket Evaluation preview will run. "
+        "If no customers are pinned, the preview mode below controls the selection."
+    )
+    picker_search_key = f"ticket_eval_picker_search_{ticket_eval_scope_key}"
+    picker_search = st.text_input(
+        "Find customer journey to add",
+        key=picker_search_key,
+        placeholder="Search by customer, phone, journey ID, source conversation ID, or date",
+        disabled=st.session_state.run_in_progress,
+    ).strip().lower()
+    picker_labels, picker_lookup, picker_total = source_window_options(
+        start=0,
+        limit=_TICKET_EVAL_SEARCH_LIMIT,
+        search=picker_search,
+    )
+    picker_label_to_id = {
+        label: str(option.get("conversation_id") or "")
+        for label, option in picker_lookup.items()
+    }
+    st.caption(
+        f"Showing {len(picker_labels):,} matching journey option(s)"
+        + (f" from {picker_total:,} available." if picker_total else ".")
+    )
+    if picker_labels:
+        quick_picker_key = f"ticket_eval_quick_picker_{ticket_eval_scope_key}"
+        if st.session_state.get(quick_picker_key) not in picker_labels:
+            st.session_state[quick_picker_key] = picker_labels[0]
+        quick_picker_label = st.selectbox(
+            "Choose one customer journey",
+            picker_labels,
+            key=quick_picker_key,
+            disabled=st.session_state.run_in_progress,
+        )
+        quick_picker_id = picker_label_to_id.get(quick_picker_label)
+        multi_picker_key = f"ticket_eval_multi_picker_{ticket_eval_scope_key}"
+        if multi_picker_key in st.session_state:
+            picker_label_set = set(picker_labels)
+            st.session_state[multi_picker_key] = [
+                label for label in st.session_state[multi_picker_key] if label in picker_label_set
+            ]
+        picked_preview_labels = st.multiselect(
+            "Select multiple customer journeys",
+            picker_labels,
+            key=multi_picker_key,
+            disabled=st.session_state.run_in_progress,
+            help="Optional: select several matching journeys, then add or replace the pinned preview list.",
+        )
+        picked_preview_ids = [
+            picker_label_to_id[label]
+            for label in picked_preview_labels
+            if picker_label_to_id.get(label)
+        ]
+        selection_cols = st.columns([1, 1, 1, 1])
+        with selection_cols[0]:
+            if st.button(
+                "Add customer",
+                key=f"ticket_eval_add_one_{ticket_eval_scope_key}",
+                use_container_width=True,
+                disabled=not quick_picker_id or st.session_state.run_in_progress,
+                help="Add the chosen customer journey to the pinned preview list.",
+            ):
+                st.session_state[pinned_key] = _ordered_selected_ids(
+                    all_ticket_eval_ids,
+                    pinned_ids + ([quick_picker_id] if quick_picker_id else []),
+                )
+                st.rerun()
+        with selection_cols[1]:
+            if st.button(
+                "Replace with customer",
+                key=f"ticket_eval_replace_one_{ticket_eval_scope_key}",
+                use_container_width=True,
+                disabled=not quick_picker_id or st.session_state.run_in_progress,
+                help="Run Ticket Evaluation preview only for the chosen customer journey.",
+            ):
+                st.session_state[pinned_key] = _ordered_selected_ids(
+                    all_ticket_eval_ids,
+                    [quick_picker_id] if quick_picker_id else [],
+                )
+                st.rerun()
+        with selection_cols[2]:
+            if st.button(
+                "Add selected",
+                key=f"ticket_eval_add_selected_{ticket_eval_scope_key}",
+                use_container_width=True,
+                disabled=not picked_preview_ids or st.session_state.run_in_progress,
+                help="Add all checked customer journeys to the pinned preview list.",
+            ):
+                st.session_state[pinned_key] = _ordered_selected_ids(
+                    all_ticket_eval_ids,
+                    pinned_ids + picked_preview_ids,
+                )
+                st.rerun()
+        with selection_cols[3]:
+            if st.button(
+                "Replace with selected",
+                key=f"ticket_eval_replace_selected_{ticket_eval_scope_key}",
+                use_container_width=True,
+                disabled=not picked_preview_ids or st.session_state.run_in_progress,
+                help="Replace the pinned preview list with all checked customer journeys.",
+            ):
+                st.session_state[pinned_key] = _ordered_selected_ids(
+                    all_ticket_eval_ids,
+                    picked_preview_ids,
+                )
+                st.rerun()
+    else:
+        st.info("No customer journeys match the current Ticket Evaluation search.")
+
+    random_pool_df = ticket_eval_selector_df
+    if picker_search and not random_pool_df.empty and "search_text" in random_pool_df.columns:
+        random_pool_df = random_pool_df[
+            random_pool_df["search_text"].fillna("").astype(str).str.contains(picker_search, regex=False)
+        ]
+    random_pool_ids = (
+        random_pool_df["journey_id"].astype(str).tolist()
+        if not random_pool_df.empty and "journey_id" in random_pool_df.columns
+        else []
+    )
+    random_pool_size = len(random_pool_ids)
+    random_default = min(5, max(random_pool_size, 1))
+    random_count_key = f"ticket_eval_random_preview_count_{ticket_eval_scope_key}"
+    if int(st.session_state.get(random_count_key) or 0) < 1:
+        st.session_state[random_count_key] = random_default
+    if int(st.session_state.get(random_count_key) or 1) > max(random_pool_size, 1):
+        st.session_state[random_count_key] = max(random_pool_size, 1)
+    random_cols = st.columns([1, 1, 1, 2])
+    with random_cols[0]:
+        random_preview_count = int(
+            st.number_input(
+                "Random sample size",
+                min_value=1,
+                max_value=max(random_pool_size, 1),
+                value=int(st.session_state.get(random_count_key) or random_default),
+                step=1,
+                key=random_count_key,
+                disabled=random_pool_size <= 0 or st.session_state.run_in_progress,
+                help="Random sampling uses the current Ticket Evaluation search results. Clear search to sample all available journeys.",
+            )
+        )
+    with random_cols[1]:
+        if st.button(
+            "Random sample",
+            key=f"ticket_eval_random_preview_{ticket_eval_scope_key}",
+            use_container_width=True,
+            disabled=random_pool_size <= 0 or st.session_state.run_in_progress,
+            help="Replace the pinned preview list with a proportional random sample.",
+        ):
+            n = min(max(1, int(random_preview_count)), random_pool_size)
+            sampled_ids = proportional_stratified_sample_ids(random_pool_df, n)
+            st.session_state[pinned_key] = _ordered_selected_ids(all_ticket_eval_ids, sampled_ids)
+            st.rerun()
+    with random_cols[2]:
+        if st.button(
+            "Clear selection",
+            key=f"ticket_eval_clear_pinned_{ticket_eval_scope_key}",
+            use_container_width=True,
+            disabled=not pinned_ids or st.session_state.run_in_progress,
+        ):
+            st.session_state[pinned_key] = []
+            st.rerun()
+    with random_cols[3]:
+        if pinned_ids:
+            st.success(f"{len(pinned_ids):,} customer journey/journeys pinned for Ticket Evaluation preview.")
+        else:
+            st.info("No pinned Ticket Evaluation customers. Preview mode below will choose the journeys.")
+
+    if pinned_ids:
+        preview_df = ticket_eval_selector_df[
+            ticket_eval_selector_df["journey_id"].astype(str).isin(set(pinned_ids))
+        ].copy()
+        if not preview_df.empty:
+            preview_df["order"] = preview_df["journey_id"].astype(str).map(
+                {journey_id: idx for idx, journey_id in enumerate(pinned_ids)}
+            )
+            preview_df = preview_df.sort_values("order")
+            preview_cols = [
+                "customer_phone",
+                "customer_name",
+                "source_conversation_count",
+                "message_count",
+                "conversation_start_date",
+                "conversation_end_date",
+            ]
+            with st.expander("Pinned Ticket Evaluation customers", expanded=False):
+                st.dataframe(
+                    preview_df[[c for c in preview_cols if c in preview_df.columns]],
+                    use_container_width=True,
+                    hide_index=True,
+                )
 
     def selected_payload(label: str) -> dict:
+        option = active_lookup[label]
         if source == "Uploaded CSV":
-            conversation_id, group, metadata_raw = uploaded_lookup[label]
+            conversation_id = str(option.get("conversation_id") or "")
+            group = _ticket_preview_uploaded_group(conversation_id)
+            metadata_raw = conversation_metadata_from_group(group)
             recs = message_records_from_group(group, conversation_id)
         else:
-            summary_result = loaded_lookup[label]
+            summary_result = option.get("summary_result") or {}
             conversation_id = str(summary_result.get("conversation_id") or "")
             detail = _load_selected_conversation_detail(conversation_id) or summary_result
             metadata_raw = detail.get("conversation_metadata") or {}
@@ -6759,24 +9026,50 @@ def tab_ticket_evaluation() -> None:
             "records": recs,
         }
 
-    if source == "Uploaded CSV":
-        if st.session_state.get("ticket_eval_uploaded_conversation") not in labels:
-            st.session_state.ticket_eval_uploaded_conversation = labels[0]
-        selected_label = st.selectbox(
-            "Full customer journey",
-            labels,
-            key="ticket_eval_uploaded_conversation",
-        )
-    else:
-        if st.session_state.get("ticket_eval_loaded_conversation") not in labels:
-            st.session_state.ticket_eval_loaded_conversation = labels[0]
-        selected_label = st.selectbox(
-            "Saved journey",
-            labels,
-            key="ticket_eval_loaded_conversation",
-        )
+    def selected_summary(label: str) -> dict:
+        option = active_lookup[label]
+        if source == "Uploaded CSV":
+            return {
+                "conversation_id": str(option.get("conversation_id") or ""),
+                "message_count": int(option.get("message_count") or 0),
+                "source_conversation_count": int(option.get("source_conversation_count") or 0),
+            }
+        return {
+            "conversation_id": str(option.get("conversation_id") or ""),
+            "message_count": int(option.get("message_count") or 0),
+            "source_conversation_count": int(option.get("source_conversation_count") or 0),
+        }
 
-    if mode == "Batch by count":
+    def selected_payload_cached(label: str) -> dict:
+        summary = selected_summary(label)
+        key = (
+            source,
+            _active_db_path() if source == "Loaded run" else str(st.session_state.get("csv_name") or ""),
+            st.session_state.get("current_run_id") if source == "Loaded run" else id(st.session_state.get("df_norm")),
+            label,
+            summary["conversation_id"],
+        )
+        cached = st.session_state.get("_ticket_eval_selected_payload_cache")
+        if isinstance(cached, dict) and cached.get("key") == key:
+            return dict(cached.get("value") or {})
+        payload = selected_payload(label)
+        st.session_state["_ticket_eval_selected_payload_cache"] = {
+            "key": key,
+            "value": payload,
+        }
+        return payload
+
+    if pinned_ids:
+        selected_labels, active_lookup = source_options_for_ids(pinned_ids)
+        if not selected_labels:
+            st.warning("The pinned Ticket Evaluation customers are no longer available for the current source/filter.")
+            st.session_state[pinned_key] = []
+            return
+        selected_label = selected_labels[0]
+        st.caption(
+            f"Using {len(selected_labels):,} pinned customer journey/journeys for this Ticket Evaluation preview."
+        )
+    elif mode == "Batch by count":
         default_count = min(5, max(total_available, 1))
         if int(st.session_state.get("ticket_eval_batch_count") or 0) < 1:
             st.session_state.ticket_eval_batch_count = default_count
@@ -6789,31 +9082,195 @@ def tab_ticket_evaluation() -> None:
             value=min(int(st.session_state.ticket_eval_batch_count), max(total_available, 1)),
             step=1,
             key="ticket_eval_batch_count",
-            help="Uses the first N journeys from the selected source list.",
+            help="For loaded DB runs, you can use source order or a random sample from the current filters.",
         )
-        selected_labels = labels[: int(batch_count)]
+        batch_selection_strategy = "First matching journeys"
+        if source == "Loaded run":
+            strategy_options = ["First matching journeys", "Random from loaded DB run"]
+            strategy_key = "ticket_eval_loaded_batch_selection_strategy"
+            if st.session_state.get(strategy_key) not in strategy_options:
+                st.session_state[strategy_key] = strategy_options[0]
+            batch_selection_strategy = st.selectbox(
+                "Batch selection",
+                strategy_options,
+                key=strategy_key,
+                help=(
+                    "Random uses only the currently filtered journeys from the loaded DB run. "
+                    "The chosen random batch stays fixed until you reshuffle or change filters/count."
+                ),
+            )
+        if source == "Loaded run" and batch_selection_strategy == "Random from loaded DB run":
+            sample_items = (
+                list(loaded_filtered_items)
+                if loaded_filtered_items is not None
+                else list(enumerate(loaded_results or [], start=1))
+            )
+            sample_df = _saved_conversation_selector_rows([result for _, result in sample_items])
+            random_state_key = "ticket_eval_loaded_random_batch"
+            sample_key = (
+                _active_db_path(),
+                st.session_state.get("current_run_id"),
+                id(loaded_results),
+                int(len(loaded_results)),
+                int(total_available),
+                selected_category,
+                preview_filter_mode,
+                selected_saved_id,
+                int(batch_count),
+            )
+            reshuffle = st.button(
+                "Reshuffle random DB batch",
+                key=f"ticket_eval_loaded_random_batch_reshuffle_{ticket_eval_scope_key}",
+                disabled=sample_df.empty,
+                use_container_width=True,
+            )
+            random_state = st.session_state.get(random_state_key)
+            sampled_ids = list(random_state.get("ids") or []) if isinstance(random_state, dict) else []
+            available_ids = set(sample_df["journey_id"].astype(str).tolist()) if not sample_df.empty else set()
+            sampled_ids = [journey_id for journey_id in sampled_ids if journey_id in available_ids]
+            needs_sample = (
+                reshuffle
+                or not isinstance(random_state, dict)
+                or random_state.get("key") != sample_key
+                or len(sampled_ids) != min(int(batch_count), len(available_ids))
+            )
+            if needs_sample:
+                sampled_ids = proportional_stratified_sample_ids(sample_df, int(batch_count))
+                st.session_state[random_state_key] = {
+                    "key": sample_key,
+                    "ids": sampled_ids,
+                }
+            selected_labels, active_lookup = _ticket_eval_loaded_options_for_ids(
+                loaded_results,
+                sampled_ids,
+                filtered_items=loaded_filtered_items,
+            )
+            sample_mix = (
+                sample_df[sample_df["journey_id"].astype(str).isin(set(sampled_ids))]
+                ["journey_starter"]
+                .value_counts()
+                if not sample_df.empty
+                else pd.Series(dtype=int)
+            )
+            mix_summary = ", ".join(
+                f"{humanize_label(starter)} {int(count):,}"
+                for starter, count in sample_mix.items()
+            )
+            st.caption(
+                f"Randomly selected {len(selected_labels):,} loaded DB journey/journeys"
+                + (f": {mix_summary}." if mix_summary else ".")
+            )
+        else:
+            selected_labels, active_lookup, _ = source_window_options(
+                start=0,
+                limit=int(batch_count),
+            )
+        if not selected_labels:
+            st.warning("No journeys are available for the current Ticket Evaluation selection.")
+            return
+        selected_label = selected_labels[0]
     else:
+        selector_key_prefix = (
+            f"ticket_eval_uploaded_conversation_{ticket_eval_scope_key}"
+            if source == "Uploaded CSV"
+            else f"ticket_eval_loaded_conversation_{ticket_eval_scope_key}"
+        )
+        selector_search = st.text_input(
+            "Search journey",
+            key=f"{selector_key_prefix}_search",
+            placeholder="Search by customer, phone, or journey ID",
+        )
+        if str(selector_search or "").strip():
+            visible_labels, active_lookup, match_count = source_window_options(
+                start=0,
+                limit=_TICKET_EVAL_SEARCH_LIMIT,
+                search=str(selector_search or ""),
+            )
+            st.caption(
+                f"Showing {len(visible_labels):,} matching journey(s)"
+                + (f" out of {match_count:,} match(es)." if match_count else ".")
+            )
+        else:
+            position_key = f"{selector_key_prefix}_position"
+            raw_position = int(st.session_state.get(position_key) or 1)
+            raw_position = min(max(raw_position, 1), total_available)
+            position = st.number_input(
+                "Journey position",
+                min_value=1,
+                max_value=max(total_available, 1),
+                value=raw_position,
+                step=1,
+                key=position_key,
+                help="Jump through the journey list without rendering every option at once.",
+            )
+            start = min(max(int(position) - 1, 0), max(total_available - 1, 0))
+            visible_labels, active_lookup, _ = source_window_options(
+                start=start,
+                limit=_TICKET_EVAL_SELECTOR_PAGE_SIZE,
+            )
+            end = min(total_available, start + len(visible_labels))
+            st.caption(f"Showing journeys {start + 1:,}-{end:,} out of {total_available:,}.")
+        if not visible_labels:
+            st.warning("No journeys match the current Ticket Evaluation selection.")
+            return
+        visible_select_key = f"{selector_key_prefix}_visible_select"
+        if st.session_state.get(visible_select_key) not in visible_labels:
+            st.session_state[visible_select_key] = visible_labels[0]
+        selected_label = st.selectbox(
+            "Full customer journey" if source == "Uploaded CSV" else "Saved journey",
+            visible_labels,
+            key=visible_select_key,
+        )
         selected_labels = [selected_label]
 
-    current_payload = selected_payload(selected_labels[0])
-    conversation_id = current_payload["conversation_id"]
-    metadata = current_payload["metadata"]
-    records = current_payload["records"]
-
-    if not records:
-        st.warning("The selected journey has no visible transcript messages.")
-        return
+    selected_summaries = [selected_summary(label) for label in selected_labels]
+    selected_conversation_ids = [summary["conversation_id"] for summary in selected_summaries]
+    first_message_count = int((selected_summaries[0] or {}).get("message_count") or 0)
     try:
         _, _, ticket_prompt_tpl, _, _, ticket_prompt_id = _load_active_prompts()
     except Exception as exc:
         st.error(f"Could not load active ticket segmentation prompt: {exc}")
         return
 
+    ticket_eval_mode_options = _ticket_segmentation_mode_options()
+    ticket_eval_mode_key = "ticket_eval_segmentation_mode"
+    if st.session_state.get(ticket_eval_mode_key) not in ticket_eval_mode_options:
+        st.session_state[ticket_eval_mode_key] = _clean_ticket_segmentation_mode(
+            st.session_state.get("ticket_segmentation_mode")
+        )
+    ticket_preview_segmentation_mode = st.selectbox(
+        "Ticket splitting mode",
+        ticket_eval_mode_options,
+        key=ticket_eval_mode_key,
+        format_func=_ticket_segmentation_mode_label,
+        help=(
+            "Single pass sends the selected journey once. Cumulative mode sends each source conversation "
+            "separately, passing only the previous ticket summary forward."
+        ),
+    )
+    if ticket_preview_segmentation_mode == TICKET_SEGMENTATION_MODE_SINGLE_PASS:
+        ticket_preview_call_count_label = f"{len(selected_labels):,}"
+    else:
+        source_counts = [
+            int(summary.get("source_conversation_count") or 0)
+            for summary in selected_summaries
+        ]
+        if all(count > 0 for count in source_counts):
+            ticket_preview_call_count_label = f"{sum(source_counts):,}"
+        else:
+            ticket_preview_call_count_label = "Counted on run"
+
     metric_row(
         [
             ("Available journeys", f"{total_available:,}", None),
             ("Selected previews", f"{len(selected_labels):,}", None),
-            ("First selected messages", f"{len(records):,}", None),
+            (
+                "First selected messages",
+                f"{first_message_count:,}" if first_message_count else "Loaded on run",
+                None,
+            ),
+            ("Ticket preview calls", ticket_preview_call_count_label, None),
+            ("Concurrency", f"{max(1, int(st.session_state.concurrency)):,}", None),
             (
                 "Ticket model",
                 st.session_state.get("ticket_selected_model")
@@ -6828,13 +9285,24 @@ def tab_ticket_evaluation() -> None:
         key="ticket_eval_preview_name",
         placeholder="Optional, e.g. Ticket split test - 20 customers",
     )
+    if "ticket_eval_debug_log_llm_calls" not in st.session_state:
+        st.session_state.ticket_eval_debug_log_llm_calls = bool(
+            st.session_state.get("debug_log_llm_calls", False)
+        )
+    st.toggle(
+        "Log Ticket Evaluation LLM requests/responses",
+        key="ticket_eval_debug_log_llm_calls",
+        help=(
+            "Writes Ticket Evaluation prompt, input, raw response, reasoning, and usage to "
+            "`logs/llm_calls.jsonl`. Enable before running the preview when you want to inspect "
+            "the exact calls for a specific journey."
+        ),
+    )
 
     run_key = {
         "source": source,
         "mode": mode,
-        "conversation_ids": [
-            selected_payload(label)["conversation_id"] for label in selected_labels
-        ],
+        "conversation_ids": selected_conversation_ids,
         "model": (
             st.session_state.get("ticket_selected_model")
             or st.session_state.get("conversation_selected_model")
@@ -6844,11 +9312,41 @@ def tab_ticket_evaluation() -> None:
         or st.session_state.get("conversation_thinking_effort")
         or "default",
         "ticket_prompt_id": ticket_prompt_id,
+        "ticket_segmentation_mode": ticket_preview_segmentation_mode,
     }
 
-    if st.button("Run ticket evaluation preview", type="primary", use_container_width=True):
+    preview_run_col, preview_cancel_col, _ = st.columns([1, 1, 3])
+    with preview_run_col:
+        run_ticket_preview_clicked = st.button(
+            "Run ticket evaluation preview",
+            type="primary",
+            disabled=st.session_state.run_in_progress,
+            use_container_width=True,
+        )
+    with preview_cancel_col:
+        if st.button(
+            "Cancel ticket evaluation",
+            key="ticket_eval_cancel_button",
+            disabled=not st.session_state.run_in_progress,
+            use_container_width=True,
+            on_click=_request_cancel_run,
+        ):
+            st.toast("Cancelling after current ticket call finishes...")
+    live_cancel_box = st.empty()
+
+    if run_ticket_preview_clicked:
+        st.session_state.run_in_progress = True
+        cancel_event = _new_run_cancel_event()
+        with live_cancel_box.container():
+            st.button(
+                "Cancel ticket evaluation",
+                key="ticket_eval_cancel_live_button",
+                use_container_width=True,
+                on_click=_request_cancel_run,
+            )
         try:
             api = _build_ticket_api_config()
+            api.debug_log_calls = bool(st.session_state.get("ticket_eval_debug_log_llm_calls", False))
             client = build_client(api.base_url, api.api_key)
             truncate_chars = (
                 int(st.session_state.max_chars_per_message)
@@ -6856,36 +9354,147 @@ def tab_ticket_evaluation() -> None:
                 else None
             )
             previews: list[dict] = []
+            cancelled = False
             status_box = st.empty()
-            with st.spinner("Running ticket segmentation..."):
-                for index, label in enumerate(selected_labels, start=1):
-                    payload = selected_payload(label)
-                    status_box.info(
-                        f"Ticket preview {index}/{len(selected_labels)} - {label}"
+            with st.spinner("Loading selected journey transcripts..."):
+                selected_payloads = [selected_payload(label) for label in selected_labels]
+            empty_payload_labels = [
+                payload["label"]
+                for payload in selected_payloads
+                if not payload.get("records")
+            ]
+            if empty_payload_labels:
+                st.warning(
+                    "Some selected journeys have no visible transcript messages and were skipped: "
+                    + ", ".join(empty_payload_labels[:5])
+                    + (" ..." if len(empty_payload_labels) > 5 else "")
+                )
+            selected_payloads = [
+                payload for payload in selected_payloads if payload.get("records")
+            ]
+            if not selected_payloads:
+                st.warning("The selected journey selection has no visible transcript messages.")
+                return
+            ticket_preview_call_count = sum(
+                _ticket_segmentation_call_count_for_records(payload["records"], ticket_preview_segmentation_mode)
+                for payload in selected_payloads
+            )
+            workers = min(max(1, int(getattr(api, "concurrency", 1) or 1)), len(selected_payloads))
+
+            def cancel_requested() -> bool:
+                return cancel_event.is_set()
+
+            def run_ticket_preview_task(task: tuple[int, str, dict]) -> tuple[int, dict]:
+                index, label, payload = task
+                try:
+                    if cancel_requested():
+                        raise RuntimeError("Ticket evaluation cancelled before this preview started.")
+                    preview = preview_ticket_segmentation(
+                        client,
+                        api,
+                        payload["conversation_id"],
+                        payload["records"],
+                        payload["metadata"],
+                        truncate_chars,
+                        ticket_prompt_tpl,
+                        ticket_preview_segmentation_mode,
+                        cancel_requested=cancel_requested,
                     )
-                    try:
-                        preview = preview_ticket_segmentation(
-                            client,
-                            api,
-                            payload["conversation_id"],
-                            payload["records"],
-                            payload["metadata"],
-                            truncate_chars,
-                            ticket_prompt_tpl,
+                    preview["records"] = payload["records"]
+                    if (preview.get("debug") or {}).get("cancelled"):
+                        preview["error"] = "Ticket evaluation cancelled before this preview completed."
+                except Exception as preview_exc:
+                    preview = {
+                        "conversation_id": payload["conversation_id"],
+                        "conversation_metadata": payload["metadata"],
+                        "records": payload["records"],
+                        "tickets": [],
+                        "error": str(preview_exc),
+                    }
+                preview["label"] = label
+                preview["run_key"] = run_key
+                return index, preview
+
+            tasks = [
+                (index, payload["label"], payload)
+                for index, payload in enumerate(selected_payloads, start=1)
+            ]
+            preview_by_index: dict[int, dict] = {}
+            with st.spinner(f"Running ticket segmentation with {workers} concurrent worker(s)..."):
+                status_box.info(
+                    f"Dispatching {ticket_preview_call_count:,} ticket preview call(s) "
+                    f"across {len(tasks):,} journey selection(s) with concurrency {workers:,}. "
+                    f"Mode: {_ticket_segmentation_mode_label(ticket_preview_segmentation_mode)}."
+                )
+                with cf.ThreadPoolExecutor(max_workers=workers) as ex:
+                    completed = 0
+                    next_task_index = 0
+                    pending: dict[cf.Future, tuple[int, str, dict]] = {}
+
+                    def fill_ticket_preview_slots() -> None:
+                        nonlocal next_task_index
+                        while (
+                            len(pending) < workers
+                            and next_task_index < len(tasks)
+                            and not cancel_requested()
+                        ):
+                            task_to_submit = tasks[next_task_index]
+                            next_task_index += 1
+                            pending[ex.submit(run_ticket_preview_task, task_to_submit)] = task_to_submit
+
+                    fill_ticket_preview_slots()
+                    while pending:
+                        done, _ = cf.wait(pending, timeout=0.5, return_when=cf.FIRST_COMPLETED)
+                        if not done:
+                            if cancel_requested():
+                                cancelled = True
+                                status_box.warning(
+                                    "Cancellation requested. Waiting for active ticket call(s) to finish, "
+                                    "then saving completed previews."
+                                )
+                            continue
+                        for future in done:
+                            task = pending.pop(future)
+                            if future.cancelled():
+                                continue
+                            if cancel_requested():
+                                cancelled = True
+                            try:
+                                result_index, preview = future.result()
+                            except Exception as preview_exc:  # noqa: BLE001
+                                result_index, label, payload = task
+                                preview = {
+                                    "conversation_id": payload["conversation_id"],
+                                    "conversation_metadata": payload["metadata"],
+                                    "records": payload["records"],
+                                    "tickets": [],
+                                    "error": str(preview_exc),
+                                    "label": label,
+                                    "run_key": run_key,
+                                }
+                            preview_by_index[int(result_index)] = preview
+                            completed += 1
+                            ticket_count = len(preview.get("tickets") or [])
+                            if (preview.get("debug") or {}).get("cancelled"):
+                                cancelled = True
+                            status_box.info(
+                                f"Completed ticket preview {completed}/{len(tasks)} - "
+                                f"{preview.get('label')} - {ticket_count} ticket(s)"
+                            )
+                            if cancel_requested():
+                                cancelled = True
+                            if not cancelled:
+                                fill_ticket_preview_slots()
+                    if cancelled:
+                        status_box.warning(
+                            f"Ticket evaluation cancelled. Completed {completed:,} of {len(tasks):,} preview(s)."
                         )
-                        preview["records"] = payload["records"]
-                    except Exception as preview_exc:
-                        preview = {
-                            "conversation_id": payload["conversation_id"],
-                            "conversation_metadata": payload["metadata"],
-                            "records": payload["records"],
-                            "tickets": [],
-                            "error": str(preview_exc),
-                        }
-                    preview["label"] = label
-                    preview["run_key"] = run_key
+            for index in range(1, len(tasks) + 1):
+                preview = preview_by_index.get(index)
+                if preview:
                     previews.append(preview)
             status_box.empty()
+            cancelled = bool(cancelled or cancel_event.is_set() or _cancel_requested())
             source_run_id = (
                 int(st.session_state.current_run_id)
                 if source == "Loaded run" and st.session_state.get("current_run_id") is not None
@@ -6916,6 +9525,12 @@ def tab_ticket_evaluation() -> None:
                     "selected_labels": selected_labels,
                     "source_run_id": source_run_id,
                     "ticket_prompt_id": ticket_prompt_id,
+                    "ticket_preview_call_count": ticket_preview_call_count,
+                    "requested_previews": len(tasks),
+                    "completed_previews": len(previews),
+                    "cancelled": cancelled,
+                    "debug_log_llm_calls": bool(st.session_state.get("ticket_eval_debug_log_llm_calls", False)),
+                    "llm_call_log_path": str(LLM_CALL_LOG_PATH),
                     "source_label": (
                         st.session_state.get("loaded_run_label")
                         if source == "Loaded run"
@@ -6925,93 +9540,43 @@ def tab_ticket_evaluation() -> None:
                 previews=previews,
             )
             st.session_state.ticket_eval_previews = previews
-            st.session_state.ticket_eval_preview_result_index = 0
+            st.session_state.ticket_eval_preview_result_index = _ticket_preview_default_result_index(previews)
             st.session_state.ticket_eval_loaded_preview_run_id = saved_preview_id
-            st.success(
-                f"Created and saved ticket preview #{saved_preview_id} "
-                f"for {len(previews):,} customer/journey selection(s)."
-            )
+            st.session_state.pop("_ticket_preview_runs_cache", None)
+            if cancelled:
+                st.warning(
+                    f"Ticket evaluation cancelled. Saved ticket preview #{saved_preview_id} "
+                    f"with {len(previews):,} completed customer/journey preview(s)."
+                )
+            else:
+                st.success(
+                    f"Created and saved ticket preview #{saved_preview_id} "
+                    f"for {len(previews):,} customer/journey selection(s)."
+                )
         except Exception as exc:
             st.error(f"Ticket evaluation failed: {exc}")
+        finally:
+            live_cancel_box.empty()
+            st.session_state.run_in_progress = False
+            _clear_run_cancel_event(cancel_event)
 
     previews = list(st.session_state.get("ticket_eval_previews") or [])
     if not previews:
-        with st.expander("Initial conversation", expanded=True):
-            render_conversation_transcript_with_evals(records, [])
+        st.info(
+            "No ticket preview is loaded for the current selection yet. "
+            "The selected transcript is loaded only when you run the preview or ask to inspect it."
+        )
+        if st.button("Load selected initial journey", key="ticket_eval_load_selected_initial_journey"):
+            with st.spinner("Loading selected journey transcript..."):
+                current_payload = selected_payload_cached(selected_label)
+            records = list(current_payload.get("records") or [])
+            if not records:
+                st.warning("The selected journey has no visible transcript messages.")
+            else:
+                with st.expander("Initial journey", expanded=True):
+                    _render_initial_journey_sections(records)
         return
-    if any(preview.get("run_key") != run_key for preview in previews):
-        st.info("The preview below is from a different selected journey or model. Run again to refresh it.")
-
-    show_multi_ticket_only = st.checkbox(
-        "Only show customers with 2+ tickets",
-        key="ticket_eval_min_two_tickets",
-        help="Filters the generated preview results after ticket segmentation finishes.",
-    )
-    shown_previews = [
-        preview
-        for preview in previews
-        if not show_multi_ticket_only or len(preview.get("tickets") or []) >= 2
-    ]
-    if show_multi_ticket_only and not shown_previews:
-        st.info("No previewed customer/journey has 2 or more tickets.")
-        return
-
-    preview_labels = [
-        f"{idx}. {preview.get('label') or preview.get('conversation_id')}"
-        for idx, preview in enumerate(shown_previews, start=1)
-    ]
-    index_key = "ticket_eval_preview_result_index"
-    if index_key not in st.session_state:
-        st.session_state[index_key] = 0
-    max_preview_index = max(len(preview_labels) - 1, 0)
-    if int(st.session_state[index_key]) > max_preview_index:
-        st.session_state[index_key] = max_preview_index
-    if int(st.session_state[index_key]) < 0:
-        st.session_state[index_key] = 0
-
-    nav_cols = st.columns([1, 1, 4])
-    current_index = int(st.session_state[index_key])
-    with nav_cols[0]:
-        if st.button(
-            "Previous",
-            key="ticket_eval_prev_customer",
-            use_container_width=True,
-            disabled=current_index <= 0,
-        ):
-            st.session_state[index_key] = max(0, current_index - 1)
-            st.rerun()
-    with nav_cols[1]:
-        if st.button(
-            "Next",
-            key="ticket_eval_next_customer",
-            use_container_width=True,
-            disabled=current_index >= max_preview_index,
-        ):
-            st.session_state[index_key] = min(max_preview_index, current_index + 1)
-            st.rerun()
-
-    selected_preview_label = preview_labels[current_index]
-    if len(preview_labels) > 1:
-        with nav_cols[2]:
-            select_key = "ticket_eval_preview_result"
-            if st.session_state.get(select_key) not in preview_labels:
-                st.session_state[select_key] = selected_preview_label
-            selected_preview_label = st.selectbox(
-                "Customer/journey preview result",
-                preview_labels,
-                index=current_index,
-                key=select_key,
-            )
-    selected_index = preview_labels.index(selected_preview_label)
-    if selected_index != int(st.session_state[index_key]):
-        st.session_state[index_key] = selected_index
-    selected_preview = shown_previews[selected_index]
-    ticket_count = len(selected_preview.get("tickets") or [])
-    st.caption(
-        f"Showing {selected_index + 1} of {len(shown_previews)}: "
-        f"`{selected_preview.get('conversation_id')}` - {ticket_count} ticket(s)."
-    )
-    _render_ticket_preview_result(selected_preview, records)
+    _render_ticket_preview_collection(previews, run_key=run_key)
 
 
 # --------- Tab: Run Evaluation ---------
@@ -7198,7 +9763,7 @@ def tab_run() -> None:
         with cancel_col:
             if st.session_state.run_in_progress:
                 if st.button("Cancel run", use_container_width=True):
-                    st.session_state.cancel_flag = True
+                    _request_cancel_run()
                     st.toast("Cancelling after current call finishes...")
 
         progress_box = st.empty()
@@ -7406,6 +9971,44 @@ def tab_run() -> None:
         f"Showing {len(visible_selector_df):,} of {len(filtered_selector_df):,} matching journeys "
         f"({len(selector_df):,} total)."
     )
+
+    if visible_options:
+        quick_select_key = "journey_selection_quick_customer"
+        if st.session_state.get(quick_select_key) not in visible_options:
+            st.session_state[quick_select_key] = visible_options[0]
+        quick_label = st.selectbox(
+            "Choose one customer journey",
+            options=visible_options,
+            key=quick_select_key,
+            help="Use search to narrow the list, then add one customer journey to the pinned run selection.",
+        )
+        quick_id = label_to_id.get(quick_label)
+        quick_cols = st.columns([1, 1, 3])
+        with quick_cols[0]:
+            if st.button(
+                "Add customer",
+                use_container_width=True,
+                disabled=not quick_id,
+                help="Add this one customer journey to the pinned run selection.",
+            ):
+                st.session_state.selected_conversation_ids = _ordered_selected_ids(
+                    all_ids,
+                    selected_ids + ([quick_id] if quick_id else []),
+                )
+                st.rerun()
+        with quick_cols[1]:
+            if st.button(
+                "Replace with customer",
+                use_container_width=True,
+                disabled=not quick_id,
+                help="Clear the pinned selection and run only this customer journey.",
+            ):
+                st.session_state.selected_conversation_ids = _ordered_selected_ids(
+                    all_ids,
+                    [quick_id] if quick_id else [],
+                )
+                st.rerun()
+
     picked_labels = st.multiselect(
         "Select customer journeys from the current search results",
         options=visible_options,
@@ -7413,6 +10016,33 @@ def tab_run() -> None:
         help="Pick one or more matching customer journeys, then add or replace the pinned run selection.",
     )
     picked_ids = [label_to_id[label] for label in picked_labels if label in label_to_id]
+
+    random_pool_df = filtered_selector_df if not filtered_selector_df.empty else selector_df.iloc[0:0].copy()
+    random_pool_size = int(len(random_pool_df))
+    random_default = min(
+        max(1, int(st.session_state.get("max_conversations") or 1)),
+        max(random_pool_size, 1),
+    )
+    random_count_key = "journey_selection_random_count"
+    if int(st.session_state.get(random_count_key) or 0) < 1:
+        st.session_state[random_count_key] = random_default
+    if int(st.session_state.get(random_count_key) or 1) > max(random_pool_size, 1):
+        st.session_state[random_count_key] = max(random_pool_size, 1)
+    random_sample_size = int(
+        st.number_input(
+            "Random sample size",
+            min_value=1,
+            max_value=max(random_pool_size, 1),
+            value=int(st.session_state.get(random_count_key) or random_default),
+            step=1,
+            key=random_count_key,
+            disabled=random_pool_size <= 0,
+            help=(
+                "Random sampling uses the current search results. Clear the search to sample from "
+                "all uploaded CSV journeys."
+            ),
+        )
+    )
 
     pick_cols = st.columns([1, 1, 1, 1, 1])
     with pick_cols[0]:
@@ -7452,23 +10082,19 @@ def tab_run() -> None:
             help=(
                 "Pick a random sample while preserving the uploaded CSV's proportions of "
                 "consumer-, system-, bot-, and agent-initiated journeys. "
-                "Sample size uses the sidebar journey count, or all journeys when Run all uploaded journeys is enabled."
+                "Sample size comes from the Random sample size field."
             ),
-            disabled=not all_ids,
+            disabled=random_pool_size <= 0,
         ):
-            if st.session_state.get("run_all_conversations"):
-                n = len(all_ids)
-            else:
-                n = max(1, int(st.session_state.max_conversations or 1))
-            n = min(n, len(all_ids))
-            sampled_ids = proportional_stratified_sample_ids(selector_df, n)
+            n = min(max(1, int(random_sample_size)), random_pool_size)
+            sampled_ids = proportional_stratified_sample_ids(random_pool_df, n)
             st.session_state.selected_conversation_ids = _ordered_selected_ids(
                 all_ids,
                 sampled_ids,
             )
-            source_mix = selector_df["journey_starter"].value_counts()
+            source_mix = random_pool_df["journey_starter"].value_counts()
             sample_mix = (
-                selector_df[selector_df["journey_id"].astype(str).isin(sampled_ids)]
+                random_pool_df[random_pool_df["journey_id"].astype(str).isin(sampled_ids)]
                 ["journey_starter"]
                 .value_counts()
             )
@@ -7476,13 +10102,16 @@ def tab_run() -> None:
                 (
                     f"{humanize_label(starter)} "
                     f"{int(sample_mix.get(starter, 0)):,}/{n:,} "
-                    f"({int(sample_mix.get(starter, 0)) / n:.1%}; source {count / len(selector_df):.1%})"
+                    f"({int(sample_mix.get(starter, 0)) / n:.1%}; source {count / random_pool_size:.1%})"
                 )
                 for starter, count in source_mix.items()
             )
             st.session_state.selection_import_feedback = (
                 "success",
-                f"Selected a proportional random sample of {n:,} journeys: {mix_summary}.",
+                (
+                    f"Selected a proportional random sample of {n:,} journey/journeys "
+                    f"from {random_pool_size:,} matching uploaded CSV journey/journeys: {mix_summary}."
+                ),
             )
             st.rerun()
     with pick_cols[4]:
@@ -7649,7 +10278,17 @@ def tab_run() -> None:
             target_role=target_role,
         )
 
-    ticket_segmentation_calls = int(estimate["conversations"]) if st.session_state.enable_ticket_segmentation else 0
+    ticket_mode = _clean_ticket_segmentation_mode(st.session_state.get("ticket_segmentation_mode"))
+    ticket_segmentation_calls = (
+        _estimate_ticket_segmentation_calls_for_df(
+            df_for_estimate if selected_ids else df,
+            max_conversations=None if selected_ids else max_conversations_for_estimate,
+            selected_conversation_ids=None,
+            mode=ticket_mode,
+        )
+        if st.session_state.enable_ticket_segmentation
+        else 0
+    )
     estimate["ticket_segmentation_calls"] = ticket_segmentation_calls
     estimate["total_calls"] = int(estimate["total_calls"]) + ticket_segmentation_calls
 
@@ -7674,6 +10313,7 @@ def tab_run() -> None:
         st.caption(
             "Ticket mode estimate is based on the selected original timelines before AI splitting. "
             "The progress bar updates to the actual ticket count and message calls after splitting finishes. "
+            f"Ticket splitting mode: `{_ticket_segmentation_mode_label(ticket_mode)}`. "
             f"Ticket model: `{st.session_state.get('ticket_selected_model') or st.session_state.get('conversation_selected_model') or st.session_state.selected_model}`."
         )
 
@@ -7779,7 +10419,7 @@ def tab_run() -> None:
     with cancel_col:
         if st.session_state.run_in_progress:
             if st.button("Cancel run", use_container_width=True):
-                st.session_state.cancel_flag = True
+                _request_cancel_run()
                 st.toast("Cancelling after current call finishes...")
     if not conversation_only_available:
         st.caption("Load or run message-level results first to enable conversation-only reruns.")
@@ -7793,7 +10433,7 @@ def tab_run() -> None:
 
     if run_clicked:
         st.session_state.run_in_progress = True
-        st.session_state.cancel_flag = False
+        cancel_event = _new_run_cancel_event()
         st.session_state.progress_log = []
 
         config, ml_prompt_id, cl_prompt_id = _build_run_config()
@@ -7825,6 +10465,7 @@ def tab_run() -> None:
             "stop_on_error": config.stop_on_error,
             "save_raw_responses": config.save_raw_responses,
             "enable_ticket_segmentation": config.enable_ticket_segmentation,
+            "ticket_segmentation_mode": config.ticket_segmentation_mode,
             "message_target_role": config.message_target_role,
             "selected_conversation_ids": config.selected_conversation_ids,
             "selected_conversation_count": len(config.selected_conversation_ids or []),
@@ -7863,11 +10504,15 @@ def tab_run() -> None:
             nonlocal total_conv, total_msg
             phase = evt.get("phase")
             if phase == "ticket_segmentation_start":
+                mode_label = _ticket_segmentation_mode_label(str(evt.get("segmentation_mode") or ""))
+                planned_ticket_calls = int(evt.get("planned_ticket_calls") or evt.get("total_conversations") or 0)
                 current_box.info(
-                    f"Splitting {evt.get('total_conversations', 0):,} customer timelines into ticket journeys..."
+                    f"Splitting {evt.get('total_conversations', 0):,} customer timelines into ticket journeys "
+                    f"with {evt.get('workers', 1):,} concurrent worker(s). "
+                    f"Mode: {mode_label}. Planned ticket calls: {planned_ticket_calls:,}."
                 )
             elif phase == "ticket_segmentation_done":
-                progress_state["calls_done"] += 1
+                progress_state["calls_done"] += max(1, int(evt.get("ticket_calls_used") or 1))
                 if evt.get("error"):
                     progress_state["failures"] += 1
                 else:
@@ -7875,7 +10520,8 @@ def tab_run() -> None:
                 current_box.info(
                     f"Ticket split {evt.get('conversation_index')}/{evt.get('total_conversations')} - "
                     f"Customer `{evt.get('conversation_id')}` - "
-                    f"{evt.get('tickets_created', 0)} ticket(s)"
+                    f"{evt.get('tickets_created', 0)} ticket(s) - "
+                    f"{int(evt.get('ticket_calls_used') or 1):,} ticket call(s)"
                 )
             elif phase == "start":
                 total_conv = int(evt.get("total_conversations") or total_conv)
@@ -7912,6 +10558,8 @@ def tab_run() -> None:
                     if evt.get("recovered_after_rerun"):
                         progress_state["recovered"] += 1
                     _show_live_message_rerun(rerun_box, live_reruns, evt)
+            elif phase == "cancelled":
+                current_box.warning("Cancellation requested. Saving completed results.")
 
             if total_msg > 0:
                 frac = min(progress_state["calls_done"] / max(total_msg, 1), 1.0)
@@ -7930,7 +10578,7 @@ def tab_run() -> None:
             st.session_state.progress_log.append(evt)
 
         def cancel_requested() -> bool:
-            return bool(st.session_state.cancel_flag)
+            return cancel_event.is_set()
 
         persistence_errors: list[str] = []
 
@@ -7985,12 +10633,16 @@ def tab_run() -> None:
             st.session_state._run_results_db_path = _active_db_path()
             _clear_run_derived_caches()
             persist_completed_results()
+            cancelled = cancel_event.is_set() or _cancel_requested()
             completion_message = (
-                f"Evaluation finished. {len(results.conversation_results)} customer journeys processed, "
+                f"Evaluation {'cancelled' if cancelled else 'finished'}. "
+                f"{len(results.conversation_results)} customer journeys processed, "
                 f"{len(results.message_level_results)} message-level calls, "
                 f"{len(results.errors)} errors. Saved as run #{run_id}."
             )
-            if results.errors:
+            if cancelled:
+                progress_box.warning(completion_message)
+            elif results.errors:
                 progress_box.warning(completion_message)
             else:
                 progress_box.success(completion_message)
@@ -8005,7 +10657,7 @@ def tab_run() -> None:
             # Finalize the run record regardless of outcome.
             try:
                 status = "completed"
-                if st.session_state.cancel_flag:
+                if cancel_event.is_set() or _cancel_requested():
                     status = "cancelled"
                 elif results is None:
                     status = "failed"
@@ -8016,7 +10668,7 @@ def tab_run() -> None:
             except Exception:
                 pass
             st.session_state.run_in_progress = False
-            st.session_state.cancel_flag = False
+            _clear_run_cancel_event(cancel_event)
 
     if convo_only_clicked:
         _execute_conversation_only_run(
@@ -11041,7 +13693,136 @@ def _persist_broadcast_clusters(
     }
 
 
+_BROADCAST_CLUSTERING_MODES: dict[str, dict[str, Any]] = {
+    "Balanced merge": {
+        "threshold": 0.80,
+        "description": "Merge broadcasts that are clearly the same operational message with small wording changes.",
+    },
+    "Strict merge": {
+        "threshold": 0.90,
+        "description": "Only merge very similar broadcasts; creates more clusters with less risk of over-merging.",
+    },
+    "Broad merge": {
+        "threshold": 0.70,
+        "description": "Merge looser variants; creates fewer clusters but should be reviewed for mixed topics.",
+    },
+    "Exact only": {
+        "threshold": 1.00,
+        "description": "Only merge broadcasts with the same normalized text; disables fuzzy similarity merging.",
+    },
+    "Custom": {
+        "threshold": None,
+        "description": "Choose the similarity threshold manually.",
+    },
+}
+
+
+def _active_run_scope_rows(db: Database, run_id: int) -> list[dict[str, str]]:
+    counts = _saved_counts_for_run(db, run_id)
+    try:
+        run = db.get_run(int(run_id)) or {}
+    except Exception:
+        run = {}
+    db_path = Path(_active_db_path())
+    run_name = str(run.get("name") or "").strip()
+    csv_name = str(run.get("csv_name") or "").strip()
+    status = str(run.get("status") or "").strip()
+    started_at = str(run.get("started_at") or "").strip()
+    return [
+        {"Field": "Database", "Value": db_path.name},
+        {"Field": "Database path", "Value": str(db_path.resolve())},
+        {"Field": "Loaded run", "Value": f"#{int(run_id)}" + (f" - {run_name}" if run_name else "")},
+        {"Field": "Run status", "Value": status or "-"},
+        {"Field": "CSV/source", "Value": csv_name or "-"},
+        {"Field": "Started at", "Value": started_at or "-"},
+        {"Field": "Saved journeys", "Value": f"{counts['conversation_results']:,}"},
+        {"Field": "Saved message evaluations", "Value": f"{counts['message_results']:,}"},
+        {"Field": "Saved errors", "Value": f"{counts['run_errors']:,}"},
+    ]
+
+
+def _render_active_run_scope(db: Database, run_id: int, *, feature_label: str) -> None:
+    rows = _active_run_scope_rows(db, run_id)
+    lookup = {row["Field"]: row["Value"] for row in rows}
+    st.markdown("### Loaded run scope")
+    metric_row(
+        [
+            ("Run", f"#{int(run_id)}", None),
+            ("Saved journeys", lookup.get("Saved journeys", "0"), None),
+            ("Message evaluations", lookup.get("Saved message evaluations", "0"), None),
+            ("Saved errors", lookup.get("Saved errors", "0"), None),
+        ]
+    )
+    st.caption(
+        f"{feature_label} uses `{lookup.get('Database', '-')}`, run `{lookup.get('Loaded run', f'#{int(run_id)}')}`. "
+        f"DB path: `{lookup.get('Database path', '-')}`"
+    )
+    with st.expander("Run/source details", expanded=False):
+        st.dataframe(pd.DataFrame(rows), width="stretch", hide_index=True)
+
+
+def _broadcast_clustering_round_rows(
+    *,
+    mode: str,
+    threshold: float,
+    saved_journeys: int,
+) -> list[dict[str, str]]:
+    if threshold >= 1.0:
+        merge_rule = "Round 4 only accepts exact normalized matches."
+    else:
+        merge_rule = f"Round 4 joins a broadcast to the best existing cluster when combined similarity is >= {threshold:.2f}."
+    return [
+        {
+            "Round": "1",
+            "Name": "Loaded run scope",
+            "What happens": f"Use all {saved_journeys:,} saved journeys from the active DB/run.",
+        },
+        {
+            "Round": "2",
+            "Name": "Broadcast extraction",
+            "What happens": "Keep only transcript messages whose raw sender type is SYSTEM.",
+        },
+        {
+            "Round": "3",
+            "Name": "Normalization",
+            "What happens": "Lowercase text and replace dynamic dates, refs, and phone-like values before matching.",
+        },
+        {
+            "Round": "4",
+            "Name": f"Cluster matching - {mode}",
+            "What happens": merge_rule,
+        },
+        {
+            "Round": "5",
+            "Name": "Grouped AI analysis",
+            "What happens": "AI is run only later, on the broadcast clusters you select.",
+        },
+    ]
+
+
+def _broadcast_existing_threshold_caption(clusters_df: pd.DataFrame, selected_threshold: float) -> str:
+    if clusters_df.empty or "threshold" not in clusters_df.columns:
+        return ""
+    stored = sorted(
+        {
+            round(float(value), 2)
+            for value in clusters_df["threshold"].dropna().tolist()
+            if str(value).strip() != ""
+        }
+    )
+    if not stored:
+        return ""
+    stored_text = ", ".join(f"{value:.2f}" for value in stored)
+    if any(abs(value - float(selected_threshold)) > 0.0001 for value in stored):
+        return (
+            f"Existing clusters for this run were built with threshold(s): {stored_text}. "
+            "Click Rebuild broadcast clusters to apply the currently selected mode."
+        )
+    return f"Existing clusters for this run use threshold {stored_text}."
+
+
 def _load_persisted_broadcast_analysis(db: Database, run_id: int) -> tuple[pd.DataFrame, pd.DataFrame, dict[str, dict]]:
+    _ensure_required_runtime_tables(db)
     cluster_rows = db._fetchall(
         "SELECT * FROM broadcast_clusters WHERE run_id=? ORDER BY occurrence_count DESC, first_seen_at ASC",
         (int(run_id),),
@@ -11284,6 +14065,7 @@ def _run_broadcast_ai_analysis(
         timeout=float(st.session_state.timeout),
         retries=int(st.session_state.retries),
         concurrency=1,
+        debug_log_calls=bool(st.session_state.get("debug_log_llm_calls", False)),
     )
     client = build_client(api.base_url, api.api_key)
     raw, debug = chat_completion(
@@ -11291,6 +14073,7 @@ def _run_broadcast_ai_analysis(
         api,
         _broadcast_ai_system_prompt(),
         json.dumps(payload, ensure_ascii=False),
+        context=f"broadcast_analysis:run{run_id}",
     )
     parsed = extract_json_object(raw)
     analyses = parsed.get("analyses") if isinstance(parsed, dict) else None
@@ -11396,29 +14179,66 @@ def tab_broadcast_analysis() -> None:
         "Groups SYSTEM messages into generated broadcast clusters using deterministic text similarity. "
         "No LLM is used for unification; AI is only used when you analyze an already grouped broadcast cluster."
     )
+    _render_active_run_scope(db, run_id, feature_label="Broadcast Analysis")
 
-    c1, c2, c3 = st.columns([1, 1, 1.2])
-    with c1:
+    counts = _saved_counts_for_run(db, run_id)
+    st.markdown("### Clustering setup")
+    mode_options = list(_BROADCAST_CLUSTERING_MODES)
+    selected_mode = st.radio(
+        "Clustering mode",
+        mode_options,
+        index=mode_options.index("Balanced merge"),
+        horizontal=True,
+        key="broadcast_clustering_mode",
+    )
+    selected_mode_config = _BROADCAST_CLUSTERING_MODES[selected_mode]
+    if selected_mode == "Custom":
         threshold = st.number_input(
-            "Similarity threshold",
+            "Custom similarity threshold",
             min_value=0.50,
-            max_value=0.99,
+            max_value=1.00,
             value=0.80,
             step=0.01,
-            help="Default 0.80. Combined similarity = 60% sentence similarity + 40% word similarity.",
+            key="broadcast_custom_similarity_threshold",
+            help="Combined similarity = 60% sentence similarity + 40% word similarity. Higher means stricter.",
         )
-    with c2:
+    else:
+        threshold = float(selected_mode_config["threshold"])
+        st.caption(f"{selected_mode_config['description']} Current threshold: `{threshold:.2f}`.")
+
+    with st.expander("Broadcast clustering rounds", expanded=True):
+        st.dataframe(
+            pd.DataFrame(
+                _broadcast_clustering_round_rows(
+                    mode=selected_mode,
+                    threshold=float(threshold),
+                    saved_journeys=int(counts["conversation_results"]),
+                )
+            ),
+            width="stretch",
+            hide_index=True,
+        )
+
+    c1, c2 = st.columns([1, 1])
+    with c1:
         rebuild = st.button("Rebuild broadcast clusters", use_container_width=True, type="secondary")
-    with c3:
+    with c2:
         match_new = st.button("Match new broadcasts", use_container_width=True)
 
     clusters_df, occurrences_df, analyses = _load_persisted_broadcast_analysis(db, run_id)
+    threshold_note = _broadcast_existing_threshold_caption(clusters_df, float(threshold))
+    if threshold_note:
+        if "Click Rebuild" in threshold_note:
+            st.warning(threshold_note)
+        else:
+            st.caption(threshold_note)
     if rebuild or match_new or clusters_df.empty:
         with st.spinner("Building broadcast clusters from SYSTEM messages..."):
             result = _persist_broadcast_clusters(db, run_id, threshold=float(threshold), rebuild=bool(rebuild or clusters_df.empty))
         st.success(
             f"Broadcast clustering complete: {result['source_broadcasts']:,} SYSTEM messages found, "
-            f"{result['inserted_clusters']:,} new clusters, {result['inserted_occurrences']:,} new occurrences."
+            f"{result['inserted_clusters']:,} new clusters, {result['inserted_occurrences']:,} new occurrences. "
+            f"Mode: {selected_mode}, threshold {float(threshold):.2f}."
         )
         clusters_df, occurrences_df, analyses = _load_persisted_broadcast_analysis(db, run_id)
 
@@ -11581,8 +14401,8 @@ def tab_broadcast_analysis() -> None:
         default=[],
         help=(
             "Acts as a filter. Leave empty to view every analyzed cluster below. Select clusters to filter the "
-            "results view and to target 'Run AI analysis per selected cluster'. Each selected cluster gets its own AI "
-            "request with aggregate counts plus the selected number of red/yellow flagged occurrences; green messages are not sent."
+            "results view and to target 'Run AI analysis per selected cluster'. Each selected sub-cluster gets its own AI "
+            "request with aggregate counts, smarter red/yellow samples, and a small green contrast sample when available."
         ),
     )
     c_examples, c_share = st.columns([1, 1])
@@ -11659,7 +14479,11 @@ def tab_broadcast_analysis() -> None:
                 temperature=float(st.session_state.get("broadcast_temperature", st.session_state.temperature)),
                 percentage_threshold=share_threshold,
                 trigger=trigger,
-                params={"max_flagged_examples": int(max_flagged_examples), "similarity_threshold": float(threshold)},
+                params={
+                    "max_flagged_examples": int(max_flagged_examples),
+                    "similarity_threshold": float(threshold),
+                    "clustering_mode": selected_mode,
+                },
             )
         if skipped_tokens:
             st.warning(
@@ -12356,6 +15180,7 @@ def _run_bot_issue_ai_analysis(
         timeout=float(st.session_state.timeout),
         retries=int(st.session_state.retries),
         concurrency=1,
+        debug_log_calls=bool(st.session_state.get("debug_log_llm_calls", False)),
     )
     client = build_client(api.base_url, api.api_key)
     raw, debug = chat_completion(
@@ -12363,6 +15188,7 @@ def _run_bot_issue_ai_analysis(
         api,
         _bot_issue_ai_system_prompt(),
         json.dumps(payload, ensure_ascii=False),
+        context=f"bot_issue_analysis:run{run_id}",
     )
     parsed = extract_json_object(raw)
     analyses = parsed.get("analyses") if isinstance(parsed, dict) else None
@@ -13817,6 +16643,7 @@ def tab_review() -> None:
             "parent_journey_id",
             "ticket_id",
             "ticket_label",
+            "ticket_category",
             "ticket_type",
             "ticket_status",
             "ticket_objective",
@@ -13918,6 +16745,7 @@ def tab_review() -> None:
         cust = row.get("customer_name") or "—"
         phone = row.get("customer_phone") or cid
         ticket = str(row.get("ticket_label") or "").strip()
+        ticket_category = humanize_label(row.get("ticket_category")) if row.get("ticket_category") else ""
         ticket_type = humanize_label(row.get("ticket_type")) if row.get("ticket_type") else ""
         source_count = row.get("source_conversation_count") or "—"
         result = f"{humanize_label(row.get('handled_status')) or 'Unknown'} / {humanize_label(row.get('customer_experience')) or 'Unknown'}"
@@ -13929,8 +16757,9 @@ def tab_review() -> None:
         ticket_part = ""
         if ticket:
             ticket_part = f" • {ticket}"
-            if ticket_type:
-                ticket_part += f" ({ticket_type})"
+            ticket_details = " / ".join(part for part in [ticket_category, ticket_type] if part)
+            if ticket_details:
+                ticket_part += f" ({ticket_details})"
         label = f"{phone} • {cust}{ticket_part} • {source_count} source convs • {result}"
         label = f"{score_label} - {label}"
         if label in label_to_id:
@@ -14143,6 +16972,9 @@ def tab_exports() -> None:
         "stop_on_error": st.session_state.stop_on_error,
         "save_raw_responses": st.session_state.save_raw_responses,
         "enable_ticket_segmentation": st.session_state.enable_ticket_segmentation,
+        "ticket_segmentation_mode": _clean_ticket_segmentation_mode(
+            st.session_state.get("ticket_segmentation_mode")
+        ),
         "message_target_role": st.session_state.message_target_role,
         "started_at": rr.started_at,
         "finished_at": rr.finished_at,
@@ -14482,6 +17314,9 @@ def tab_debug() -> None:
         "stop_on_error": st.session_state.stop_on_error,
         "save_raw_responses": st.session_state.save_raw_responses,
         "enable_ticket_segmentation": st.session_state.enable_ticket_segmentation,
+        "ticket_segmentation_mode": _clean_ticket_segmentation_mode(
+            st.session_state.get("ticket_segmentation_mode")
+        ),
         "message_target_role": st.session_state.message_target_role,
     }
     st.json(cfg, expanded=False)
@@ -14536,11 +17371,22 @@ def main() -> None:
     is_master = auth_role == ROLE_MASTER
     is_active = auth_role == ROLE_ACTIVE
 
+    if st.session_state.get("_runtime_schema_refresh_version") != DB_CACHE_VERSION:
+        st.session_state["_runtime_schema_refresh_result"] = _refresh_runtime_schema_for_known_databases()
+        st.session_state["_runtime_schema_refresh_version"] = DB_CACHE_VERSION
+        get_db.clear()
+
     # Force DB initialization at app start so the seeded defaults exist before
     # the sidebar status or any tab tries to read them.
     db = get_active_db()
     if is_master:
-        _refresh_default_prompts(db)
+        prompt_refresh_signature = (
+            _active_db_path(),
+            _default_prompt_files_signature(),
+        )
+        if st.session_state.get("_default_prompt_refresh_signature") != prompt_refresh_signature:
+            _refresh_default_prompts(db)
+            st.session_state._default_prompt_refresh_signature = prompt_refresh_signature
     _auto_load_latest_run(db)
 
     if is_master:
@@ -14568,10 +17414,21 @@ def main() -> None:
     )
 
     tab_specs = _workspace_tab_specs(auth_role)
-    tabs = st.tabs([label for label, _render in tab_specs])
-    for tab, (_label, render_tab) in zip(tabs, tab_specs):
-        with tab:
-            render_tab()
+    tab_labels = [label for label, _render in tab_specs]
+    active_view_key = "workspace_active_view"
+    if st.session_state.get(active_view_key) not in tab_labels:
+        st.session_state[active_view_key] = tab_labels[0]
+    active_view = st.pills(
+        "Workspace view",
+        options=tab_labels,
+        key=active_view_key,
+        selection_mode="single",
+        label_visibility="collapsed",
+    )
+    if active_view is None:
+        active_view = tab_labels[0]
+    render_tab = dict(tab_specs)[active_view]
+    render_tab()
 
 
 if __name__ == "__main__":
