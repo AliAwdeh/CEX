@@ -1,0 +1,1292 @@
+You are given a complete customer support conversation timeline.
+
+Your task is to segment the conversation into customer tickets.
+
+Return STRICT JSON only.
+
+--------------------------------------------------
+CORE PRINCIPLE
+--------------------------------------------------
+
+A ticket represents one customer objective.
+
+A customer objective is one thing that the customer wants to know, receive, fix, complete, or resolve.
+
+Think from the customer's perspective.
+
+Ask yourself:
+
+"If this objective were completed, would the customer consider this particular matter finished?"
+
+If yes, everything related to that objective belongs to the same ticket.
+
+A ticket continues until one of the following occurs:
+
+- the objective is completed
+- the customer abandons it
+- the customer starts pursuing a materially different objective
+
+Never create tickets based on message count, conversation length, source_conversation_id boundaries, or small wording changes.
+
+Always segment based on customer objective.
+
+Personal names are identity context, not customer objectives. Never include a customer, maid, worker, helper, or agent name in ticket_type or customer_objective. Use a neutral role such as "the maid", "the worker", or "the customer" only when the role is needed to understand the objective. If two workers must be distinguished, use neutral labels such as "first worker" and "second worker", not names.
+
+customer_objective must summarize the concrete outcome sought. Write it yourself. Never copy, quote, or lightly reword a sentence from the transcript.
+
+customer_objective must:
+
+- start with a verb describing the outcome, such as Complete, Confirm, Refund, Clarify, Obtain, Resolve, Cancel, or Establish
+- describe one outcome. If you need the word "and" to join two unrelated outcomes, you have merged two tickets and must split them
+- never be a question, and never end with a question mark
+- never begin with a greeting, a time of day, or a name, such as "Hi", "Hello", "Morning", or "Dear"
+- never contain a person's name, an account number, a passport number, or other identifying detail
+
+Wrong: "Morning, I believe you have taken 1050AED from my account. Please refund this immediately"
+Right: "Refund the disputed monthly deduction"
+
+Wrong: "Is this a new rejection?"
+Right: "Confirm whether the latest document rejection is new"
+
+Wrong: "Complete the visa application and resolve related salary and payment matters"
+Right: two tickets, one for the visa lifecycle and one for the payment dispute
+
+Treat every named example in this document (for example NOC, uniforms, a specific broadcast type, or any other named item) as an illustration of a pattern, not an exhaustive list. Apply the same underlying rule to any other item, name, or wording that fits the same pattern.
+
+--------------------------------------------------
+TICKET CATEGORIES
+--------------------------------------------------
+
+Every ticket must have exactly one ticket_category.
+
+Possible values:
+
+- inquiry
+- request
+- issue
+
+Definitions:
+
+Inquiry
+
+The customer only wants information.
+
+Examples:
+
+- status
+- update
+- timing
+- policy
+- eligibility
+- availability
+- explanation
+- location
+- requirements
+- price
+- procedure
+- next step
+
+The customer is not asking the company to perform an operational action. It is informational.
+
+Asking whether the company offers, provides, or includes something as part of the service, such as uniforms or another optional item, is an inquiry. Asking the company to actually order, buy, or provide that item is a request.
+
+Classify a visa-renewal message as an inquiry when the customer is only asking whether renewal is allowed or when they would be eligible to start it. Examples: "Can the visa be renewed in February 2027?", "Am I right that it can be renewed?", and "What date can we start the renewal?" These questions seek eligibility or timing information and do not ask the company to act now. Classify it as a request only when the customer asks the company to begin or perform the renewal, for example: "Please start the renewal", "Renew the visa now", or "Can you submit the renewal for me?"
+
+--------------------------------------------------
+
+Request
+
+The customer wants the company to perform an action.
+
+Examples:
+
+- send
+- provide
+- process
+- renew
+- cancel
+- refund
+- upload
+- change
+- replace
+- transfer
+- deliver
+- confirm
+- book
+- arrange
+- collect
+- create
+- submit
+- start
+- continue
+
+A request may contain delays, complaints, missing documents, rejected documents, government rejection, fees, frustrations, or repeated follow-ups.
+
+Those remain part of the same request unless the customer starts pursuing a different objective.
+
+--------------------------------------------------
+
+Issue
+
+The customer's primary objective is reporting or resolving a problem.
+
+Examples:
+
+- payment failed
+- duplicate charge
+- incorrect action
+- broken service
+- contradiction
+- complaint
+- dispute
+- blocker
+- poor experience
+
+Choose issue only when the problem itself is the customer's objective.
+
+Do not classify a request as an issue merely because problems occur during the request.
+
+A specific charge the customer disputes as duplicate, wrong, or already paid is an issue, even while a related normal process is also underway.
+
+A complaint about the consequences of a failure is an issue. When the customer describes someone waiting, inconvenienced, left without money or a service, or otherwise affected because something did not happen, the objective is fixing that failure.
+
+Politeness does not change the category. Softeners such as "I know it's not your fault", "I understand", "no rush", "sorry to bother you", or thanking the agent do not turn an issue into a request or an inquiry. Judge the underlying matter, not the tone.
+
+Urging continued effort on something that has already failed is escalation inside the issue, not a new operational request. Wording such as "please keep trying", "please do your best", "please follow up with them", or "please chase it" presses the company to continue working an unresolved failure and stays ticket_category=issue. A first-time action ask for something that has not failed yet is still a request.
+
+Naming an external provider, bank, government body, or courier as the cause does not change the category. The customer is still reporting a failure in the service they receive from the company.
+
+Example: "This is a huge inconvenience for the lady as she is waiting for her salary. I know it's not your fault, but please keep trying to do your best with the payment provider." -> issue. The salary has not arrived, the impact is the complaint, the softener does not downgrade it, naming the provider does not shift the blame away from the service, and "keep trying" is escalation inside the failure rather than a new request.
+
+This determines the category when such a message is the ticket's first material objective. Inside an already-anchored ticket, CATEGORY PRIORITY still governs.
+
+--------------------------------------------------
+CATEGORY PRIORITY
+--------------------------------------------------
+
+Determine the category from the customer's FIRST material objective.
+
+That category anchors the ticket.
+
+Use only objectives visible in the provided timeline. Do not infer that the customer previously requested a visa or another process when that earlier request is not present.
+
+A customer-forwarded official notice such as "Dear Customer, your application ... was approved/rejected" is supporting context, not the customer's objective. Skip it when identifying the first material objective.
+
+When the first visible support objective is that something already went wrong, category is issue. This covers missing files or documents, an incorrect message or action, a rejection, or a previously agreed action that was not performed. Keep it as issue when the customer later asks the company to perform the overdue action, submit the application, or send proof, because those requests are attempts to resolve the opening failure.
+
+When a visible earlier customer objective already asked the company to start that same process, category remains request even when missing documents, rejection, delay, or frustration occur later inside fulfillment.
+
+The difference is whether the original ask is visible, not how the customer worded the complaint.
+
+Because visibility can change between cumulative passes, re-check this on every pass. If a later pass reveals an earlier customer message that requested the process, merge the failure into that request ticket and change ticket_category from issue to request. See CUMULATIVE SEGMENTATION.
+
+Examples:
+
+- The timeline opens with the customer asking why files are missing and whether an agreed action was ever performed, then later asking the company to submit it and send confirmation -> issue, because no earlier request is visible.
+- The timeline opens with the customer asking the company to start that same process, and a document is rejected or missing later -> request, because the failure sits inside visible fulfillment.
+
+Exception: when the customer first asks only for information about a process and then asks the company to perform that same process, treat the informational question as a prelude to the operational objective. Keep both in one request ticket and include the earlier question in inquiries.
+
+Example
+
+Customer:
+
+How much does visa renewal cost?
+
+Later:
+
+Okay, please renew it.
+
+Category:
+
+request
+
+This is one visa-renewal lifecycle, not a separate inquiry followed by a request.
+
+Examples
+
+Customer:
+
+Please renew my visa.
+
+Later:
+
+The passport was rejected.
+
+Category remains:
+
+request
+
+because the rejection is part of the renewal process.
+
+------------
+
+Customer:
+
+You charged me twice.
+
+Later:
+
+Please refund it.
+
+Category remains:
+
+issue
+
+because the customer's objective began as a billing problem.
+
+CATEGORY HIERARCHY
+
+The three categories are not equal in strength. inquiry is the weakest.
+
+- A ticket anchored as request stays request for its whole life.
+- A ticket anchored as issue stays issue for its whole life.
+- A ticket anchored as inquiry may be upgraded to request or to issue when the customer's objective in that same matter turns operational or turns into a problem.
+
+Upgrade an inquiry to request when the customer stops only asking and asks the company to act on the same matter.
+
+Upgrade an inquiry to issue when the same matter fails, is delayed, or goes wrong and the customer's objective becomes fixing that failure.
+
+An inquiry is never downgraded, and request and issue are never converted into each other or into inquiry.
+
+When a request later contains a problem, keep ticket_category=request and describe the problem inside the same ticket, in customer_objective and segmentation_reason. Do not open a second ticket for a failure that occurs while fulfilling a request you are already tracking. The same applies in reverse: when an issue later contains action asks, keep ticket_category=issue and describe those actions in the same ticket.
+
+Example: the customer asks how cancellation works, is told to send the worker to the accommodation, and later reports she waited three hours there. That is one ticket. It anchored as inquiry, and the failure upgrades it to issue.
+
+Example: the customer asks the company to renew a visa, and the passport is later rejected. That stays one request ticket. The rejection is a problem inside fulfilment, not a new matter.
+
+Apart from these upgrades, do not change ticket_category simply because later messages contain requests, complaints, updates, or questions.
+
+--------------------------------------------------
+REQUEST ORIGIN
+--------------------------------------------------
+
+Every ticket must also record request_origin: which side opened or triggered the underlying thread.
+
+Possible values:
+
+- company
+- customer
+
+company
+
+The company reached out first: a reminder, a renewal notice, a billing notice, or another outbound broadcast or message started the thread.
+
+customer
+
+The customer reached out first with their own need, question, or complaint.
+
+request_origin is independent of ticket_category.
+
+A company reminder or billing notice that the customer disputes is request_origin=company, but ticket_category still reflects the customer's own objective, which is the dispute itself, so ticket_category=issue.
+
+A company renewal reminder that the customer simply acts on, such as agreeing to renew, is request_origin=company and ticket_category=request, because the customer's objective became completing that action.
+
+Do not let a company-initiated reminder or broadcast by itself change ticket_category. Category always follows the customer's own objective; origin only records who spoke first.
+
+Examples:
+
+- Company sends "Your visa expires soon" and the customer replies "Please renew it" -> request_origin=company, ticket_category=request.
+- Company sends an unrelated promotion, then the customer independently asks "When does my visa expire?" -> request_origin=customer, ticket_category=inquiry. The unrelated promotion does not establish origin.
+- Customer asks to replace a card and the company later sends status updates -> request_origin remains customer.
+
+--------------------------------------------------
+TICKET STATUS
+--------------------------------------------------
+
+Every ticket must also have exactly one status.
+
+Possible values:
+
+- resolved
+- pending_unresolved
+- totally_unresolved
+
+Definitions:
+
+resolved
+
+The customer's objective was answered or completed, and the delivered outcome is final or the customer explicitly accepts it as satisfactory.
+
+A company acknowledgment, promise, internal acceptance, or statement that work has started does not resolve a request. For a request with several action asks, resolved only when every material action has been completed or delivered, or the customer explicitly accepts the delivered result as satisfactory.
+
+pending_unresolved
+
+The customer is still waiting on something concrete: a review, a delivery, a refund, a government step, a document, a bank action, an internal action, or a promised future update.
+
+Answering a question about how to complete a process does not resolve that process. When the reply tells the customer what to do next, where to go, when to attend, or what to bring, the objective stays pending_unresolved until that step actually happens. Explaining the cancellation procedure, telling the worker to attend an office, clinic, or accommodation, or scheduling a visit all leave the ticket pending.
+
+Only mark such a ticket resolved once the visible outcome is reached: the visit took place and its purpose was served, the process completed, or the customer confirmed the matter is finished.
+
+totally_unresolved
+
+No usable current state or path remains. The customer was left blocked, ignored, or without a next step.
+
+Rules:
+
+A reply that only redirects the customer elsewhere, or says the current channel cannot help, is not a resolution by itself. Treat it as pending_unresolved unless a later message in the same ticket actually answers or completes the objective.
+
+A partial workaround that solves only the immediate moment, without fixing the underlying objective, does not make the ticket resolved. Keep it pending_unresolved and note that the underlying objective still needs a future fix.
+
+When the customer's objective is to understand or resolve confusing payment, cancellation, or reminder messages, the ticket can be resolved by a clear final clarification, even if no operational action is performed.
+
+Examples of resolving clarification include:
+
+- the company explains that no extra payment is needed and tells the customer to ignore the reminders
+- the company explains that a remaining fee is actually due and tells the customer the amount or due timing
+- the company clarifies why reminders are being sent and what the customer should do next
+
+If the customer accepts that clarification, thanks the company, agrees to the stated next step, or does not continue disputing the point, treat the concern as resolved. Do not keep the ticket pending merely because automated reminders may continue later, unless the customer responds again with a renewed unresolved concern.
+
+When a customer wants a standing arrangement stopped, distinguish three separate outcomes:
+
+- settling the current amount by some other means
+- changing what happens on future cycles
+- revoking the instruction that is already in flight right now
+
+Confirming any one of these never confirms the others. When the customer asks to stop, cancel, recall, or withdraw an instruction that is already in flight, resolve the ticket only after the company explicitly confirms that this current instruction was recalled, cancelled, stopped, withdrawn, or is no longer active. Confirmation that the amount was paid another way, that the customer is covered for this cycle, that paperwork will be deleted, or that future cycles are switched to another method does not confirm revocation of the in-flight instruction.
+
+If the current instruction was only forwarded for review, or revocation is never confirmed, keep the ticket pending_unresolved. A later "thanks" following an answer about future cycles does not accept or resolve the unanswered revocation concern.
+
+This applies to any in-flight instruction of this kind, including a direct debit, standing order, subscription renewal, auto-deduction, or scheduled transfer.
+
+Set should_append_future_conversations to true only when status is pending_unresolved.
+
+For a ticket whose category is inquiry, status follows the inquiries list. See INQUIRIES below.
+
+Examples:
+
+- "Please send my contract" and the contract is attached -> resolved.
+- "Please send my contract" and the company says it will be sent tomorrow -> pending_unresolved.
+- "Please send my contract" and the company says it cannot help, gives no alternative, and stops replying -> totally_unresolved.
+
+--------------------------------------------------
+INQUIRIES
+--------------------------------------------------
+
+A ticket may contain an inquiries list of informational questions the customer asked inside that ticket.
+
+Put a question in inquiries only when it asks for information: status, timing, price, policy, eligibility, explanation, or a next step.
+
+Do not put action asks in inquiries. Classify the desired outcome, not the verb by itself.
+
+"Can you check whether it is ready?" asks for status information and is an inquiry.
+
+"Can you check the application and correct the error?" asks the company to perform operational work and is a request.
+
+"Can you send/process/update/provide..." is normally an action ask; describe it in the ticket objective instead.
+
+Track each inquiry's own status separately: resolved, pending_unresolved, or totally_unresolved.
+
+Use an empty inquiries array when the ticket contains no informational question.
+
+For a ticket whose category is inquiry, the overall ticket status is:
+
+resolved only when every listed inquiry is resolved.
+
+pending_unresolved when any inquiry is still pending_unresolved.
+
+totally_unresolved when an inquiry is totally_unresolved and no other inquiry is still pending with a clear path.
+
+Example: "When will the card be ready?" and "Where can it be collected?" are two inquiry entries. If the location is answered but readiness is still awaiting an update, the ticket is pending_unresolved.
+
+--------------------------------------------------
+MESSAGE ASSIGNMENT
+--------------------------------------------------
+
+message_index is continuous across the customer's full journey and does not reset when a new source_conversation_id block starts. Use the exact message_index values from the input in start_message_index, end_message_index, included_message_indexes, and every inquiry's message_indexes.
+
+Every substantive message should belong to exactly one ticket.
+
+Greeting messages immediately preceding the customer's first objective belong to that ticket.
+
+Thank-you messages belong to the previous ticket.
+
+Routing messages belong to the nearest relevant ticket, and to the next real customer ticket when none precedes them.
+
+A routing-only reply -- "this number cannot receive or review messages", "our team is already assisting you on another WhatsApp number", "please continue on the other number" -- is never a resolution and never evidence that nothing happened here. It answers nothing, so the objective it interrupts stays pending_unresolved. When a later block continues that same objective and actually answers it, both belong to one ticket and the outcome comes from the later block.
+
+Broadcasts belong to a ticket when they are directly related to that ticket, trigger the customer's objective, provide progress on an existing ticket, or the customer responds to them about the same matter. An isolated promotional service or marketing message is the exception: attach it to the nearest current ticket as context even when the customer does not respond. See BROADCASTS below.
+
+Clearly unrelated operational chatter from customers or agents never opens a ticket of its own and never sets a ticket's objective. Attach it to the closest surrounding ticket instead of excluding it.
+
+This exclusion never applies to broadcast, system, bot, or automated company messages. Those are never excluded and never left unassigned. When such a message does not clearly concern any specific ticket -- an out-of-hours or no-agents-available auto-reply, a working-hours or queue notice, a birthday or holiday greeting -- attach it to the closest surrounding ticket, normally the ticket most recently active immediately before it, or the next ticket when none precedes it. Attaching one must not change that ticket's customer_objective, ticket_category, status, inquiries, or previous_ticket_id. No message is ever left out, including a repeat of an identical broadcast, per BROADCASTS below.
+
+Every message index in the input must end up in exactly one ticket. Before returning JSON, check that the union of every ticket's included_message_indexes covers every index you were given, with no index appearing twice. There is no "unassigned" bucket: a message you consider irrelevant still goes to the closest surrounding ticket.
+
+--------------------------------------------------
+SEGMENTATION ALGORITHM
+--------------------------------------------------
+
+For each new message or source_conversation_id block, follow these steps in order:
+
+STEP 1: Identify the customer objective.
+
+State in one short phrase what the customer wants to know, receive, fix, complete, or resolve. Ignore greetings, wording changes, and the source_conversation_id when identifying the objective.
+
+STEP 2: Check whether the message continues an existing ticket.
+
+Append it to an existing ticket when it does any of the following for the same objective:
+
+- answers the company's preceding question
+- provides a requested document, detail, selection, or confirmation
+- repeats or clarifies the objective
+- asks for status, timing, proof, or an update
+- reports a delay, rejection, or problem inside the same process
+- escalates or requests a callback about the same matter
+- records another stage or partial result in the same lifecycle
+
+For an open or pending ticket, continue the same ticket even when an unrelated objective temporarily interrupts it. Open tickets may be non-contiguous.
+
+For a previously resolved ticket, use source-conversation sequence:
+
+- Immediate return: if the very next substantive source conversation returns to the same subject and shows that it was not actually resolved, reopen and update the original ticket. Preserve its ticket_id, append the new messages, replace its status with the latest outcome, and keep previous_ticket_id empty.
+- Interrupted return: if one or more substantive different-subject source conversations occur after the resolved ticket and before the same subject returns, keep the original ticket closed. Create a new ticket using only the returning subject's new messages and set previous_ticket_id to the original resolved ticket's id.
+
+Greetings, routing-only exchanges, courtesy messages, and isolated promotional context do not count as an intervening different subject.
+
+This sequence rule applies only to tickets that were resolved before the return. A pending ticket still resumes the original ticket after an interruption and does not use previous_ticket_id.
+
+Examples:
+
+- Source A: refund confirmed resolved. Source B immediately says the refund is not visible -> reopen Source A's ticket.
+- Source A: refund confirmed resolved. Source B discusses a salary card. Source C says the refund is not visible -> create a new refund ticket for Source C with previous_ticket_id pointing to Source A's refund ticket.
+- Source A: visa remains pending. Source B discusses a salary dispute. Source C resumes visa status -> append Source C to the original pending visa ticket.
+
+STEP 3: Create a new ticket only for a materially different objective.
+
+A materially different objective is something the customer would consider a separate matter to solve. It may be a different service, process, payment, refund, worker, booking, contract, order, complaint, or a new post-completion objective.
+
+If an earlier objective remains visibly complete and the customer starts a new instance, replacement, supplementary request, or leftover objective, create a new ticket rather than reopening the completed ticket.
+
+STEP 4: Perform a final check.
+
+Before creating the new ticket, ask:
+
+"Would the customer consider this a separate matter, or is it only another message needed to finish the same matter?"
+
+- Same matter -> append to the existing ticket.
+- Separate matter -> create a new ticket.
+
+A new source_conversation_id is only a transport or session boundary. Never use it as evidence of a new ticket.
+
+Examples:
+
+- The company asks "Monthly or one-time plan?" and the next source conversation begins "one-time" -> append to the existing ticket.
+- The customer asks "Any update on the visa?" in a new source conversation -> append to the existing visa ticket.
+- The visa process is open and the customer sends a requested passport copy -> append to the visa ticket.
+- The visa process is open and the customer asks to cancel an unrelated weekly cleaning subscription -> create a new ticket.
+
+--------------------------------------------------
+WHEN TO CREATE A NEW TICKET
+--------------------------------------------------
+
+Create a new ticket only when all three conditions are true:
+
+1. The customer is pursuing a materially different objective.
+2. The new messages are not needed to complete, clarify, or follow up on an existing objective.
+3. The customer would consider the new objective a separate matter.
+
+Create the new ticket immediately when these conditions are met, even if the previous ticket is still open, both objectives appear in the same conversation, or the new ticket contains only two messages.
+
+Example: "Any update on the visa?" continues the visa ticket. "Also, please verify my contract at the consulate" starts a separate contract-verification ticket.
+
+--------------------------------------------------
+PREVIOUS TICKET ID
+--------------------------------------------------
+
+Every ticket must also record previous_ticket_id.
+
+Use an empty string when the ticket has no related predecessor.
+
+Set previous_ticket_id only after deciding that the current objective truly needs a separate ticket.
+
+Use the earlier ticket's id only when all three conditions are true:
+
+1. The earlier and current objectives require separate tickets.
+2. The current objective was directly caused, enabled, or left over by the earlier ticket's outcome.
+3. That relationship is explicit in the messages, not inferred only from timing or a broad shared topic.
+
+Dependency test:
+
+"Would the current objective still exist in the same form if the earlier ticket had never occurred?"
+
+- No -> use the earlier ticket's id.
+- Yes -> use an empty string.
+
+- Same objective -> append messages; do not create a new ticket and do not use previous_ticket_id.
+- Separate but related follow-on objective -> create a new ticket and set previous_ticket_id.
+- Separate and unrelated objective -> create a new ticket with previous_ticket_id="".
+
+Resolved-ticket return override:
+
+- Same subject in the immediately next substantive source conversation -> reopen the original ticket; previous_ticket_id="".
+- Same subject after an intervening different-subject conversation -> create a new ticket; previous_ticket_id is the earlier resolved ticket.
+- Same subject returning to a ticket that was still pending -> append to the original ticket even after an interruption; previous_ticket_id="".
+
+Example: after explicit visa completion, "Now when will my salary card be ready?" is a separate post-visa objective enabled by that completed process, so it uses the visa ticket's id. An unrelated cleaning booking uses an empty string.
+
+--------------------------------------------------
+MERGE RULE
+--------------------------------------------------
+
+Merge proposed tickets when they represent the same customer objective.
+
+Status requests, delay complaints, document uploads, proof requests, callbacks, screenshots, escalations, reminders, repeated questions, agent follow-ups, government updates, and partial answers are not separate objectives when they support the same matter.
+
+Merge test:
+
+"If one ticket disappeared, would the other ticket still describe the complete customer matter?"
+
+- No -> merge them because each is only part of the same matter.
+- Yes -> keep them separate if each represents a complete, distinct objective.
+
+--------------------------------------------------
+SPLIT RULE
+--------------------------------------------------
+
+Split objectives, not conversations.
+
+Create separate tickets when the customer is independently pursuing two matters and each matter can be completed without completing the other.
+
+Do not keep objectives together merely because they are close in time, share a broad topic, occur in the same source conversation, or involve the same customer or worker.
+
+A shared domain word is not a shared objective. Words like maid, worker, customer, contract, visa, insurance, payment, or booking appear across most of a customer's matters and never by themselves make two objectives one ticket.
+
+Once a thread has been answered or closed, a later conversation raising a different objective is a new ticket, not a continuation, even when it concerns the same worker or the same contract. This applies to medical, insurance, clinic, payment, visa, document, delivery, and every other closed thread.
+
+Examples:
+
+- An answered insurance-coverage question about a medical checkup, then a later conversation asking what the procedure is to replace the worker -> two tickets. Both mention the worker, but replacing her is a separate matter from her coverage.
+- An answered clinic-location question, then a later conversation asking how much a renewal costs -> two tickets.
+
+Example: an open visa medical process and a separate duplicate salary charge are two tickets. Resolving the salary dispute does not complete the visa process, and completing the visa process does not resolve the disputed charge.
+
+--------------------------------------------------
+NO OVERLAPPING TICKETS
+--------------------------------------------------
+
+Every substantive message_index belongs to exactly one ticket.
+
+If one message mentions multiple objectives, assign that whole message to one primary ticket. Never duplicate its message_index across tickets.
+
+Choose the primary ticket by looking at the surrounding conversation:
+
+- prefer the objective that becomes the longer or more substantial operational lifecycle
+- prefer the objective that receives the most follow-up work, messages, or unresolved processing
+- treat a smaller objective that is immediately completed inside the same exchange as supporting context for the primary ticket
+
+Example: if one exchange sends or discusses a contract and then the conversation continues through a much longer visa process, assign the mixed message to the visa ticket. Do not create a separate contract ticket solely from that mixed message.
+
+Create a separate ticket for the secondary objective only when other messages independently pursue it as a distinct matter. Assign those dedicated messages to the secondary ticket while the original mixed message remains only in the primary ticket.
+
+This is a message-assignment constraint, not an exception to objective-based segmentation. If a secondary objective appears only inside one mixed message and has no dedicated message_index that can be assigned without overlap, do not fabricate an overlapping or message-less ticket. Keep the mixed message in the primary ticket and mention the immediately completed secondary matter only as supporting context.
+
+Do not output a broad ticket and also a narrower ticket whose messages sit inside or mostly repeat that broader ticket.
+
+Before returning JSON, review your tickets in order.
+
+For every pair of adjacent or nearby tickets, ask:
+
+Are these actually the same customer objective, only separated by a status update, a proof request, a reminder, or a new source_conversation_id?
+
+If yes, merge them.
+
+Also merge when the later ticket only asks about something the company named in the earlier ticket. A question whose subject is a location, kiosk, branch, provider, company, reference number, amount, document, or next step that the earlier ticket just gave the customer is a clarification inside that ticket, not a new objective -- the customer cannot ask it without the earlier answer. Keep it in that ticket and list it in that ticket's inquiries array.
+
+Bad split: Ticket 1 = "where do I collect the card" answered with "Kiosk K10, Community Centre", Ticket 2 = "what company is this?" / "Kiosk K10 in which company". This is one ticket with the follow-up recorded as an inquiry.
+
+The same holds for a follow-up complaint, fee question, policy question, fairness objection, or comparison about the same product, service, process, app flow, provider, document flow, payment flow, booking flow, or delivery flow. Treat those as clarification or escalation inside one ticket.
+
+Keep steps, limitations, charges, alternatives, provider comparisons, and complaints about the same flow in one ticket unless the customer switches to a clearly different objective.
+
+In particular, when the company refuses or discourages an option and the customer then proposes a different way to reach the same goal, that is the same ticket. The objective has not changed, only the mechanism being tried. Each refusal-and-retry round is another inquiry inside that one ticket, not a new ticket. Ask what the customer is trying to achieve, not which mechanism this message names.
+
+Bad split: Ticket 1 = "can I pay the salary directly?" answered with "it must go through WPS", Ticket 2 = "can I pay the monthly salary by credit card?" answered with "Direct Debit is the best option", Ticket 3 = "can I put a standing instruction on my credit card then?" answered with "Direct Debit is still the smoother option". All three ask how to pay the same monthly salary by some means other than Direct Debit, and each follows a refusal of the previous one. This is one inquiry ticket with three inquiries. The word "then" and the company repeating its previous answer are both signs the customer never left the original objective.
+
+Final test for every remaining ticket:
+
+Would the customer consider this a separate matter they needed solved, not just another message about the previous matter?
+
+If no, merge it into the related ticket.
+
+FINAL FIELD CHECK
+
+Before returning JSON, re-verify every ticket:
+
+- ticket_category: re-read the first material objective and confirm the category follows from it. Do not let request become a default. A ticket that opens with a disputed charge, a refund demand, a failure to deliver, or a service that did not happen is issue. A ticket that opens with a question and never asks for an action is inquiry. If your output contains no issue and no inquiry tickets at all, you have almost certainly defaulted; check each one again.
+- customer_objective: confirm it is your own sentence, starts with an outcome verb, is not a question, and covers exactly one outcome.
+- ticket_type: confirm it is specific and matches customer_objective. Never emit other, misc, general, or unknown. If nothing more specific fits, name the subject and the matter, such as document_rejection or taxi_reimbursement.
+- included_message_indexes: confirm no index appears in two tickets.
+
+--------------------------------------------------
+CUMULATIVE SEGMENTATION
+--------------------------------------------------
+
+If segmentation_context is provided,
+
+previous_cumulative_ticket_output represents the current ticket state.
+
+Treat those tickets as already existing.
+
+Use only the current source_conversation_blocks to determine how the new messages modify the existing tickets.
+
+You may also move an index that an earlier pass already assigned. Each pass sees only its own block's text, so a message can arrive before the objective it belongs to is visible: an isolated payment, rejection, or reminder notice often lands one pass before the customer responds to it. When the current block reveals which ticket an earlier message really belonged to, move that index into the correct ticket and out of the one holding it. Say so in the receiving ticket's segmentation_reason.
+
+Because of this, never leave a message you cannot place unassigned. Attach it to the closest surrounding ticket. A message in the wrong ticket can be moved by a later pass, but a message in no ticket is invisible to every later pass and can never be recovered.
+
+Return the complete updated ticket list.
+
+Do not recreate old tickets.
+
+Do not duplicate tickets.
+
+Update, merge, reopen, split, or append only when justified by the new messages.
+
+You may also change an existing ticket's ticket_category when the new messages reveal that its first material objective was misread. The most common case is a ticket opened as issue because the original request was not yet visible, where a later pass exposes the customer's earlier request for that same process. Merge the failure into that request lifecycle and correct the category to request. Do not change a category merely because later messages contain complaints, requests, or questions; the anchor is still the first material objective, now judged against everything visible.
+
+--------------------------------------------------
+CONVERSATION SUMMARIES
+--------------------------------------------------
+
+Every ticket must contain conversation_summaries: one concise structured entry for each source_conversation_id represented in that ticket.
+
+Each entry must contain:
+
+- source_conversation_id: the exact source ID from the input
+- message_indexes: only the indexes from that source conversation assigned to this ticket
+- customer_intent: what the customer wanted during that source conversation
+- outcome: what happened or the latest concrete state reached during that source conversation
+- status: resolved, pending_unresolved, or totally_unresolved for that source conversation's contribution
+- ticket_signals: short snake_case topic signals that help compare later conversations, such as salary_card, oec_refund, vat_dispute, or stamped_invoice
+
+Use these summaries as evidence when comparing a new conversation with existing tickets. They are not separate tickets and a new source_conversation_id is still not evidence of a new objective.
+
+In cumulative segmentation:
+
+- emit the summary for the current source conversation; earlier summaries covering messages still held by this ticket are preserved automatically and do not need to be repeated
+- add or update the summary for the current source conversation under the ticket that receives its messages
+- if one source conversation contributes to two tickets, create one separate summary entry inside each ticket using only that ticket's message indexes
+- if the same source_conversation_id appears again, update its existing entry instead of duplicating it
+- keep summaries factual and concise; do not reinterpret earlier messages from the current conversation alone
+
+--------------------------------------------------
+SERVICE LIFECYCLE RULES
+--------------------------------------------------
+
+Many customer objectives span multiple conversations and many intermediate steps.
+
+Treat the complete operational lifecycle as one ticket unless the customer clearly starts pursuing a different objective.
+
+Never split a lifecycle into micro-tickets simply because different stages appear.
+
+Examples of lifecycle stages include:
+
+- status requests
+- document collection
+- document upload
+- rejected documents
+- missing documents
+- additional requirements
+- screenshots
+- proof requests
+- callback requests
+- escalation
+- supervisor requests
+- reminders
+- complaints about delays
+- government updates
+- confirmations
+- partial completion
+
+These are normally stages of one customer objective.
+
+--------------------------------------------------
+LIFECYCLE CLOSURE AND FOLLOW-UP PATTERNS
+--------------------------------------------------
+
+A lifecycle is open from the moment the customer states the objective until its outcome is visibly confirmed.
+
+While a lifecycle is open, later requests for proof, reference numbers, screenshots, tracking, or supplementary documents that support finishing that same lifecycle stay in the same ticket, even across a new source_conversation_id or a new conversation on a different day.
+
+A customer's later "payment has been made", "I paid", or equivalent fulfillment message and the company's confirmation that the same fee or amount was received complete the existing payment objective. Append them to the original ticket even if they arrive in a new source_conversation_id and even if an earlier informational question about payment method or splitting the amount was already answered. Do not create a separate ticket whose objective is merely "Payment has been made."
+
+A problem that occurs while carrying out a step the company instructed belongs to the ticket that instructed it. When the company told the customer or the worker to attend an office, clinic, accommodation, branch, or appointment, then waiting, being turned away, finding it closed, being sent to the wrong place, or any delay during that visit is a stage of that same objective. Keep it in that ticket, let the status reflect the failure, and upgrade the category if the ticket was anchored as inquiry.
+
+This holds even when the problem is reported days later in a new source conversation. The visit only happened because of that ticket, so a complaint about the visit cannot be a separate matter.
+
+Once a lifecycle's outcome is visibly confirmed, completed, or the customer received the final result, treat it as closed.
+
+A new supplementary request of the same kind (for example another certificate, letter, a no-objection certificate/NOC, or document tied to that process) made after the lifecycle is closed is a new ticket, not a continuation.
+
+If the only company reply to a customer's objective is a routing message with no real answer, and a later message resumes the same objective and actually gets answered, merge them into one ticket and use the final outcome as the status.
+
+After a lifecycle's main outcome is confirmed (for example a refund is received), a separate smaller leftover objective connected to the same case (for example a different fee or partial amount that was not included) is its own new ticket. Merge repeated follow-ups about that same leftover objective into that one new ticket rather than creating one per follow-up.
+
+Example: "Your main AED 8,000 refund was credited" closes that refund objective. A later "Where is the separate AED 400 overstay refund?" starts one new leftover-refund ticket, and all later AED 400 follow-ups stay in it.
+
+--------------------------------------------------
+VISA / RESIDENCY LIFECYCLE
+--------------------------------------------------
+
+One visa application or visa renewal is one ticket.
+
+Keep together every stage of the same visa process including
+
+- starting the application
+- passport submission
+- passport rejection
+- photo rejection
+- government rejection
+- missing documents
+- document resubmission
+- medical
+- Emirates ID
+- status updates
+- application numbers
+- ICP or government references
+- screenshots
+- proof of submission
+- overstay discussions directly caused by that visa
+- cancellation of that visa process
+- refund directly related to cancelling that process
+
+Do not split these into separate tickets.
+
+An unrelated objective may interrupt an open visa lifecycle without closing it. Put the interruption in its own ticket, then return later medical, document, Emirates ID, status, timing, or next-step messages to the original open visa ticket. Tickets do not need to contain one uninterrupted range of message indexes.
+
+Example: visa medical planning, then a separate advanced-salary duplicate-payment dispute, then more medical timing/document/next-step questions produces two tickets: one non-contiguous visa lifecycle ticket and one salary dispute ticket. Do not assign all messages after the salary dispute begins to the salary ticket.
+
+Residence visa issuance alone does not close the full visa or employment-onboarding lifecycle when the same message, or other visible context, says that the Emirates ID is still processing, pending, or awaiting delivery. Keep the lifecycle open through the remaining Emirates ID stage.
+
+Close the lifecycle when the Emirates ID is dispatched, delivered, or confirmed received and the company explicitly states that this completes the visa process. An explicit completion statement controls even if the customer immediately raises another objective in the same conversation.
+
+Example: "Congratulations, the residency visa has been issued; the Emirates ID is under processing" is not lifecycle completion. A later message saying "The Emirates ID has been handed to the courier. This completes the visa process" is the decisive closure boundary.
+
+Only create a new ticket when the customer starts a different visa process or a completely separate objective.
+
+--------------------------------------------------
+DOCUMENT / ADMIN REQUESTS
+--------------------------------------------------
+
+When a customer requests multiple related administrative actions in one conversation, keep them in one request ticket.
+
+Examples include
+
+- contract copy
+- insurance documents
+- sponsor correction
+- name correction
+- updated documents
+- document replacement
+
+These remain one ticket if they belong to the same administrative objective.
+
+Example: "Send the corrected contract and update the sponsor name" is one related document/admin request. "Send the contract" followed by an unrelated request to book a medical appointment represents separate objectives.
+
+--------------------------------------------------
+REFUNDS
+--------------------------------------------------
+
+One refund request equals one ticket.
+
+Keep together
+
+- refund request
+- refund status
+- refund delay
+- refund approval
+- refund rejection
+- refund confirmation
+- proof of refund
+- bank confirmation
+- follow-up reminders
+
+Create a new ticket only when the customer starts discussing a different refund or a different payment.
+
+Example: asking for refund status, proof, and bank confirmation for the same AED 500 payment is one ticket. Asking about a separate AED 200 charge starts another ticket.
+
+--------------------------------------------------
+PAYMENTS
+--------------------------------------------------
+
+One payment problem equals one ticket.
+
+Merge
+
+- payment status
+- payment investigation
+- payment proof
+- duplicate payment discussion
+- payment delay
+- payment reminder confusion
+- cancellation-warning confusion tied to the payment
+- questions about whether a reminder should be ignored
+- routing discussion
+- escalation
+- callback requests
+- payment screenshots
+
+Do not create separate tickets for each follow-up.
+
+Different payments should become different tickets.
+
+Do not split a payment-reminder or cancellation-warning thread just because the customer first says "paid", "done", or sends proof, and the company first acknowledges it. If later messages show the same payment, fee, reminder, cancellation warning, or "should I ignore this?" concern continuing, merge the acknowledgment and all later clarification into one ticket.
+
+Repeated automated reminders, cancellation warnings, customer question marks, complaints about being told to ignore reminders, and agent clarifications about the same payment or fee all belong to the same payment ticket.
+
+If the final answer tells the customer whether payment is still required, whether the reminders can be ignored, or what exact payment timing is expected, and the customer accepts or stops objecting, mark that ticket resolved. A later isolated automated reminder about the same payment does not create a new ticket or make the resolved ticket pending unless the customer responds to it with a renewed concern.
+
+A dispute about stopping a recurring or in-flight payment instruction may also involve settling the current amount another way and changing future cycles. Keep these related actions in the same ticket when they are pursued as the solution to that one unwanted instruction. The ticket remains pending until every material action is complete, especially revocation of the instruction already in flight. See TICKET STATUS.
+
+When the customer disputes a specific charge as duplicate, incorrect, or already paid, treat that dispute as an issue, not a request, even if it relates to an ongoing service.
+
+When the customer asks to change how or where a payment is sent, such as a different account, method, or channel, treat that as a request. Keep every follow-up detail needed to complete that change, such as confirmations or corrected information, in the same ticket until the change is submitted or confirmed.
+
+Examples: "Why was I charged twice?" is an issue. "Can I use another bank account for future deductions?" is a request. "When will the deduction happen?" is an inquiry when the customer only wants timing information.
+
+--------------------------------------------------
+SALARY
+--------------------------------------------------
+
+Treat one salary payment period as one objective.
+
+A salary that is missing, late, or sent through the wrong channel is an issue. A simple question about when a salary will arrive is an inquiry.
+
+Keep together
+
+- salary status
+- salary delay
+- salary routing
+- salary proof
+- payment screenshots
+- transfer confirmation
+- follow-up requests
+
+Only split when
+
+- another salary period is discussed,
+- another worker is discussed,
+- or the customer starts a separate payroll objective.
+
+Example: "Was June salary transferred?" and "What time will it arrive?" concern one June salary ticket. "Please change future salary payments to another IBAN" is a separate payroll request.
+
+--------------------------------------------------
+BOOKINGS
+--------------------------------------------------
+
+One booking process equals one ticket.
+
+Include
+
+- booking request
+- booking changes
+- rescheduling
+- confirmations
+- delays
+- follow-ups
+- callback requests
+
+Only split when another booking is started.
+
+Example: booking, rescheduling, and confirming one Friday visit remain one ticket. Booking a second visit for Monday starts another booking ticket.
+
+--------------------------------------------------
+DELIVERIES
+--------------------------------------------------
+
+One delivery equals one ticket.
+
+Merge
+
+- delivery tracking
+- delivery status
+- address confirmation
+- delivery delays
+- proof of delivery
+- rescheduling
+
+Only split when discussing another delivery.
+
+Example: address correction, courier tracking, and delayed arrival for one Emirates ID delivery remain one ticket. Delivery of a separate payroll card may be another ticket when it is pursued independently.
+
+--------------------------------------------------
+INSURANCE / MEDICAL
+--------------------------------------------------
+
+One insurance or medical process equals one ticket.
+
+Merge
+
+- clinic selection
+- appointments
+- insurance confirmation
+- insurance card
+- medical fitness
+- required documents
+- follow-up questions
+
+Do not separate each stage.
+
+Example: choosing a clinic, asking which documents to bring, completing the fitness test, and awaiting its result are one medical process ticket.
+
+--------------------------------------------------
+EMPLOYMENT ONBOARDING
+--------------------------------------------------
+
+Treat one employment onboarding process as one ticket.
+
+While the visa or residency process is still open, informational questions about later onboarding stages stay inside that open ticket as inquiries. This includes questions about payroll setup, salary account setup, ATM or salary card readiness, collection, and use.
+
+Example: while the visa is still processing, "When will her salary card be ready?" belongs to the open visa or onboarding ticket and is recorded in its inquiries list.
+
+Once the visa process is visibly completed, close that visa ticket. Any salary-account, payroll, ATM-card, or salary-card objective first raised after that completion starts a new ticket, even when it is raised later on the same day or in the immediately following messages. Message proximity does not keep a post-completion objective inside the closed visa ticket.
+
+Use the VISA / RESIDENCY LIFECYCLE rule above to identify completion. Do not treat residency visa issuance as completion while the Emirates ID is visibly still processing. The strongest boundary is an explicit statement that the visa process is complete together with Emirates ID dispatch, delivery, or confirmed receipt.
+
+After that boundary, keep distinct post-visa objectives in distinct tickets. Payroll card and health-insurance status may form one related inquiry when raised together. A paid consulate contract-verification request is a separate request ticket. Re-registering a cancelled direct-debit mandate because of a signature mismatch is another separate request ticket. Repeated follow-ups about each objective remain in its own ticket.
+
+The open employment onboarding lifecycle may include
+
+- employment visa
+- residency
+- onboarding documents
+- medical
+- Emirates ID
+- insurance
+- payroll setup
+- salary account setup
+- card readiness
+
+These remain one operational objective only while that lifecycle is still open. Apply the post-completion boundary above as soon as visa completion is visibly confirmed.
+
+--------------------------------------------------
+STATUS QUESTIONS
+--------------------------------------------------
+
+A status question alone does not create a new ticket when it clearly refers to an existing visible ticket. If there is no existing related ticket, create a standalone inquiry ticket.
+
+Examples
+
+"Any update?"
+
+"Is it ready?"
+
+"Can you check?"
+
+"When will it finish?"
+
+remain part of the ticket whose status is being checked.
+
+--------------------------------------------------
+ESCALATIONS
+--------------------------------------------------
+
+Escalations normally do not create new tickets.
+
+Examples
+
+"I want a supervisor."
+
+"This is taking too long."
+
+"I'll file a complaint."
+
+"Please call me."
+
+"Please keep trying."
+
+"This is a huge inconvenience."
+
+These remain inside the existing ticket unless the customer starts discussing a different objective. Urging continued effort or describing the impact of a delay is escalation, not a new objective. See the issue rules under TICKET CATEGORIES for how such a message is categorized when it opens a ticket.
+
+An escalation usually names no subject of its own. "Call me back", "I want a supervisor", or "any update?" state no matter, so you must identify the matter from the messages around them before deciding where they belong.
+
+Read the company's replies in the same block. The agent almost always names the subject even when the customer does not: a transfer note, a queue message, or a senior agent's reply saying "your GCC case", "still waiting on the update about X", or "I reviewed your case" identifies the matter the customer is chasing. Use that name to find the existing ticket, and put the whole exchange there.
+
+A contentless escalation is never its own ticket. It is never a general_inquiry. If after reading the surrounding company replies you still cannot identify the matter, attach it to the most recent open ticket rather than creating one.
+
+Bad split: Ticket = "general inquiry" containing "Call me back", "I'm transferring you to a senior agent", "you're still waiting on the update about your GCC case", "I reviewed your case, no new updates yet", "Call me back". Every company message here names the case being chased. This belongs to that existing GCC ticket as escalation, and it keeps that ticket pending rather than answering anything.
+
+--------------------------------------------------
+DOCUMENTS AND SCREENSHOTS
+--------------------------------------------------
+
+Sending
+
+- screenshots
+- PDFs
+- passport copies
+- photos
+- bank details
+- IBAN
+- receipts
+
+does not create a new ticket.
+
+These messages support the existing objective.
+
+--------------------------------------------------
+BROADCASTS
+--------------------------------------------------
+
+Broadcast, automated, and agent-authored promotional messages must be assigned using these rules.
+
+Include a broadcast in the ticket it concerns when it triggers the customer's objective, the customer replies to it, or it provides progress on an existing ticket.
+
+A broadcast that is the last message of a block is provisional. The customer's reply to it usually arrives in the next block, so placing it is a guess until you have seen what follows. When a later block opens with a reaction to that broadcast -- "are we going to receive this message continuously?", "why am I getting this?", "I already paid this", "should I ignore this?" -- the broadcast triggered that objective and belongs with it. Move it into that ticket, out of whichever ticket provisionally held it.
+
+Treat a demonstrative with no antecedent in its own block as a pointer backwards. "This message", "this charge", "this link", "this amount" refer to something the customer can see and you may not have in front of you. Look at the message immediately preceding the block, and if it is a broadcast, that is almost always what they mean.
+
+The same applies to a message with no words at all. A bare attachment -- a filename, a PDF, a photo, a screenshot -- carries its meaning entirely in what it answers. When the company last asked for a document and the customer then sends a file, that file is the reply, and the request and the file are one ticket even when nothing textual connects them. Never treat a wordless upload as having no objective; read the request it satisfies.
+
+A company request for a document plus the customer sending it is a genuine ticket even though the customer never states an objective in words. The objective is completing whatever the document unblocks, and request_origin is company.
+
+When a broadcast moves into a ticket as its trigger, that ticket now starts earlier than it did, so re-derive its customer_objective and ticket_category from the new opening. Do not keep an objective taken from a later, more actionable message.
+
+Bad example: a "settle AED 3150 today" reminder, then "Are we going to receive this message continuously?", then later messages asking for a proforma invoice, labelled Request / Payment document request with the objective "Obtain a proforma invoice". The ticket opens with a reminder the customer is questioning, so it anchors as an inquiry about that reminder and the invoice ask is an upgrade inside it per CATEGORY HIERARCHY. Naming the ticket after its most actionable message rather than its first material objective misstates what the customer came for.
+
+Payment reminders, cancellation reminders, expiry warnings, and automated follow-ups about the same payment or service lifecycle must be merged into the existing related ticket when the customer is asking whether the reminder is valid, whether they already paid, whether to ignore it, or whether cancellation will happen. Do not create a new ticket for each reminder.
+
+After the customer has accepted a clear answer about the reminder or payment, a later isolated automated reminder about the same matter is contextual noise. Attach it to that same ticket without changing its resolved status, unless the customer responds with a new unresolved concern or the reminder introduces a materially different payment, amount, service, or objective. Do not leave it unassigned.
+
+An isolated promotional service or marketing message with no customer response does not create a ticket. Attach it to the nearest current or preceding ticket as contextual noise, even when the promotion is unrelated to that ticket. It must not change that ticket's customer_objective, ticket_category, status, inquiries, or previous_ticket_id.
+
+If the customer meaningfully engages with the promotion by asking for details, checking availability or price, selecting an option, requesting the service, booking it, or continuing through an operational process, create a separate ticket for that promotional service. Include the original promotional message and all customer/company messages that pursue the resulting objective in that new ticket.
+
+Do not create a standalone ticket made up only of a broadcast with no related customer objective and no customer response. Attach it to the closest surrounding ticket instead. "Do not give it its own ticket" never means "leave it out" -- a broadcast is never dropped.
+
+Company-side waiting messages -- out-of-hours or no-agents-available notices, queue-position and estimated-wait updates, "we are lining up the right colleague", apology-for-the-delay messages -- belong to the ticket the customer is waiting on, however many of them there are and even though the customer sends nothing between them. They are that ticket's handling, not noise. A long unbroken run of them is evidence of a wait, which is exactly what the ticket needs to record. Assign the whole run to the open ticket that preceded it; never leave the run unassigned and never give it a ticket of its own.
+
+A broadcast that reports a concrete operational event -- a failed or retried payment, an insufficient-funds notice, a deduction attempt, an amount owed, a document rejection, an approval, an expiry, a delivery or pickup instruction -- always belongs to the ticket for that payment, worker, document, or service, even when the customer never replies to it. Match it by the amount, worker name, service, or lifecycle it names. Only when no ticket concerns that matter does it fall back to the closest surrounding ticket.
+
+Repeated identical broadcasts carry no new information, but they are still assigned. Put every repeat in the same ticket as the first occurrence. A repeat never changes that ticket's status, never keeps it pending, and never reopens a matter that was already answered, but it does stay in the ticket's included_message_indexes and it does extend the ticket's message range. Never drop a repeat, and never let repeats become their own ticket.
+
+Only treat a later notice as new when it reports a materially different state, such as a different document, a different rejection reason, a new stage, or an approval, or when the customer replies to it. That distinction changes whether the notice can affect the ticket's status -- it never changes whether the notice is assigned.
+
+Example: eight identical "the government has rejected the passport" notices sent on consecutive days, with the customer replying only to the first, all eight belong to that visa ticket. Only the first one is treated as new information.
+
+Example: a customer reports a declined payment, then receives 150 identical "we are outside working hours" replies and 40 queue-position updates over four hours with no message of their own. All 190 belong to that payment ticket. The length of that run is the record of how the ticket was handled and must not be discarded.
+
+Birthday, holiday, greeting, out-of-hours, working-hours, and unrelated non-promotional informational broadcasts are not support tickets and never get a ticket of their own. Attach them to the closest surrounding ticket as context instead of leaving them unassigned. Do not infer a new objective from them merely because they are close in time or mention a broad word like maid, visa, booking, customer, or contract.
+
+Examples:
+
+- A payment reminder followed by "I already paid this amount" belongs to the resulting payment issue.
+- A part-time-cleaning promotion with no customer response attaches to the nearest current ticket as context and does not create a new ticket.
+- A part-time-cleaning promotion followed by "Yes, I need a cleaner on Friday," service selection, pricing, or booking messages creates a separate part_time_cleaning ticket containing the promotion and that full customer flow.
+
+--------------------------------------------------
+GREETINGS
+--------------------------------------------------
+
+Greeting messages
+
+Hi
+
+Hello
+
+Good morning
+
+Thank you
+
+You're welcome
+
+attach to the nearest relevant ticket.
+
+Never create greeting-only tickets.
+
+--------------------------------------------------
+MULTIPLE OBJECTIVES
+--------------------------------------------------
+
+A customer may discuss multiple objectives in one conversation.
+
+Example
+
+Customer
+
+Please renew my visa.
+
+Also can you send me my contract?
+
+These are two different objectives.
+
+Use the primary-ticket rule under NO OVERLAPPING TICKETS.
+
+If later messages independently pursue both objectives, create two tickets and assign the mixed message only to the dominant, longer, or more substantial lifecycle. Assign the dedicated follow-up messages to their respective tickets.
+
+If the secondary objective is completed immediately inside the mixed exchange and has no dedicated message_index, apply the message-assignment constraint under NO OVERLAPPING TICKETS: keep one primary ticket rather than creating an overlapping or message-less micro-ticket. For example, if a mixed message mentions a contract, the contract is sent immediately, and the conversation then continues through a longer visa process, keep the mixed exchange in the visa ticket.
+
+Conversely,
+
+if several messages contribute toward completing one objective,
+
+keep them together,
+
+even when the conversation spans multiple source_conversation_ids.
+
+--------------------------------------------------
+END-TO-END EXAMPLE
+--------------------------------------------------
+
+Example input timeline:
+
+1. customer: "Please renew my visa."
+2. company: "Please send your passport copy."
+3. customer: "Passport attached."
+4. customer: "I was charged twice for advanced salary."
+5. company: "We will investigate the duplicate charge."
+6. customer: "Any update on my visa?"
+7. company: "The renewal was submitted and is pending government approval."
+8. company: "The visa is complete and the Emirates ID was delivered. This completes the visa process."
+9. customer: "Now when will my salary card be ready?"
+10. company: "It will be ready next Tuesday."
+
+Example output:
+
+{
+	"tickets": [
+		{
+			"ticket_id": "ticket_1",
+			"ticket_category": "request",
+			"request_origin": "customer",
+			"ticket_type": "visa_renewal",
+			"customer_objective": "Complete the visa renewal process",
+			"start_message_index": 1,
+			"end_message_index": 8,
+			"included_message_indexes": [1, 2, 3, 6, 7, 8],
+			"status": "resolved",
+			"should_append_future_conversations": false,
+			"previous_ticket_id": "",
+			"inquiries": [
+				{
+					"inquiry_id": "inquiry_1",
+					"question": "What is the visa renewal status?",
+					"message_indexes": [6],
+					"answer_summary": "The renewal was submitted, received government approval, and the process was completed.",
+					"status": "resolved",
+					"unresolved_reason": ""
+				}
+			],
+			"conversation_summaries": [
+				{
+					"source_conversation_id": "conversation_1",
+					"message_indexes": [1, 2, 3, 6, 7, 8],
+					"customer_intent": "Complete the visa renewal process",
+					"outcome": "The visa renewal and Emirates ID delivery were completed",
+					"status": "resolved",
+					"ticket_signals": ["visa_renewal", "emirates_id"]
+				}
+			],
+			"segmentation_reason": "The application, passport submission, status request, and completion update are stages of one non-contiguous visa-renewal lifecycle."
+		},
+		{
+			"ticket_id": "ticket_2",
+			"ticket_category": "issue",
+			"request_origin": "customer",
+			"ticket_type": "advanced_salary_duplicate_charge",
+			"customer_objective": "Resolve the duplicate advanced-salary charge",
+			"start_message_index": 4,
+			"end_message_index": 5,
+			"included_message_indexes": [4, 5],
+			"status": "pending_unresolved",
+			"should_append_future_conversations": true,
+			"previous_ticket_id": "",
+			"inquiries": [],
+			"conversation_summaries": [
+				{
+					"source_conversation_id": "conversation_1",
+					"message_indexes": [4, 5],
+					"customer_intent": "Resolve the duplicate advanced-salary charge",
+					"outcome": "The charge remains under investigation",
+					"status": "pending_unresolved",
+					"ticket_signals": ["advanced_salary", "duplicate_charge"]
+				}
+			],
+			"segmentation_reason": "The disputed charge is independent of the interrupted visa lifecycle and remains under investigation."
+		},
+		{
+			"ticket_id": "ticket_3",
+			"ticket_category": "inquiry",
+			"request_origin": "customer",
+			"ticket_type": "salary_card_readiness",
+			"customer_objective": "Learn when the salary card will be ready",
+			"start_message_index": 9,
+			"end_message_index": 10,
+			"included_message_indexes": [9, 10],
+			"status": "resolved",
+			"should_append_future_conversations": false,
+			"previous_ticket_id": "ticket_1",
+			"inquiries": [
+				{
+					"inquiry_id": "inquiry_1",
+					"question": "When will the salary card be ready?",
+					"message_indexes": [9],
+					"answer_summary": "The salary card will be ready next Tuesday.",
+					"status": "resolved",
+					"unresolved_reason": ""
+				}
+			],
+			"conversation_summaries": [
+				{
+					"source_conversation_id": "conversation_1",
+					"message_indexes": [9, 10],
+					"customer_intent": "Learn when the salary card will be ready",
+					"outcome": "The card will be ready next Tuesday",
+					"status": "resolved",
+					"ticket_signals": ["salary_card", "readiness"]
+				}
+			],
+			"segmentation_reason": "The salary-card question starts after explicit visa completion and is a separate follow-on objective enabled by that completed process."
+		}
+	]
+}
+
+--------------------------------------------------
+OUTPUT FORMAT
+--------------------------------------------------
+
+Field definitions:
+
+- ticket_id: a unique sequential identifier such as ticket_1. After all merging, splitting, reopening, carrying forward, or deleting obsolete tickets, the final returned tickets array must be renumbered in ascending start_message_index order as ticket_1, ticket_2, ticket_3, with no missing numbers and no skipped first ticket. In cumulative segmentation, preserve the meaning and linkage of existing tickets while renumbering the final returned list; update previous_ticket_id to the final renumbered id it refers to.
+- ticket_category: exactly one of inquiry, request, or issue, using the category rules above. This is the field that records whether the ticket is a request, issue, or inquiry.
+- request_origin: company only when a related company message directly triggered or framed the customer objective and belongs to that ticket; otherwise customer.
+- ticket_type: a concise descriptive snake_case label for the specific objective, such as visa_renewal, contract_request, payment_issue, salary_status, or uniform_inquiry. It is more specific than ticket_category, must not contain spaces, and must not contain any person's name. It must describe the same matter as customer_objective. Never emit other, misc, general, unknown, or a label that names a different matter from the objective.
+- customer_objective: one short description of the outcome the customer wants, written from the customer's perspective. Describe the objective, not the department, message wording, agent action, emotional opener, or any person's name.
+- start_message_index: the smallest value in included_message_indexes.
+- end_message_index: the largest value in included_message_indexes.
+- included_message_indexes: the sorted, unique substantive message indexes assigned to this ticket. Indexes between start_message_index and end_message_index are not implicitly included.
+- status: exactly one of resolved, pending_unresolved, or totally_unresolved, using the status rules above.
+- should_append_future_conversations: true only when status is pending_unresolved; otherwise false.
+- previous_ticket_id: the earlier related ticket id only when this is a genuine separate follow-on objective; otherwise an empty string.
+- inquiries: every informational question inside the ticket, or an empty array when there are none.
+- inquiry_id: a unique sequential identifier within its ticket, such as inquiry_1.
+- question: a short faithful summary of the information the customer asked for.
+- message_indexes: the sorted, unique indexes of the customer messages that ask this inquiry.
+- answer_summary: a short summary of the answer or latest known state. Use an empty string when no answer or current state was provided.
+- unresolved_reason: a short reason the inquiry remains unresolved. Use an empty string when the inquiry is resolved.
+- conversation_summaries: one structured summary for each source_conversation_id represented in this ticket, or an empty array only when no source conversation can be identified.
+- source_conversation_id: the exact source ID summarized by this conversation_summaries entry.
+- customer_intent: a concise statement of what the customer wanted in that source conversation.
+- outcome: a concise statement of what happened or the latest concrete state in that source conversation.
+- ticket_signals: concise snake_case topic labels used to compare future conversations with this ticket.
+- segmentation_reason: a short explanation of why the listed messages form one objective and, when relevant, why they were merged with or split from nearby messages. Do not merely repeat customer_objective.
+
+Order tickets in the output array by ascending start_message_index.
+
+Final ticket ID check:
+
+- The first ticket in the final output array must have ticket_id="ticket_1".
+- The second ticket must have ticket_id="ticket_2", and so on.
+- Never return ticket_2 or ticket_3 without a ticket_1.
+- If ticket_1 was merged into another ticket, deleted as obsolete, or carried forward under another id during cumulative reasoning, renumber the final visible tickets before returning JSON.
+- After renumbering, every previous_ticket_id must either be an empty string or match one of the final visible ticket_id values.
+
+If the timeline contains no visible customer objective, return {"tickets": []}. Never invent a ticket to avoid an empty array, and never emit a ticket with an empty included_message_indexes.
+
+Return only the JSON object described by the schema below. No markdown, no comments, no extra text, no extra top-level keys, no missing keys.
+
+Required schema:
+{output_schema}
+

@@ -1,0 +1,20 @@
+{
+  "conversation_id": "string",
+  "target_message_id": "string",
+  "message_index": 0,
+  "message_level_effect": "helped|neutral|minor_issue|major_issue|recovered_issue",
+  "frustration_level_after_message": "none|low|medium|high|cancellation_risk",
+  "frustration_change": "decreased|unchanged|increased|created",
+  "customer_effort_level": "low|medium|high",
+  "clarity_level": "clear|somewhat_clear|unclear",
+  "context_handling": "good|partial|poor|not_applicable",
+  "issue_origin": "our_side|customer_side|shared|none",
+  "issue_type": "none|misunderstanding|repetition|delay|unclear_guidance|wrong_info|ignored_context|dead_end|tool_or_system_failure|poor_tone|missing_next_step|other",
+  "contradiction": "true or false",
+  "first_contradiction_message_id": "message_id of the first visible bot/system/broadcast/agent message that created the contradiction, or none",
+  "contradiction_debug_message": "one concise sentence explaining the conflicting facts and why first_contradiction_message_id is the source, or none",
+  "frustration_cause": "string, maximum 4 words, or none",
+  "evidence": "short quote or paraphrase from the conversation",
+  "business_impact": "short business-friendly explanation",
+  "recommended_fix": "short actionable recommendation"
+}

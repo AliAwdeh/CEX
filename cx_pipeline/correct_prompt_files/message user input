@@ -1,0 +1,8 @@
+Evaluate ONE specific target agent message using the visible conversation history up to and including that target message.
+
+Your task is to judge whether the message helped or harmed the customer journey, how much frustration or effort it created, and what the better response should have done instead.
+
+Return strict JSON only using the required schema.
+
+Input:
+{payload_json}

@@ -2706,8 +2706,18 @@ def _execute_db_source_full_run(
     st.session_state.loaded_run_label = None
     st.session_state._run_results_db_path = _active_db_path()
 
-    total_conv = int(estimate["conversations"] or 0)
+    original_timeline_count = int(estimate["conversations"] or 0)
+    total_conv = original_timeline_count
     total_calls = int(estimate["total_calls"] or 0)
+    has_ticketing = bool(config.enable_ticket_segmentation)
+    ticket_progress = {
+        "done": 0,
+        "calls_done": 0,
+        "total": original_timeline_count,
+        "planned_calls": int(estimate.get("ticket_segmentation_calls") or 0),
+        "successes": 0,
+        "failures": 0,
+    }
     progress_state = {
         "convs_done": 0,
         "calls_done": 0,
@@ -2727,32 +2737,100 @@ def _execute_db_source_full_run(
         if phase == "ticket_segmentation_start":
             mode_label = _ticket_segmentation_mode_label(str(evt.get("segmentation_mode") or ""))
             planned_ticket_calls = int(evt.get("planned_ticket_calls") or evt.get("total_conversations") or 0)
+            ticket_progress["done"] = 0
+            ticket_progress["calls_done"] = 0
+            ticket_progress["total"] = int(evt.get("total_conversations") or ticket_progress["total"] or 0)
+            ticket_progress["planned_calls"] = planned_ticket_calls
             current_box.info(
-                f"Splitting {evt.get('total_conversations', 0):,} saved DB timelines into ticket journeys "
+                f"Phase 1/2 - Ticketing by original journey: splitting "
+                f"{ticket_progress['total']:,} saved DB timeline(s) into ticket journeys "
                 f"with {evt.get('workers', 1):,} concurrent worker(s). "
                 f"Mode: {mode_label}. Planned ticket calls: {planned_ticket_calls:,}."
             )
+            bar.progress(
+                0,
+                text=(
+                    f"Phase 1/2 Ticketing | Original journeys "
+                    f"0/{ticket_progress['total']} | Ticket calls 0/{ticket_progress['planned_calls']}"
+                ),
+            )
+            counter_box.markdown("**Ticket successes:** 0 | **Ticket failures:** 0")
+            st.session_state.progress_log.append(evt)
+            return
+        elif phase == "ticket_segmentation_skipped":
+            current_box.warning(str(evt.get("reason") or "Ticketing skipped."))
+            bar.progress(0, text="Phase 1/2 Ticketing skipped | Original journeys 0/0 | Ticket calls 0/0")
+            counter_box.markdown("**Ticket successes:** 0 | **Ticket failures:** 0")
+            st.session_state.progress_log.append(evt)
+            return
         elif phase == "ticket_segmentation_done":
-            progress_state["calls_done"] += max(1, int(evt.get("ticket_calls_used") or 1))
+            ticket_progress["done"] = int(evt.get("completed_conversations") or ticket_progress["done"] + 1)
+            ticket_progress["calls_done"] += max(1, int(evt.get("ticket_calls_used") or 1))
             if evt.get("error"):
-                progress_state["failures"] += 1
+                ticket_progress["failures"] += 1
             else:
-                progress_state["successes"] += 1
+                ticket_progress["successes"] += 1
             current_box.info(
-                f"Ticket split {evt.get('conversation_index')}/{evt.get('total_conversations')} - "
+                f"Phase 1/2 - Ticket split {ticket_progress['done']}/{ticket_progress['total']} - "
                 f"Customer `{evt.get('conversation_id')}` - "
                 f"{evt.get('tickets_created', 0)} ticket(s) - "
                 f"{int(evt.get('ticket_calls_used') or 1):,} ticket call(s)"
             )
+            frac = min(
+                ticket_progress["calls_done"] / max(ticket_progress["planned_calls"], 1),
+                1.0,
+            )
+            bar.progress(
+                frac,
+                text=(
+                    f"Phase 1/2 Ticketing | Original journeys "
+                    f"{ticket_progress['done']}/{ticket_progress['total']} | "
+                    f"Ticket calls {ticket_progress['calls_done']}/{ticket_progress['planned_calls']}"
+                ),
+            )
+            counter_box.markdown(
+                f"**Ticket successes:** {ticket_progress['successes']} | "
+                f"**Ticket failures:** {ticket_progress['failures']}"
+            )
+            st.session_state.progress_log.append(evt)
+            return
         elif phase == "start":
             total_conv = int(evt.get("total_conversations") or total_conv or 0)
             if evt.get("total_calls") is not None:
-                total_calls = progress_state["calls_done"] + int(evt.get("total_calls") or 0)
+                total_calls = int(evt.get("total_calls") or 0)
             else:
                 total_calls = total_calls or total_conv
+            progress_state.update(
+                {
+                    "convs_done": 0,
+                    "calls_done": 0,
+                    "successes": 0,
+                    "failures": 0,
+                    "reruns": 0,
+                    "recovered": 0,
+                }
+            )
+            if has_ticketing:
+                current_box.info(
+                    f"Phase 2/2 - Analysis by generated ticket journey: "
+                    f"{total_conv:,} ticket journey/journeys, {total_calls:,} message/conversation call(s), "
+                    f"{evt.get('workers', 1):,} concurrent worker(s)."
+                )
+                progress_text = f"Phase 2/2 Analysis | Ticket journeys 0/{total_conv} | Calls 0/{total_calls}"
+            else:
+                current_box.info(
+                    f"Analysis: {total_conv:,} journey/journeys, {total_calls:,} message/conversation call(s)."
+                )
+                progress_text = f"Journeys 0/{total_conv} | Calls 0/{total_calls}"
+            bar.progress(
+                0,
+                text=progress_text,
+            )
         elif phase == "conversation_start":
+            journey_label = "Ticket journey" if has_ticketing else "Journey"
             current_box.info(
-                f"Journey {evt.get('conversation_index')}/{evt.get('total_conversations')} - "
+                f"{'Phase 2/2 - ' if has_ticketing else ''}{journey_label} "
+                f"{evt.get('conversation_index')}/{evt.get('total_conversations')} - "
                 f"Customer `{evt.get('conversation_id')}` - "
                 f"{evt.get('target_messages', 0)} target message(s)"
             )
@@ -2787,7 +2865,18 @@ def _execute_db_source_full_run(
         frac = min(progress_state["calls_done"] / max(total_calls, 1), 1.0) if total_calls > 0 else 0.0
         bar.progress(
             frac,
-            text=f"Journeys {progress_state['convs_done']}/{total_conv} | Calls {progress_state['calls_done']}/{total_calls}",
+            text=(
+                (
+                    f"Phase 2/2 Analysis | Ticket journeys "
+                    f"{progress_state['convs_done']}/{total_conv} | "
+                    f"Calls {progress_state['calls_done']}/{total_calls}"
+                )
+                if has_ticketing
+                else (
+                    f"Journeys {progress_state['convs_done']}/{total_conv} | "
+                    f"Calls {progress_state['calls_done']}/{total_calls}"
+                )
+            ),
         )
         counter_box.markdown(
             f"**Successes:** {progress_state['successes']} | "
@@ -3142,14 +3231,33 @@ def _execute_full_batch_into_run(
         },
     )
 
+    scoped_df = df[df[JOURNEY_ID_COLUMN].astype(str).isin(set(conversation_ids))]
     estimate = estimate_call_counts(
-        df[df[JOURNEY_ID_COLUMN].astype(str).isin(set(conversation_ids))],
+        scoped_df,
         max_conversations=None,
         max_agent_messages_per_conv=config.max_agent_messages_per_conv,
         target_role=config.message_target_role,
     )
     total_conversations = int(estimate["conversations"])
     total_calls = int(estimate["total_calls"])
+    has_ticketing = bool(config.enable_ticket_segmentation)
+    ticket_progress = {
+        "done": 0,
+        "calls_done": 0,
+        "total": total_conversations,
+        "planned_calls": (
+            _estimate_ticket_segmentation_calls_for_df(
+                scoped_df,
+                max_conversations=None,
+                selected_conversation_ids=None,
+                mode=config.ticket_segmentation_mode,
+            )
+            if has_ticketing
+            else 0
+        ),
+        "successes": 0,
+        "failures": 0,
+    }
     progress_state = {
         "conversations": 0,
         "calls": 0,
@@ -3164,10 +3272,104 @@ def _execute_full_batch_into_run(
     rerun_box = st.empty()
 
     def on_progress(event: dict) -> None:
+        nonlocal total_conversations, total_calls
         phase = event.get("phase")
-        if phase == "conversation_start":
+        if phase == "ticket_segmentation_start":
+            mode_label = _ticket_segmentation_mode_label(str(event.get("segmentation_mode") or ""))
+            planned_ticket_calls = int(event.get("planned_ticket_calls") or event.get("total_conversations") or 0)
+            ticket_progress["done"] = 0
+            ticket_progress["calls_done"] = 0
+            ticket_progress["total"] = int(event.get("total_conversations") or ticket_progress["total"] or 0)
+            ticket_progress["planned_calls"] = planned_ticket_calls
             current_box.info(
-                f"Journey {event.get('conversation_index')}/{event.get('total_conversations')} — "
+                f"Phase 1/2 - Ticketing by original journey: splitting "
+                f"{ticket_progress['total']:,} customer timeline(s) into ticket journeys "
+                f"with {event.get('workers', 1):,} concurrent worker(s). "
+                f"Mode: {mode_label}. Planned ticket calls: {planned_ticket_calls:,}."
+            )
+            bar.progress(
+                0,
+                text=(
+                    f"Phase 1/2 Ticketing | Original journeys "
+                    f"0/{ticket_progress['total']} | Ticket calls 0/{ticket_progress['planned_calls']}"
+                ),
+            )
+            counter_box.markdown("**Ticket successes:** 0 | **Ticket failures:** 0")
+            st.session_state.progress_log.append(event)
+            return
+        elif phase == "ticket_segmentation_skipped":
+            current_box.warning(str(event.get("reason") or "Ticketing skipped."))
+            bar.progress(0, text="Phase 1/2 Ticketing skipped | Original journeys 0/0 | Ticket calls 0/0")
+            counter_box.markdown("**Ticket successes:** 0 | **Ticket failures:** 0")
+            st.session_state.progress_log.append(event)
+            return
+        elif phase == "ticket_segmentation_done":
+            ticket_progress["done"] = int(event.get("completed_conversations") or ticket_progress["done"] + 1)
+            ticket_progress["calls_done"] += max(1, int(event.get("ticket_calls_used") or 1))
+            if event.get("error"):
+                ticket_progress["failures"] += 1
+            else:
+                ticket_progress["successes"] += 1
+            current_box.info(
+                f"Phase 1/2 - Ticket split {ticket_progress['done']}/{ticket_progress['total']} - "
+                f"Customer `{event.get('conversation_id')}` - "
+                f"{event.get('tickets_created', 0)} ticket(s) - "
+                f"{int(event.get('ticket_calls_used') or 1):,} ticket call(s)"
+            )
+            fraction = min(
+                ticket_progress["calls_done"] / max(ticket_progress["planned_calls"], 1),
+                1.0,
+            )
+            bar.progress(
+                fraction,
+                text=(
+                    f"Phase 1/2 Ticketing | Original journeys "
+                    f"{ticket_progress['done']}/{ticket_progress['total']} | "
+                    f"Ticket calls {ticket_progress['calls_done']}/{ticket_progress['planned_calls']}"
+                ),
+            )
+            counter_box.markdown(
+                f"**Ticket successes:** {ticket_progress['successes']} | "
+                f"**Ticket failures:** {ticket_progress['failures']}"
+            )
+            st.session_state.progress_log.append(event)
+            return
+        elif phase == "start":
+            total_conversations = int(event.get("total_conversations") or total_conversations or 0)
+            if event.get("total_calls") is not None:
+                total_calls = int(event.get("total_calls") or 0)
+            progress_state.update(
+                {
+                    "conversations": 0,
+                    "calls": 0,
+                    "successes": 0,
+                    "failures": 0,
+                    "reruns": 0,
+                    "recovered": 0,
+                }
+            )
+            if has_ticketing:
+                current_box.info(
+                    f"Phase 2/2 - Analysis by generated ticket journey: "
+                    f"{total_conversations:,} ticket journey/journeys, {total_calls:,} message/conversation call(s), "
+                    f"{event.get('workers', 1):,} concurrent worker(s)."
+                )
+                progress_text = (
+                    f"Phase 2/2 Analysis | Ticket journeys 0/{total_conversations} | "
+                    f"Calls 0/{total_calls}"
+                )
+            else:
+                current_box.info(
+                    f"Analysis: {total_conversations:,} journey/journeys, "
+                    f"{total_calls:,} message/conversation call(s)."
+                )
+                progress_text = f"Journeys 0/{total_conversations} | Calls 0/{total_calls}"
+            bar.progress(0, text=progress_text)
+        elif phase == "conversation_start":
+            journey_label = "Ticket journey" if has_ticketing else "Journey"
+            current_box.info(
+                f"{'Phase 2/2 - ' if has_ticketing else ''}{journey_label} "
+                f"{event.get('conversation_index')}/{event.get('total_conversations')} - "
                 f"Customer `{event.get('conversation_id')}`"
             )
         elif phase == "message_done":
@@ -3197,8 +3399,16 @@ def _execute_full_batch_into_run(
         bar.progress(
             fraction,
             text=(
-                f"Journeys {progress_state['conversations']}/{total_conversations} | "
-                f"Calls {progress_state['calls']}/{total_calls}"
+                (
+                    f"Phase 2/2 Analysis | Ticket journeys "
+                    f"{progress_state['conversations']}/{total_conversations} | "
+                    f"Calls {progress_state['calls']}/{total_calls}"
+                )
+                if has_ticketing
+                else (
+                    f"Journeys {progress_state['conversations']}/{total_conversations} | "
+                    f"Calls {progress_state['calls']}/{total_calls}"
+                )
             ),
         )
         counter_box.markdown(
@@ -3238,7 +3448,11 @@ def _execute_full_batch_into_run(
             (
                 "Running failed journeys..."
                 if mode in {"retry_failed", "run_failed_full"}
-                else "Appending the next journey batch..."
+                else (
+                    "Running all remaining journeys from the loaded DB run..."
+                    if mode == "continue_remaining"
+                    else "Appending the next journey batch..."
+                )
             )
         )
         results = run_evaluation(
@@ -3799,7 +4013,8 @@ def _render_db_source_run(
         st.caption(
             "Ticket mode is enabled for this loaded DB run. The selected saved journeys are split first, "
             "then the resulting ticket journeys are scored. The estimate is based on the selected saved "
-            "journeys before AI splitting; progress updates to the actual ticket count after splitting. "
+            "journeys before AI splitting. The live progress bar runs sequentially: Phase 1 ticketing by "
+            "original journey, then Phase 2 analysis by generated ticket journey. "
             f"Ticket splitting mode: `{_ticket_segmentation_mode_label(ticket_mode)}`. "
             f"Ticket model: `{st.session_state.get('ticket_selected_model') or st.session_state.get('conversation_selected_model') or st.session_state.selected_model}`."
         )
@@ -4217,6 +4432,59 @@ def _ordered_selected_ids(all_ids: list[str], selected_ids: list[str] | None) ->
     ordered = [str(x) for x in all_ids if str(x) in wanted]
     extra = [str(x) for x in selected_ids if str(x) not in set(ordered)]
     return ordered + extra
+
+
+def _saved_run_requested_journey_ids(run: dict | None, all_ids: list[str]) -> tuple[list[str], str]:
+    """Return the original CSV journeys targeted by a saved run config."""
+    run_config = (run or {}).get("run_config") or {}
+    csv_order_ids = [str(value) for value in all_ids if str(value).strip()]
+    saved_selected_ids = [
+        str(value)
+        for value in (run_config.get("selected_conversation_ids") or [])
+        if str(value).strip()
+    ]
+    if saved_selected_ids:
+        wanted = set(saved_selected_ids)
+        return [journey_id for journey_id in csv_order_ids if journey_id in wanted], "loaded run pinned selection"
+    if bool(run_config.get("run_all_conversations")):
+        return csv_order_ids, "loaded run all uploaded journeys"
+    try:
+        max_conversations = int(run_config.get("max_conversations") or 0)
+    except Exception:
+        max_conversations = 0
+    if max_conversations > 0:
+        return csv_order_ids[:max_conversations], f"loaded run first {max_conversations:,} journeys"
+    return csv_order_ids, "loaded run CSV order"
+
+
+def _source_journey_id_from_result(result: dict) -> str:
+    metadata = result.get("conversation_metadata") or {}
+    parent_id = str(metadata.get("parent_journey_id") or "").strip()
+    if parent_id:
+        return parent_id
+    conversation_id = _conversation_result_id(result)
+    if "::ticket_" in conversation_id:
+        return conversation_id.split("::ticket_", 1)[0]
+    return conversation_id
+
+
+def _completed_source_journey_ids_for_run(db: Database, run_id: int) -> set[str]:
+    """Map saved conversation rows back to original journeys for resume logic."""
+    try:
+        loaded = db.load_run_summary_results(int(run_id))
+        return {
+            source_id
+            for result in loaded.get("conversation_results", [])
+            for source_id in [_source_journey_id_from_result(result)]
+            if source_id
+        }
+    except Exception:
+        completed_ids = db.list_run_completed_conversation_ids(int(run_id))
+        return {
+            value.split("::ticket_", 1)[0] if "::ticket_" in value else value
+            for value in completed_ids
+            if value
+        }
 
 
 def _customer_ids_from_saved_run(db: Database, run_id: int) -> tuple[list[str], str]:
@@ -8396,20 +8664,15 @@ def _render_ticket_preview_collection(previews: list[dict], run_key: dict | None
         st.info("No previewed customer/journey has 2 or more tickets.")
         return
 
-    # on_change="rerun" makes .open a real, queryable bool instead of None,
-    # which is what actually lets us skip _ticket_eval_preview_export_dataframe
-    # (per-ticket category re-derivation for every shown preview) unless the
-    # user has this section open. A plain `with st.expander(...):` here would
-    # NOT gate anything: Streamlit computes and sends expander content on
-    # every rerun regardless of collapsed/expanded state.
-    export_expander = st.expander(
-        "Ticket evaluation CSV",
-        expanded=False,
-        on_change="rerun",
-        key="ticket_eval_csv_export_expander",
+    prepare_export = st.checkbox(
+        "Prepare ticket evaluation CSV",
+        key="ticket_eval_csv_export_prepare",
+        help=(
+            "Builds the ticket CSV only when needed. This can be slow for large preview sets."
+        ),
     )
-    if export_expander.open:
-        with export_expander:
+    if prepare_export:
+        with st.expander("Ticket evaluation CSV", expanded=True):
             st.caption("Exports the currently shown ticket evaluation previews, one row per detected ticket.")
             export_df = _ticket_eval_preview_export_dataframe(shown_previews)
             st.download_button(
@@ -10157,8 +10420,10 @@ def tab_run() -> None:
             )
 
     append_clicked = False
+    run_remaining_clicked = False
     run_failed_clicked = False
     append_ids: list[str] = []
+    run_remaining_ids: list[str] = []
     run_failed_ids: list[str] = []
     run_failed_mode = "Smart repair"
     failed_repair_plan: dict[str, Any] = {}
@@ -10172,8 +10437,10 @@ def tab_run() -> None:
             and saved_csv_name
             and uploaded_csv_name != saved_csv_name
         )
-        completed_ids = set(db.list_run_completed_conversation_ids(continuation_run_id))
-        remaining_ids = [journey_id for journey_id in all_ids if journey_id not in completed_ids]
+        requested_ids, requested_scope_label = _saved_run_requested_journey_ids(continuation_run, all_ids)
+        completed_ids = _completed_source_journey_ids_for_run(db, continuation_run_id)
+        completed_in_scope = sum(1 for journey_id in requested_ids if journey_id in completed_ids)
+        remaining_ids = [journey_id for journey_id in requested_ids if journey_id not in completed_ids]
         db_failed_ids = set(db.list_run_failed_conversation_ids(continuation_run_id))
         failed_ids = db_failed_ids
         run_failed_ids = [journey_id for journey_id in all_ids if journey_id in failed_ids]
@@ -10183,8 +10450,9 @@ def tab_run() -> None:
             expanded=False,
         ):
             st.caption(
-                f"CSV journeys: {len(all_ids):,} | Saved conversation results: "
-                f"{len(completed_ids):,} | Remaining: {len(remaining_ids):,} | "
+                f"CSV journeys: {len(all_ids):,} | Loaded run scope: {len(requested_ids):,} "
+                f"({requested_scope_label}) | Completed original journeys: "
+                f"{completed_in_scope:,} | Remaining: {len(remaining_ids):,} | "
                 f"Failed journeys: {len(run_failed_ids):,}"
             )
             if not csv_matches:
@@ -10194,6 +10462,18 @@ def tab_run() -> None:
                 )
 
             if remaining_ids:
+                run_remaining_ids = remaining_ids
+                run_remaining_clicked = st.button(
+                    f"Run all remaining from loaded DB ({len(run_remaining_ids):,})",
+                    key=f"continue_remaining_run_{continuation_run_id}",
+                    type="primary",
+                    disabled=st.session_state.run_in_progress or not csv_matches,
+                    use_container_width=True,
+                )
+                st.caption(
+                    "Appends missing analysis into the loaded run. For ticketed runs, saved ticket rows "
+                    "are counted back against their original customer journey."
+                )
                 default_batch_size = min(
                     max(1, int(st.session_state.get("max_conversations") or 50)),
                     len(remaining_ids),
@@ -10219,12 +10499,11 @@ def tab_run() -> None:
                 append_clicked = st.button(
                     f"Append next {len(append_ids):,} journeys to run #{continuation_run_id}",
                     key=f"append_run_batch_{continuation_run_id}",
-                    type="primary",
                     disabled=st.session_state.run_in_progress or not csv_matches,
                     use_container_width=True,
                 )
             else:
-                st.success("This run already has a conversation result for every journey in the CSV.")
+                st.success("This run already has saved analysis for every journey in its loaded DB scope.")
 
             if run_failed_ids:
                 st.caption(
@@ -10312,7 +10591,8 @@ def tab_run() -> None:
     if st.session_state.enable_ticket_segmentation:
         st.caption(
             "Ticket mode estimate is based on the selected original timelines before AI splitting. "
-            "The progress bar updates to the actual ticket count and message calls after splitting finishes. "
+            "The live progress bar runs sequentially: Phase 1 ticketing by original journey, then "
+            "Phase 2 analysis by generated ticket journey. "
             f"Ticket splitting mode: `{_ticket_segmentation_mode_label(ticket_mode)}`. "
             f"Ticket model: `{st.session_state.get('ticket_selected_model') or st.session_state.get('conversation_selected_model') or st.session_state.selected_model}`."
         )
@@ -10483,12 +10763,21 @@ def tab_run() -> None:
         st.session_state.loaded_run_label = None
         st.session_state._run_results_db_path = _active_db_path()
 
-        total_conv = estimate["conversations"]
+        original_timeline_count = int(estimate["conversations"] or 0)
+        total_conv = original_timeline_count
         total_msg = (
-            int(estimate.get("ticket_segmentation_calls") or 0)
-            + int(estimate["message_level_calls"])
+            int(estimate["message_level_calls"])
             + int(estimate["conversation_level_calls"])
         )
+        has_ticketing = bool(config.enable_ticket_segmentation)
+        ticket_progress = {
+            "done": 0,
+            "calls_done": 0,
+            "total": original_timeline_count,
+            "planned_calls": int(estimate.get("ticket_segmentation_calls") or 0),
+            "successes": 0,
+            "failures": 0,
+        }
         progress_state = {
             "convs_done": 0,
             "calls_done": 0,
@@ -10506,31 +10795,96 @@ def tab_run() -> None:
             if phase == "ticket_segmentation_start":
                 mode_label = _ticket_segmentation_mode_label(str(evt.get("segmentation_mode") or ""))
                 planned_ticket_calls = int(evt.get("planned_ticket_calls") or evt.get("total_conversations") or 0)
+                ticket_progress["done"] = 0
+                ticket_progress["calls_done"] = 0
+                ticket_progress["total"] = int(evt.get("total_conversations") or ticket_progress["total"] or 0)
+                ticket_progress["planned_calls"] = planned_ticket_calls
                 current_box.info(
-                    f"Splitting {evt.get('total_conversations', 0):,} customer timelines into ticket journeys "
+                    f"Phase 1/2 - Ticketing by original journey: splitting "
+                    f"{ticket_progress['total']:,} customer timeline(s) into ticket journeys "
                     f"with {evt.get('workers', 1):,} concurrent worker(s). "
                     f"Mode: {mode_label}. Planned ticket calls: {planned_ticket_calls:,}."
                 )
+                bar.progress(
+                    0,
+                    text=(
+                        f"Phase 1/2 Ticketing | Original journeys "
+                        f"0/{ticket_progress['total']} | Ticket calls 0/{ticket_progress['planned_calls']}"
+                    ),
+                )
+                counter_box.markdown("**Ticket successes:** 0 | **Ticket failures:** 0")
+                st.session_state.progress_log.append(evt)
+                return
+            elif phase == "ticket_segmentation_skipped":
+                current_box.warning(str(evt.get("reason") or "Ticketing skipped."))
+                bar.progress(0, text="Phase 1/2 Ticketing skipped | Original journeys 0/0 | Ticket calls 0/0")
+                counter_box.markdown("**Ticket successes:** 0 | **Ticket failures:** 0")
+                st.session_state.progress_log.append(evt)
+                return
             elif phase == "ticket_segmentation_done":
-                progress_state["calls_done"] += max(1, int(evt.get("ticket_calls_used") or 1))
+                ticket_progress["done"] = int(evt.get("completed_conversations") or ticket_progress["done"] + 1)
+                ticket_progress["calls_done"] += max(1, int(evt.get("ticket_calls_used") or 1))
                 if evt.get("error"):
-                    progress_state["failures"] += 1
+                    ticket_progress["failures"] += 1
                 else:
-                    progress_state["successes"] += 1
+                    ticket_progress["successes"] += 1
                 current_box.info(
-                    f"Ticket split {evt.get('conversation_index')}/{evt.get('total_conversations')} - "
+                    f"Phase 1/2 - Ticket split {ticket_progress['done']}/{ticket_progress['total']} - "
                     f"Customer `{evt.get('conversation_id')}` - "
                     f"{evt.get('tickets_created', 0)} ticket(s) - "
                     f"{int(evt.get('ticket_calls_used') or 1):,} ticket call(s)"
                 )
+                frac = min(
+                    ticket_progress["calls_done"] / max(ticket_progress["planned_calls"], 1),
+                    1.0,
+                )
+                bar.progress(
+                    frac,
+                    text=(
+                        f"Phase 1/2 Ticketing | Original journeys "
+                        f"{ticket_progress['done']}/{ticket_progress['total']} | "
+                        f"Ticket calls {ticket_progress['calls_done']}/{ticket_progress['planned_calls']}"
+                    ),
+                )
+                counter_box.markdown(
+                    f"**Ticket successes:** {ticket_progress['successes']} | "
+                    f"**Ticket failures:** {ticket_progress['failures']}"
+                )
+                st.session_state.progress_log.append(evt)
+                return
             elif phase == "start":
-                total_conv = int(evt.get("total_conversations") or total_conv)
+                total_conv = int(evt.get("total_conversations") or total_conv or 0)
                 if evt.get("total_calls") is not None:
-                    total_msg = progress_state["calls_done"] + int(evt.get("total_calls") or 0)
+                    total_msg = int(evt.get("total_calls") or 0)
+                progress_state.update(
+                    {
+                        "convs_done": 0,
+                        "calls_done": 0,
+                        "successes": 0,
+                        "failures": 0,
+                        "reruns": 0,
+                        "recovered": 0,
+                    }
+                )
+                if has_ticketing:
+                    current_box.info(
+                        f"Phase 2/2 - Analysis by generated ticket journey: "
+                        f"{total_conv:,} ticket journey/journeys, {total_msg:,} message/conversation call(s), "
+                        f"{evt.get('workers', 1):,} concurrent worker(s)."
+                    )
+                    progress_text = f"Phase 2/2 Analysis | Ticket journeys 0/{total_conv} | Calls 0/{total_msg}"
+                else:
+                    current_box.info(
+                        f"Analysis: {total_conv:,} journey/journeys, {total_msg:,} message/conversation call(s)."
+                    )
+                    progress_text = f"Journeys 0/{total_conv} | Calls 0/{total_msg}"
+                bar.progress(0, text=progress_text)
             elif phase == "conversation_start":
+                journey_label = "Ticket journey" if has_ticketing else "Journey"
                 current_box.info(
-                    f"Journey {evt.get('conversation_index')}/{evt.get('total_conversations')} — "
-                    f"Customer `{evt.get('conversation_id')}` — "
+                    f"{'Phase 2/2 - ' if has_ticketing else ''}{journey_label} "
+                    f"{evt.get('conversation_index')}/{evt.get('total_conversations')} - "
+                    f"Customer `{evt.get('conversation_id')}` - "
                     f"{evt.get('agent_messages', 0)} target messages"
                 )
             elif phase == "message_done":
@@ -10567,7 +10921,18 @@ def tab_run() -> None:
                 frac = 0.0
             bar.progress(
                 frac,
-                text=f"Journeys {progress_state['convs_done']}/{total_conv} • Calls {progress_state['calls_done']}/{total_msg}",
+                text=(
+                    (
+                        f"Phase 2/2 Analysis | Ticket journeys "
+                        f"{progress_state['convs_done']}/{total_conv} | "
+                        f"Calls {progress_state['calls_done']}/{total_msg}"
+                    )
+                    if has_ticketing
+                    else (
+                        f"Journeys {progress_state['convs_done']}/{total_conv} | "
+                        f"Calls {progress_state['calls_done']}/{total_msg}"
+                    )
+                ),
             )
             counter_box.markdown(
                 f"**Successes:** {progress_state['successes']} | "
@@ -10678,6 +11043,17 @@ def tab_run() -> None:
             counter_box=counter_box,
             current_box=current_box,
             selected_conversation_ids=conversation_rerun_ids,
+        )
+    elif run_remaining_clicked:
+        _execute_full_batch_into_run(
+            df=df,
+            run_id=continuation_run_id,
+            conversation_ids=run_remaining_ids,
+            mode="continue_remaining",
+            progress_box=progress_box,
+            bar=bar,
+            counter_box=counter_box,
+            current_box=current_box,
         )
     elif append_clicked:
         _execute_full_batch_into_run(

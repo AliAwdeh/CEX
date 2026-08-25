@@ -2690,6 +2690,15 @@ def segment_dataframe_into_ticket_journeys(
 
     groups = _filtered_groups_for_segmentation(df, config)
     if not groups:
+        if on_progress:
+            on_progress(
+                {
+                    "phase": "ticket_segmentation_skipped",
+                    "reason": "No selected customer timelines were available for ticket splitting.",
+                    "total_conversations": 0,
+                    "planned_ticket_calls": 0,
+                }
+            )
         return df.iloc[0:0].copy()
 
     index_col = MESSAGE_ORDER_COLUMN if MESSAGE_ORDER_COLUMN in df.columns else LEGACY_MESSAGE_ORDER_COLUMN
@@ -3022,13 +3031,13 @@ def run_evaluation(
 ) -> RunResults:
     """Run the full message-level + conversation-level evaluation pipeline.
 
-    All AI calls — both message-level and conversation-level, across all
-    conversations — share ONE ``ThreadPoolExecutor`` whose worker count equals
-    ``config.api.concurrency``. Only enough work to fill the active worker slots
-    is submitted at once. As soon as the *last* message-level call for a
-    conversation completes, its conversation-level call receives priority for
-    the next free slot — no cross-conversation barrier and no waiting behind the
-    entire message-level queue.
+    Message-level and conversation-level work share ONE ``ThreadPoolExecutor``
+    whose worker count equals ``config.api.concurrency``. Concurrency is scoped
+    by evaluation source: at most one message/conversation call is active for a
+    given source at a time, while different journeys or generated ticket
+    journeys run concurrently. As soon as the last message-level call for a
+    source completes, its conversation-level call receives priority for the next
+    free slot.
 
     Optional persistence callbacks (``on_message_result``,
     ``on_conversation_result``, ``on_error``) are invoked on the calling thread
@@ -3145,7 +3154,7 @@ def run_evaluation(
     # 500-message journey holds hundreds of overlapping transcript copies).
     # Histories are constructed only when a task enters an available worker
     # slot below, so at most ``workers`` temporary history lists exist.
-    ml_tasks: list[tuple[str, dict]] = []  # (conversation_id, target_record)
+    ready_ml: deque[str] = deque()
     no_target_convs: list[str] = []
 
     for ci, (conversation_id, records, conversation_metadata) in enumerate(sources, start=1):
@@ -3160,6 +3169,8 @@ def run_evaluation(
             "conversation_metadata": conversation_metadata,
             "targets": targets,
             "results_by_idx": {},          # message_index -> message-level record
+            "target_queue": deque(targets),
+            "started": False,
             "ml_total": len(targets),
             "ml_done": 0,
             "cl_submitted": False,
@@ -3168,33 +3179,38 @@ def run_evaluation(
         conv_state[conversation_id] = state
         conv_order.append(conversation_id)
 
+        if not targets:
+            no_target_convs.append(conversation_id)
+            continue
+
+        ready_ml.append(conversation_id)
+
+    # ---- One shared pool drives everything ---------------------------------
+
+    stop_signal = {"flag": False, "reason": None}
+
+    def _emit_conversation_start(conversation_id: str) -> None:
+        state = conv_state[conversation_id]
+        if state.get("started"):
+            return
+        state["started"] = True
         if on_progress:
             on_progress(
                 {
                     "phase": "conversation_start",
-                    "conversation_index": ci,
+                    "conversation_index": state["conversation_index"],
                     "conversation_id": conversation_id,
-                    "agent_messages": len(targets),
-                    "target_messages": len(targets),
+                    "agent_messages": state["ml_total"],
+                    "target_messages": state["ml_total"],
                     "target_role": target_role,
                     "total_conversations": total_conversations,
                     "workers": workers,
                 }
             )
 
-        if not targets:
-            no_target_convs.append(conversation_id)
-            continue
-
-        for target in targets:
-            ml_tasks.append((conversation_id, target))
-
-    # ---- One shared pool drives everything ---------------------------------
-
-    stop_signal = {"flag": False, "reason": None}
-
     def _submit_cl(ex: cf.ThreadPoolExecutor, conversation_id: str) -> cf.Future:
         """Build the conversation-level payload and submit it to the pool."""
+        _emit_conversation_start(conversation_id)
         state = conv_state[conversation_id]
         message_results_ordered = [
             state["results_by_idx"][t["message_index"]]
@@ -3286,13 +3302,12 @@ def run_evaluation(
 
     fut_info: dict[cf.Future, dict] = {}
     pending: set[cf.Future] = set()
-    unscheduled_ml = deque(ml_tasks)
     ready_cl = deque(no_target_convs)
 
     with cf.ThreadPoolExecutor(max_workers=workers) as ex:
         def fill_worker_slots() -> None:
             """Keep the pool full, prioritizing newly-ready conversation calls."""
-            while len(pending) < workers and (ready_cl or unscheduled_ml):
+            while len(pending) < workers and (ready_cl or ready_ml):
                 if ready_cl:
                     conversation_id = ready_cl.popleft()
                     fut = _submit_cl(ex, conversation_id)
@@ -3303,7 +3318,9 @@ def run_evaluation(
                     }
                     continue
 
-                conversation_id, target = unscheduled_ml.popleft()
+                conversation_id = ready_ml.popleft()
+                _emit_conversation_start(conversation_id)
+                target = conv_state[conversation_id]["target_queue"].popleft()
                 history = visible_history_of(
                     conv_state[conversation_id]["records"],
                     target["message_index"],
@@ -3413,10 +3430,12 @@ def run_evaluation(
                         and not state["cl_submitted"]
                         and state["ml_done"] >= state["ml_total"]
                     ):
-                        # Mark now to prevent duplicate queueing when several
-                        # message futures complete in the same wait batch.
+                        # Mark now so this source cannot be queued twice before
+                        # its conversation-level call is submitted.
                         state["cl_submitted"] = True
                         ready_cl.append(conversation_id)
+                    elif not stop_signal["flag"] and state["target_queue"]:
+                        ready_ml.append(conversation_id)
 
                 elif info["type"] == "cl":
                     try:
@@ -3472,7 +3491,7 @@ def run_evaluation(
 
             if stop_signal["flag"]:
                 # Cancel anything that hasn't started yet and drop the rest.
-                unscheduled_ml.clear()
+                ready_ml.clear()
                 ready_cl.clear()
                 for f in list(pending):
                     if not f.done():

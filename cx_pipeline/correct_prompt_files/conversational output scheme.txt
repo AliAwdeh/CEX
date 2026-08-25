@@ -1,0 +1,66 @@
+{
+  "conversation_id": "string",
+  "customer_objective_type": "Inquiry|Issue",
+  "customer_primary_objective": "short description",
+  "handled_status": "handled|unhandled",
+  "customer_experience": "good|bad",
+  "unhandled_resolution_subtype": "totally_unresolved|pending_unresolved|not_applicable",
+  "frustration_detected": true,
+  "frustration_origin": "our_side|customer_side|shared|none",
+  "customer_started_frustrated": true,
+  "customer_became_frustrated_during_chat": true,
+  "customer_ended_frustrated": true,
+  "frustration_timing": "start|during|end|multiple|none",
+  "final_customer_sentiment": "satisfied|neutral|frustrated|confused|dissatisfied|unknown",
+  "max_frustration_level": "none|low|medium|high|cancellation_risk",
+  "conversation_score": {
+    "resolution_score": 0,
+    "context_understanding_score": 0,
+    "customer_effort_score": 0,
+    "trust_frustration_risk_score": 0,
+    "ai_judgment_score": 0,
+    "message_signal_score": 0,
+    "raw_total_score": 0,
+    "final_score": 0,
+    "final_score_100": 0,
+    "score_rating": "Excellent|Good|Fair|Poor|Critical",
+    "score_explanation": "short explanation of the score"
+  },
+  "main_issue": {
+    "issue_exists": true,
+    "issue_origin": "our_side|customer_side|shared|none",
+    "issue_type": "none|misunderstanding|repetition|delay|unclear_guidance|wrong_info|ignored_context|dead_end|tool_or_system_failure|poor_tone|missing_next_step|other",
+    "issue_summary": "short business-friendly summary",
+    "customer_impact": "short explanation of impact on customer journey"
+  },
+  "all_detected_issues": [
+    {
+      "issue_origin": "our_side|customer_side|shared",
+      "issue_type": "misunderstanding|repetition|delay|unclear_guidance|wrong_info|ignored_context|dead_end|tool_or_system_failure|poor_tone|missing_next_step|other",
+      "issue_summary": "string",
+      "evidence": "string",
+      "impact": "string"
+    }
+  ],
+  "positive_signals": [
+    "short bullet"
+  ],
+  "negative_signals": [
+    "short bullet"
+  ],
+  "management_summary": "concise business-friendly explanation of the outcome and customer experience",
+  "culprits": [
+    "agent|bot|broadcast|customer"
+  ],
+  "culprit_agent_names": [
+    "exact agent_full_name values for materially culpable human agents, or empty array"
+  ],
+  "culprit_reason": "short explanation of who materially caused the bad experience or friction, or none",
+  "recommended_actions": [
+    "short actionable recommendation"
+  ],
+  "manual_review_required": true,
+  "manual_review_reason": "short reason or none",
+  "confidence": "low|medium|high",
+  "classification_reason": "short reason explaining handled/unhandled and good/bad experience"
+}

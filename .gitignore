@@ -49,6 +49,8 @@ saved_changes/
 # Secrets / env
 .env
 .env.*
+!.env.example
+!**/.env.example
 *.key
 
 # Local DB backup
@@ -61,6 +63,7 @@ __pycache__
 cx_conversation_results.csv
 cx_message_results.csv
 cx_full_results.json
+cx_pipeline/data/inbox/*.csv
 
 # OS / editor files
 .DS_Store
