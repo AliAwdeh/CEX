@@ -158,7 +158,13 @@ def status_pill(status: str, has_failures: bool) -> str:
     return pill(status.title() or "Created", PENDING)
 
 
-init_db()
+@st.cache_resource
+def ensure_db_initialized() -> bool:
+    init_db()
+    return True
+
+
+ensure_db_initialized()
 
 runs = q(
     """
