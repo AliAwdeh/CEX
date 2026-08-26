@@ -10,6 +10,7 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
+from cx_pipeline.app.config import get_settings
 from cx_pipeline.app.db import fetch_all, init_db, tx
 
 
@@ -27,9 +28,9 @@ FAILED = "#e03131"
 WARN = "#e8590c"
 
 STAGES = [
-    ("ticketing", "Ticketing", "per customer"),
-    ("message", "Message", "per ticket"),
-    ("ticket_cx", "Ticket CX", "per ticket"),
+    ("ticketing", "Ticketing", "per conversation"),
+    ("message", "Message", "runnable messages"),
+    ("ticket_cx", "Ticket CX", "customer floor + tickets"),
 ]
 
 # Requests slower than this are called out as possibly stuck. The client gives
@@ -158,6 +159,38 @@ def status_pill(status: str, has_failures: bool) -> str:
     return pill(status.title() or "Created", PENDING)
 
 
+def _frame_int(frame: pd.DataFrame, column: str, default: int = 0) -> int:
+    if frame.empty or column not in frame.columns:
+        return default
+    try:
+        return int(frame.iloc[0][column] or 0)
+    except (TypeError, ValueError):
+        return default
+
+
+def _logical_stage_counts(
+    counts: dict[str, int],
+    *,
+    total: int,
+    done: int,
+    running: int = 0,
+    failed: int = 0,
+) -> dict[str, int]:
+    fallback_running = int(counts.get("running", 0) or 0)
+    fallback_failed = int(counts.get("failed", 0) or 0)
+    running = max(int(running or 0), fallback_running)
+    failed = max(int(failed or 0), fallback_failed)
+    done = int(done or 0)
+    total = max(int(total or 0), done + running + failed)
+    pending = max(total - done - running - failed, int(counts.get("pending", 0) or 0))
+    return {
+        "done": done,
+        "running": running,
+        "pending": pending,
+        "failed": failed,
+    }
+
+
 @st.cache_resource
 def ensure_db_initialized() -> bool:
     init_db()
@@ -228,8 +261,159 @@ def render(run_id: str) -> None:
     for row in steps.itertuples():
         by_stage.setdefault(row.step_type, {})[row.status] = int(row.n)
 
+    settings = get_settings()
+    workload = q(
+        """
+        WITH run_sources AS (
+            SELECT id, customer_id, status, ticketed_run_id, updated_at
+            FROM source_conversations
+            WHERE first_seen_run_id = CAST(:rid AS uuid)
+               OR ticketed_run_id = CAST(:rid AS uuid)
+        ),
+        source_counts_by_customer AS (
+            SELECT customer_id, count(*) AS source_count
+            FROM run_sources
+            GROUP BY customer_id
+        ),
+        running_ticketing_sources AS (
+            SELECT COALESCE(sum(scc.source_count), 0) AS running
+            FROM run_steps rs
+            JOIN source_counts_by_customer scc ON scc.customer_id = rs.customer_id
+            WHERE rs.run_id = CAST(:rid AS uuid)
+              AND rs.step_type = 'ticketing'
+              AND rs.status = 'running'
+        ),
+        run_tickets AS (
+            SELECT *
+            FROM tickets
+            WHERE latest_ticketing_run_id = CAST(:rid AS uuid)
+        ),
+        run_customers AS (
+            SELECT DISTINCT customer_id
+            FROM run_sources
+        ),
+        customer_ticketing AS (
+            SELECT
+                customer_id,
+                bool_and(status = 'ticketed' AND ticketed_run_id = CAST(:rid AS uuid)) AS ticketing_done
+            FROM run_sources
+            GROUP BY customer_id
+        ),
+        eligible_tickets AS (
+            SELECT id, customer_id
+            FROM run_tickets
+            WHERE analysis_eligible = true
+        ),
+        runnable_messages AS (
+            SELECT DISTINCT tm.ticket_id, tm.message_id
+            FROM eligible_tickets et
+            JOIN ticket_messages tm ON tm.ticket_id = et.id
+            JOIN messages m ON m.id = tm.message_id
+            WHERE m.sender_role = :target_role
+        ),
+        ticket_cx_ticket_counts AS (
+            SELECT
+                et.customer_id,
+                count(et.id) AS eligible_tickets,
+                count(cx.id) FILTER (WHERE cx.run_id = CAST(:rid AS uuid)) AS cx_done,
+                count(cx.id) FILTER (
+                    WHERE cx.run_id = CAST(:rid AS uuid)
+                      AND cx.parse_status <> 'ok'
+                ) AS cx_failed
+            FROM eligible_tickets et
+            LEFT JOIN ticket_cx_results cx ON cx.ticket_id = et.id
+            GROUP BY et.customer_id
+        ),
+        ticket_cx_work AS (
+            SELECT
+                rc.customer_id,
+                COALESCE(ct.ticketing_done, false) AS ticketing_done,
+                COALESCE(tcc.eligible_tickets, 0) AS eligible_tickets,
+                COALESCE(tcc.cx_done, 0) AS cx_done,
+                COALESCE(tcc.cx_failed, 0) AS cx_failed
+            FROM run_customers rc
+            LEFT JOIN customer_ticketing ct ON ct.customer_id = rc.customer_id
+            LEFT JOIN ticket_cx_ticket_counts tcc ON tcc.customer_id = rc.customer_id
+        )
+        SELECT
+            (SELECT count(*) FROM run_sources) AS ticketing_total,
+            (
+                SELECT count(*)
+                FROM run_sources
+                WHERE status = 'ticketed' AND ticketed_run_id = CAST(:rid AS uuid)
+            ) AS ticketing_done,
+            (SELECT running FROM running_ticketing_sources) AS ticketing_running,
+            (
+                SELECT count(*)
+                FROM message_results mr
+                JOIN runnable_messages rm
+                  ON rm.ticket_id = mr.ticket_id AND rm.message_id = mr.message_id
+                WHERE mr.run_id = CAST(:rid AS uuid)
+            ) AS message_done,
+            (SELECT count(*) FROM runnable_messages) AS message_total,
+            (
+                SELECT count(*)
+                FROM ai_requests
+                WHERE run_id = CAST(:rid AS uuid)
+                  AND layer = 'message'
+                  AND status = 'running'
+            ) AS message_running,
+            (
+                SELECT count(*)
+                FROM message_results mr
+                JOIN runnable_messages rm
+                  ON rm.ticket_id = mr.ticket_id AND rm.message_id = mr.message_id
+                WHERE mr.run_id = CAST(:rid AS uuid)
+                  AND mr.parse_status <> 'ok'
+            ) AS message_failed,
+            (SELECT count(*) FROM run_customers) AS run_customers,
+            (SELECT count(*) FROM eligible_tickets) AS tickets_segmented,
+            (SELECT sum(GREATEST(eligible_tickets, 1)) FROM ticket_cx_work) AS ticket_cx_total,
+            (
+                SELECT sum(
+                    CASE
+                        WHEN eligible_tickets = 0 AND ticketing_done THEN 1
+                        ELSE LEAST(cx_done, eligible_tickets)
+                    END
+                )
+                FROM ticket_cx_work
+            ) AS ticket_cx_done,
+            (
+                SELECT count(*)
+                FROM ai_requests
+                WHERE run_id = CAST(:rid AS uuid)
+                  AND layer = 'ticket_cx'
+                  AND status = 'running'
+            ) AS ticket_cx_running,
+            (SELECT sum(cx_failed) FROM ticket_cx_work) AS ticket_cx_failed
+        """,
+        {"rid": run_id, "target_role": settings.message_target_role},
+    )
+    logical_by_stage = {
+        "ticketing": _logical_stage_counts(
+            by_stage.get("ticketing", {}),
+            total=_frame_int(workload, "ticketing_total"),
+            done=_frame_int(workload, "ticketing_done"),
+            running=_frame_int(workload, "ticketing_running"),
+        ),
+        "message": _logical_stage_counts(
+            by_stage.get("message", {}),
+            total=_frame_int(workload, "message_total"),
+            done=_frame_int(workload, "message_done"),
+            running=_frame_int(workload, "message_running"),
+            failed=_frame_int(workload, "message_failed"),
+        ),
+        "ticket_cx": _logical_stage_counts(
+            by_stage.get("ticket_cx", {}),
+            total=_frame_int(workload, "ticket_cx_total"),
+            done=_frame_int(workload, "ticket_cx_done"),
+            running=_frame_int(workload, "ticket_cx_running"),
+            failed=_frame_int(workload, "ticket_cx_failed"),
+        ),
+    }
+
     def total_of(status: str) -> int:
-        return sum(counts.get(status, 0) for counts in by_stage.values())
+        return sum(counts.get(status, 0) for counts in logical_by_stage.values())
 
     done = total_of("done")
     running = total_of("running")
@@ -332,7 +516,7 @@ def render(run_id: str) -> None:
 
     st.write("")
     for col, (key, title, tag) in zip(st.columns(3), STAGES):
-        counts = by_stage.get(key, {})
+        counts = logical_by_stage.get(key, {})
         s_done = counts.get("done", 0)
         s_running = counts.get("running", 0)
         s_pending = counts.get("pending", 0)
